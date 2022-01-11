@@ -1945,7 +1945,7 @@ where
         virtio_snd_device_mute_tube,
     )?;
 
-    let mut kvm_vcpu_ids = Vec::new();
+    let mut vcpu_ids = Vec::new();
 
     let windows = Arch::build_vm::<V, Vcpu>(
         components,
@@ -1958,7 +1958,7 @@ where
         ramoops_region,
         pci_devices,
         irq_chip,
-        &mut kvm_vcpu_ids,
+        &mut vcpu_ids,
         /*debugcon_jail=*/ None,
         None,
     )

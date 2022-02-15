@@ -10,6 +10,7 @@ mod encoder;
 
 use base::{error, info, warn, Tube, WaitContext};
 use std::collections::{BTreeMap, BTreeSet};
+use vm_memory::GuestMemory;
 
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
@@ -58,8 +59,10 @@ struct OutputResource {
 
 #[derive(Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 enum PendingCommand {
-    GetSrcParams,
-    GetDstParams,
+    // TODO(b/193202566): remove this is_ext parameter throughout the code along with
+    // support for the old GET_PARAMS and SET_PARAMS commands.
+    GetSrcParams { is_ext: bool },
+    GetDstParams { is_ext: bool },
     Drain,
     SrcQueueClear,
     DstQueueClear,
@@ -67,14 +70,11 @@ enum PendingCommand {
 
 struct Stream<T: EncoderSession> {
     id: u32,
-    src_resource_type: ResourceType,
-    dst_resource_type: ResourceType,
     src_params: Params,
     dst_params: Params,
     dst_bitrate: Bitrate,
     dst_profile: Profile,
     dst_h264_level: Option<Level>,
-    frame_rate: u32,
     force_keyframe: bool,
 
     encoder_session: Option<T>,
@@ -112,8 +112,10 @@ impl<T: EncoderSession> Stream<T> {
         const DEFAULT_FPS: u32 = 30;
 
         let mut src_params = Params {
+            frame_rate: DEFAULT_FPS,
             min_buffers: MIN_BUFFERS,
             max_buffers: MAX_BUFFERS,
+            resource_type: src_resource_type,
             ..Default::default()
         };
 
@@ -129,7 +131,13 @@ impl<T: EncoderSession> Stream<T> {
             )
             .map_err(|_| VideoError::InvalidArgument)?;
 
-        let mut dst_params = Default::default();
+        let mut dst_params = Params {
+            resource_type: dst_resource_type,
+            frame_rate: DEFAULT_FPS,
+            frame_width: DEFAULT_WIDTH,
+            frame_height: DEFAULT_HEIGHT,
+            ..Default::default()
+        };
 
         // In order to support requesting encoder params change, we must know the default frame
         // rate, because VEA's request_encoding_params_change requires both framerate and
@@ -153,14 +161,11 @@ impl<T: EncoderSession> Stream<T> {
 
         Ok(Self {
             id,
-            src_resource_type,
-            dst_resource_type,
             src_params,
             dst_params,
             dst_bitrate: DEFAULT_BITRATE,
             dst_profile,
             dst_h264_level,
-            frame_rate: DEFAULT_FPS,
             force_keyframe: false,
             encoder_session: None,
             received_input_buffers_event: false,
@@ -197,7 +202,7 @@ impl<T: EncoderSession> Stream<T> {
                 dst_profile: self.dst_profile,
                 dst_bitrate: self.dst_bitrate,
                 dst_h264_level: self.dst_h264_level,
-                frame_rate: self.frame_rate,
+                frame_rate: self.dst_params.frame_rate,
             })
             .map_err(|_| VideoError::InvalidOperation)?;
 
@@ -251,7 +256,20 @@ impl<T: EncoderSession> Stream<T> {
         let mut responses = vec![];
 
         // Respond to any GetParams commands that were waiting.
-        if self.pending_commands.remove(&PendingCommand::GetSrcParams) {
+        let pending_get_src_params = if self
+            .pending_commands
+            .remove(&PendingCommand::GetSrcParams { is_ext: false })
+        {
+            Some(false)
+        } else if self
+            .pending_commands
+            .remove(&PendingCommand::GetSrcParams { is_ext: true })
+        {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(is_ext) = pending_get_src_params {
             responses.push(VideoEvtResponseType::AsyncCmd(
                 AsyncCmdResponse::from_response(
                     AsyncCmdTag::GetParams {
@@ -261,11 +279,25 @@ impl<T: EncoderSession> Stream<T> {
                     CmdResponse::GetParams {
                         queue_type: QueueType::Input,
                         params: self.src_params.clone(),
+                        is_ext,
                     },
                 ),
             ));
         }
-        if self.pending_commands.remove(&PendingCommand::GetDstParams) {
+        let pending_get_dst_params = if self
+            .pending_commands
+            .remove(&PendingCommand::GetDstParams { is_ext: false })
+        {
+            Some(false)
+        } else if self
+            .pending_commands
+            .remove(&PendingCommand::GetDstParams { is_ext: true })
+        {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(is_ext) = pending_get_dst_params {
             responses.push(VideoEvtResponseType::AsyncCmd(
                 AsyncCmdResponse::from_response(
                     AsyncCmdTag::GetParams {
@@ -275,6 +307,7 @@ impl<T: EncoderSession> Stream<T> {
                     CmdResponse::GetParams {
                         queue_type: QueueType::Output,
                         params: self.dst_params.clone(),
+                        is_ext,
                     },
                 ),
             ));
@@ -472,16 +505,18 @@ pub struct EncoderDevice<T: Encoder> {
     encoder: T,
     streams: BTreeMap<u32, Stream<T::Session>>,
     resource_bridge: Tube,
+    mem: GuestMemory,
 }
 
 impl<T: Encoder> EncoderDevice<T> {
     /// Build a new encoder using the provided `backend`.
-    pub fn new(backend: T, resource_bridge: Tube) -> VideoResult<Self> {
+    pub fn new(backend: T, resource_bridge: Tube, mem: GuestMemory) -> VideoResult<Self> {
         Ok(Self {
             cros_capabilities: backend.query_capabilities()?,
             encoder: backend,
             streams: Default::default(),
             resource_bridge,
+            mem,
         })
     }
 
@@ -576,7 +611,7 @@ impl<T: Encoder> EncoderDevice<T> {
         queue_type: QueueType,
         resource_id: u32,
         plane_offsets: Vec<u32>,
-        resource: UnresolvedGuestResource,
+        plane_entries: Vec<Vec<UnresolvedResourceEntry>>,
     ) -> VideoResult<VideoCmdResponseType> {
         let stream = self
             .streams
@@ -591,9 +626,20 @@ impl<T: Encoder> EncoderDevice<T> {
 
         let num_planes = plane_offsets.len();
 
+        // We only support single-buffer resources for now.
+        let entries = if plane_entries.len() != 1 {
+            return Err(VideoError::InvalidArgument);
+        } else {
+            // unwrap() is safe because we just tested that `plane_entries` had exactly one element.
+            plane_entries.get(0).unwrap()
+        };
+
         match queue_type {
             QueueType::Input => {
-                if num_planes != stream.src_params.plane_formats.len() {
+                // We currently only support single-buffer formats, but some clients may mistake
+                // color planes with memory planes and submit several planes to us. This doesn't
+                // matter as we will only consider the first one.
+                if num_planes < 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -601,11 +647,31 @@ impl<T: Encoder> EncoderDevice<T> {
                     warn!("Replacing source resource with id {}", resource_id);
                 }
 
-                let resource = match stream.src_resource_type {
-                    ResourceType::Object => GuestResource::from_virtio_object_entry(
+                let resource = match stream.src_params.resource_type {
+                    ResourceType::VirtioObject => {
+                        // Virtio object resources only have one entry.
+                        if entries.len() != 1 {
+                            return Err(VideoError::InvalidArgument);
+                        }
+                        GuestResource::from_virtio_object_entry(
+                            // Safe because we confirmed the correct type for the resource.
+                            // unwrap() is also safe here because we just tested above that `entries` had
+                            // exactly one element.
+                            unsafe { entries.get(0).unwrap().object },
+                            &self.resource_bridge,
+                        )
+                        .map_err(|_| VideoError::InvalidArgument)?
+                    }
+                    ResourceType::GuestPages => GuestResource::from_virtio_guest_mem_entry(
                         // Safe because we confirmed the correct type for the resource.
-                        unsafe { resource.object },
-                        &self.resource_bridge,
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                entries.as_ptr() as *const protocol::virtio_video_mem_entry,
+                                entries.len(),
+                            )
+                        },
+                        &self.mem,
+                        &stream.src_params.plane_formats,
                     )
                     .map_err(|_| VideoError::InvalidArgument)?,
                 };
@@ -619,7 +685,8 @@ impl<T: Encoder> EncoderDevice<T> {
                 );
             }
             QueueType::Output => {
-                if num_planes != stream.dst_params.plane_formats.len() {
+                // Bitstream buffers always have only one plane.
+                if num_planes != 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -627,11 +694,31 @@ impl<T: Encoder> EncoderDevice<T> {
                     warn!("Replacing dest resource with id {}", resource_id);
                 }
 
-                let resource = match stream.dst_resource_type {
-                    ResourceType::Object => GuestResource::from_virtio_object_entry(
+                let resource = match stream.dst_params.resource_type {
+                    ResourceType::VirtioObject => {
+                        // Virtio object resources only have one entry.
+                        if entries.len() != 1 {
+                            return Err(VideoError::InvalidArgument);
+                        }
+                        GuestResource::from_virtio_object_entry(
+                            // Safe because we confirmed the correct type for the resource.
+                            // unwrap() is also safe here because we just tested above that `entries` had
+                            // exactly one element.
+                            unsafe { entries.get(0).unwrap().object },
+                            &self.resource_bridge,
+                        )
+                        .map_err(|_| VideoError::InvalidArgument)?
+                    }
+                    ResourceType::GuestPages => GuestResource::from_virtio_guest_mem_entry(
                         // Safe because we confirmed the correct type for the resource.
-                        unsafe { resource.object },
-                        &self.resource_bridge,
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                entries.as_ptr() as *const protocol::virtio_video_mem_entry,
+                                entries.len(),
+                            )
+                        },
+                        &self.mem,
+                        &stream.dst_params.plane_formats,
                     )
                     .map_err(|_| VideoError::InvalidArgument)?,
                 };
@@ -676,7 +763,10 @@ impl<T: Encoder> EncoderDevice<T> {
 
         match queue_type {
             QueueType::Input => {
-                if data_sizes.len() != stream.src_params.plane_formats.len() {
+                // We currently only support single-buffer formats, but some clients may mistake
+                // color planes with memory planes and submit several planes to us. This doesn't
+                // matter as we will only consider the first one.
+                if data_sizes.len() < 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -738,7 +828,8 @@ impl<T: Encoder> EncoderDevice<T> {
                 }))
             }
             QueueType::Output => {
-                if data_sizes.len() != stream.dst_params.plane_formats.len() {
+                // Bitstream buffers always have only one plane.
+                if data_sizes.len() != 1 {
                     return Err(VideoError::InvalidParameter);
                 }
 
@@ -880,6 +971,7 @@ impl<T: Encoder> EncoderDevice<T> {
         &mut self,
         stream_id: u32,
         queue_type: QueueType,
+        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let stream = self
             .streams
@@ -891,8 +983,8 @@ impl<T: Encoder> EncoderDevice<T> {
             // event, we need to wait for that before replying so that
             // the G_FMT response has the correct data.
             let pending_command = match queue_type {
-                QueueType::Input => PendingCommand::GetSrcParams,
-                QueueType::Output => PendingCommand::GetDstParams,
+                QueueType::Input => PendingCommand::GetSrcParams { is_ext },
+                QueueType::Output => PendingCommand::GetDstParams { is_ext },
             };
 
             if !stream.pending_commands.insert(pending_command) {
@@ -913,6 +1005,7 @@ impl<T: Encoder> EncoderDevice<T> {
             Ok(VideoCmdResponseType::Sync(CmdResponse::GetParams {
                 queue_type,
                 params,
+                is_ext,
             }))
         }
     }
@@ -927,6 +1020,7 @@ impl<T: Encoder> EncoderDevice<T> {
         frame_height: u32,
         frame_rate: u32,
         plane_formats: Vec<PlaneFormat>,
+        _is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let stream = self
             .streams
@@ -943,18 +1037,20 @@ impl<T: Encoder> EncoderDevice<T> {
         // encoder session as long as no resources have been queued yet. If an encoder session is
         // active we will request a dynamic framerate change instead, and it's up to the encoder
         // backend to return an error on invalid requests.
-        if stream.frame_rate != frame_rate {
-            stream.frame_rate = frame_rate;
+        if stream.dst_params.frame_rate != frame_rate {
             if let Some(ref mut encoder_session) = stream.encoder_session {
                 if !resources_queued {
                     create_session = true;
-                } else if let Err(e) = encoder_session
-                    .request_encoding_params_change(stream.dst_bitrate, stream.frame_rate)
-                {
+                } else if let Err(e) = encoder_session.request_encoding_params_change(
+                    stream.dst_bitrate,
+                    stream.dst_params.frame_rate,
+                ) {
                     error!("failed to dynamically request framerate change: {}", e);
                     return Err(VideoError::InvalidOperation);
                 }
             }
+            stream.src_params.frame_rate = frame_rate;
+            stream.dst_params.frame_rate = frame_rate;
         }
 
         match queue_type {
@@ -983,6 +1079,9 @@ impl<T: Encoder> EncoderDevice<T> {
                         frame_height,
                         plane_formats[0].stride,
                     )?;
+
+                    stream.dst_params.frame_width = frame_width;
+                    stream.dst_params.frame_height = frame_height;
 
                     create_session = true
                 }
@@ -1185,9 +1284,10 @@ impl<T: Encoder> EncoderDevice<T> {
                         Bitrate::CBR { target } | Bitrate::VBR { target, .. } => *target = bitrate,
                     }
                     if let Some(ref mut encoder_session) = stream.encoder_session {
-                        if let Err(e) = encoder_session
-                            .request_encoding_params_change(new_bitrate, stream.frame_rate)
-                        {
+                        if let Err(e) = encoder_session.request_encoding_params_change(
+                            new_bitrate,
+                            stream.dst_params.frame_rate,
+                        ) {
                             error!("failed to dynamically request target bitrate change: {}", e);
                             return Err(VideoError::InvalidOperation);
                         }
@@ -1204,9 +1304,10 @@ impl<T: Encoder> EncoderDevice<T> {
                                 peak: bitrate,
                             };
                             if let Some(ref mut encoder_session) = stream.encoder_session {
-                                if let Err(e) = encoder_session
-                                    .request_encoding_params_change(new_bitrate, stream.frame_rate)
-                                {
+                                if let Err(e) = encoder_session.request_encoding_params_change(
+                                    new_bitrate,
+                                    stream.dst_params.frame_rate,
+                                ) {
                                     error!(
                                         "failed to dynamically request peak bitrate change: {}",
                                         e
@@ -1317,14 +1418,14 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                 queue_type,
                 resource_id,
                 plane_offsets,
-                resource,
+                plane_entries,
             } => self.resource_create(
                 wait_ctx,
                 stream_id,
                 queue_type,
                 resource_id,
                 plane_offsets,
-                resource,
+                plane_entries,
             ),
             VideoCmd::ResourceQueue {
                 stream_id,
@@ -1384,7 +1485,8 @@ impl<T: Encoder> Device for EncoderDevice<T> {
             VideoCmd::GetParams {
                 stream_id,
                 queue_type,
-            } => self.get_params(stream_id, queue_type),
+                is_ext,
+            } => self.get_params(stream_id, queue_type, is_ext),
             VideoCmd::SetParams {
                 stream_id,
                 queue_type,
@@ -1397,6 +1499,7 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                         plane_formats,
                         ..
                     },
+                is_ext,
             } => self.set_params(
                 wait_ctx,
                 stream_id,
@@ -1406,6 +1509,7 @@ impl<T: Encoder> Device for EncoderDevice<T> {
                 frame_height,
                 frame_rate,
                 plane_formats,
+                is_ext,
             ),
             VideoCmd::QueryControl { query_ctrl_type } => self.query_control(query_ctrl_type),
             VideoCmd::GetControl {

@@ -363,14 +363,14 @@ where
     }
 
     fn process_ctrl(&mut self) -> Result<(), NetError> {
-        let mut ctrl_queue = match self.ctrl_queue.as_mut() {
+        let ctrl_queue = match self.ctrl_queue.as_mut() {
             Some(queue) => queue,
             None => return Ok(()),
         };
 
         process_ctrl(
             self.interrupt.as_ref(),
-            &mut ctrl_queue,
+            ctrl_queue,
             &self.mem,
             &mut self.tap,
             self.acked_features,
@@ -511,6 +511,19 @@ where
             .map_err(NetError::TapSetMacAddress)?;
 
         tap.enable().map_err(NetError::TapEnable)?;
+
+        Net::from(base_features, tap, vq_pairs)
+    }
+
+    /// Try to open the already-configured TAP interface `name` and to create a network device from
+    /// it.
+    pub fn new_from_name(
+        base_features: u64,
+        name: &[u8],
+        vq_pairs: u16,
+    ) -> Result<Net<T>, NetError> {
+        let multi_queue = vq_pairs > 1;
+        let tap: T = T::new_with_name(name, true, multi_queue).map_err(NetError::TapOpen)?;
 
         Net::from(base_features, tap, vq_pairs)
     }

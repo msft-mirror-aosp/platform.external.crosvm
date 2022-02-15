@@ -15,7 +15,6 @@ use crate::virtio::video::{
     decoder::{backend::*, Capability},
     error::{VideoError, VideoResult},
     format::*,
-    resource::{GuestResource, GuestResourceHandle},
 };
 
 #[sorted]
@@ -23,13 +22,15 @@ use crate::virtio::video::{
 enum VdaBackendError {
     #[error("set_output_parameters() must be called before use_output_buffer()")]
     OutputParamsNotSet,
+    #[error("VDA backend only supports virtio object resources")]
+    UnsupportedMemoryType,
     #[error("VDA failure: {0}")]
     VdaFailure(libvda::decode::Response),
 }
 
 impl From<VdaBackendError> for VideoError {
     fn from(e: VdaBackendError) -> Self {
-        VideoError::BackendFailure(Box::new(e))
+        VideoError::backend_failure(e)
     }
 }
 
@@ -179,7 +180,10 @@ impl DecoderSession for VdaDecoderSession {
         offset: u32,
         bytes_used: u32,
     ) -> VideoResult<()> {
-        let GuestResourceHandle::Object(handle) = resource;
+        let handle = match resource {
+            GuestResourceHandle::VirtioObject(handle) => handle,
+            _ => return Err(VdaBackendError::UnsupportedMemoryType.into()),
+        };
 
         Ok(self.vda_session.decode(
             bitstream_id,
@@ -207,7 +211,10 @@ impl DecoderSession for VdaDecoderSession {
         picture_buffer_id: i32,
         resource: GuestResource,
     ) -> VideoResult<()> {
-        let GuestResourceHandle::Object(handle) = resource.handle;
+        let handle = match resource.handle {
+            GuestResourceHandle::VirtioObject(handle) => handle,
+            _ => return Err(VdaBackendError::UnsupportedMemoryType.into()),
+        };
         let vda_planes: Vec<libvda::FramePlane> = resource.planes.iter().map(Into::into).collect();
 
         Ok(self.vda_session.use_output_buffer(
@@ -237,10 +244,8 @@ pub struct LibvdaDecoder(libvda::decode::VdaInstance);
 
 impl LibvdaDecoder {
     /// Create a decoder backend instance that can be used to instantiate an decoder.
-    pub fn new() -> VideoResult<Self> {
-        Ok(Self(libvda::decode::VdaInstance::new(
-            libvda::decode::VdaImplType::Gavda,
-        )?))
+    pub fn new(backend_type: libvda::decode::VdaImplType) -> VideoResult<Self> {
+        Ok(Self(libvda::decode::VdaInstance::new(backend_type)?))
     }
 }
 
@@ -275,7 +280,19 @@ impl DecoderBackend for LibvdaDecoder {
                     in_fmts.push(FormatDesc {
                         mask,
                         format,
-                        frame_formats: vec![Default::default()],
+                        frame_formats: vec![FrameFormat {
+                            width: FormatRange {
+                                min: fmt.min_width,
+                                max: fmt.max_width,
+                                step: 1,
+                            },
+                            height: FormatRange {
+                                min: fmt.min_height,
+                                max: fmt.max_height,
+                                step: 1,
+                            },
+                            bitrates: Vec::new(),
+                        }],
                     });
                     match profiles.entry(format) {
                         Entry::Occupied(mut e) => e.get_mut().push(profile),

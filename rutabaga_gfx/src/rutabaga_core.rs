@@ -7,7 +7,7 @@
 use std::collections::BTreeMap as Map;
 use std::sync::Arc;
 
-use base::ExternalMapping;
+use base::{ExternalMapping, SafeDescriptor};
 use data_model::VolatileSlice;
 
 use crate::cross_domain::CrossDomain;
@@ -133,6 +133,7 @@ pub trait RutabagaComponent {
         _resource_id: u32,
         _resource_create_blob: ResourceCreateBlob,
         _iovec_opt: Option<Vec<RutabagaIovec>>,
+        _handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         Err(RutabagaError::Unsupported)
     }
@@ -167,7 +168,7 @@ pub trait RutabagaContext {
         &mut self,
         _resource_id: u32,
         _resource_create_blob: ResourceCreateBlob,
-        _handle: Option<RutabagaHandle>,
+        _handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         Err(RutabagaError::Unsupported)
     }
@@ -192,6 +193,9 @@ pub trait RutabagaContext {
     fn context_poll(&mut self) -> Option<Vec<RutabagaFence>> {
         None
     }
+
+    /// Implementations must return the component type associated with the context.
+    fn component_type(&self) -> RutabagaComponentType;
 }
 
 #[derive(Copy, Clone)]
@@ -209,8 +213,9 @@ struct RutabagaCapsetInfo {
 /// thread-safe is more difficult.
 pub struct Rutabaga {
     resources: Map<u32, RutabagaResource>,
-    components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>>,
     contexts: Map<u32, Box<dyn RutabagaContext>>,
+    // Declare components after resources and contexts such that it is dropped last.
+    components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>>,
     default_component: RutabagaComponentType,
     capset_info: Vec<RutabagaCapsetInfo>,
     fence_handler: RutabagaFenceHandler,
@@ -459,28 +464,33 @@ impl Rutabaga {
             return Err(RutabagaError::InvalidResourceId);
         }
 
+        let component = self
+            .components
+            .get_mut(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+
+        let mut context = None;
         // For the cross-domain context, we'll need to create the blob resource via a home-grown
-        // rutabaga context rather than one from an external C/C++ component.  Use `ctx_id` to check
-        // if it happens to be a cross-domain context.
+        // rutabaga context rather than one from an external C/C++ component.  Use `ctx_id` and
+        // the component type if it happens to be a cross-domain context.
         if ctx_id > 0 {
             let ctx = self
                 .contexts
                 .get_mut(&ctx_id)
                 .ok_or(RutabagaError::InvalidContextId)?;
 
-            if let Ok(resource) = ctx.context_create_blob(resource_id, resource_create_blob, handle)
-            {
-                self.resources.insert(resource_id, resource);
-                return Ok(());
+            if ctx.component_type() == RutabagaComponentType::CrossDomain {
+                context = Some(ctx);
             }
         }
 
-        let component = self
-            .components
-            .get_mut(&self.default_component)
-            .ok_or(RutabagaError::InvalidComponent)?;
+        let resource = match context {
+            Some(ctx) => ctx.context_create_blob(resource_id, resource_create_blob, handle)?,
+            None => {
+                component.create_blob(ctx_id, resource_id, resource_create_blob, iovecs, handle)?
+            }
+        };
 
-        let resource = component.create_blob(ctx_id, resource_id, resource_create_blob, iovecs)?;
         self.resources.insert(resource_id, resource);
         Ok(())
     }
@@ -613,12 +623,12 @@ impl Rutabaga {
             .get_mut(&ctx_id)
             .ok_or(RutabagaError::InvalidContextId)?;
 
-        let mut resource = self
+        let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        ctx.attach(&mut resource);
+        ctx.attach(resource);
         Ok(())
     }
 
@@ -713,11 +723,20 @@ impl RutabagaBuilder {
     /// This should be only called once per every virtual machine instance.  Rutabaga tries to
     /// intialize all 3D components which have been built. In 2D mode, only the 2D component is
     /// initialized.
-    pub fn build(self, fence_handler: RutabagaFenceHandler) -> RutabagaResult<Rutabaga> {
+    pub fn build(
+        self,
+        fence_handler: RutabagaFenceHandler,
+        render_server_fd: Option<SafeDescriptor>,
+    ) -> RutabagaResult<Rutabaga> {
         let mut rutabaga_components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>> =
             Default::default();
 
         let mut rutabaga_capsets: Vec<RutabagaCapsetInfo> = Default::default();
+
+        #[cfg(not(feature = "virgl_renderer_next"))]
+        if render_server_fd.is_some() {
+            return Err(RutabagaError::InvalidRutabagaBuild);
+        }
 
         if self.default_component == RutabagaComponentType::Rutabaga2D {
             let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
@@ -729,7 +748,11 @@ impl RutabagaBuilder {
                     .virglrenderer_flags
                     .ok_or(RutabagaError::InvalidRutabagaBuild)?;
 
-                let virgl = VirglRenderer::init(virglrenderer_flags, fence_handler.clone())?;
+                let virgl = VirglRenderer::init(
+                    virglrenderer_flags,
+                    fence_handler.clone(),
+                    render_server_fd,
+                )?;
                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
 
                 rutabaga_capsets.push(RutabagaCapsetInfo {
@@ -783,9 +806,9 @@ impl RutabagaBuilder {
         }
 
         Ok(Rutabaga {
-            components: rutabaga_components,
             resources: Default::default(),
             contexts: Default::default(),
+            components: rutabaga_components,
             default_component: self.default_component,
             capset_info: rutabaga_capsets,
             fence_handler,

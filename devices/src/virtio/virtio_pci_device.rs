@@ -24,29 +24,36 @@ use crate::pci::{
 
 use self::virtio_pci_common_config::VirtioPciCommonConfig;
 
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, enumn::N)]
 pub enum PciCapabilityType {
     CommonConfig = 1,
     NotifyConfig = 2,
     IsrConfig = 3,
     DeviceConfig = 4,
     PciConfig = 5,
+    // Doorbell, Notification and SharedMemory are Virtio Vhost User related PCI
+    // capabilities. Specified in 5.7.7.4 here
+    // https://stefanha.github.io/virtio/vhost-user-slave.html#x1-2830007.
+    DoorbellConfig = 6,
+    NotificationConfig = 7,
     SharedMemoryConfig = 8,
 }
 
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct VirtioPciCap {
-    // _cap_vndr and _cap_next are autofilled based on id() in pci configuration
-    _cap_vndr: u8,    // Generic PCI field: PCI_CAP_ID_VNDR
-    _cap_next: u8,    // Generic PCI field: next ptr
-    cap_len: u8,      // Generic PCI field: capability length
-    cfg_type: u8,     // Identifies the structure.
-    bar: u8,          // Where to find it.
+pub struct VirtioPciCap {
+    // cap_vndr and cap_next are autofilled based on id() in pci configuration
+    pub cap_vndr: u8, // Generic PCI field: PCI_CAP_ID_VNDR
+    pub cap_next: u8, // Generic PCI field: next ptr
+    pub cap_len: u8,  // Generic PCI field: capability length
+    pub cfg_type: u8, // Identifies the structure.
+    pub bar: u8,      // Where to find it.
     id: u8,           // Multiple capabilities of the same type
     padding: [u8; 2], // Pad to full dword.
-    offset: Le32,     // Offset within bar.
-    length: Le32,     // Length of the structure, in bytes.
+    pub offset: Le32, // Offset within bar.
+    pub length: Le32, // Length of the structure, in bytes.
 }
 // It is safe to implement DataInit; all members are simple numbers and any value is valid.
 unsafe impl DataInit for VirtioPciCap {}
@@ -68,8 +75,8 @@ impl PciCapability for VirtioPciCap {
 impl VirtioPciCap {
     pub fn new(cfg_type: PciCapabilityType, bar: u8, offset: u32, length: u32) -> Self {
         VirtioPciCap {
-            _cap_vndr: 0,
-            _cap_next: 0,
+            cap_vndr: 0,
+            cap_next: 0,
             cap_len: std::mem::size_of::<VirtioPciCap>() as u8,
             cfg_type: cfg_type as u8,
             bar,
@@ -78,6 +85,10 @@ impl VirtioPciCap {
             offset: Le32::from(offset),
             length: Le32::from(length),
         }
+    }
+
+    pub fn set_cap_len(&mut self, cap_len: u8) {
+        self.cap_len = cap_len;
     }
 }
 
@@ -115,8 +126,8 @@ impl VirtioPciNotifyCap {
     ) -> Self {
         VirtioPciNotifyCap {
             cap: VirtioPciCap {
-                _cap_vndr: 0,
-                _cap_next: 0,
+                cap_vndr: 0,
+                cap_next: 0,
                 cap_len: std::mem::size_of::<VirtioPciNotifyCap>() as u8,
                 cfg_type: cfg_type as u8,
                 bar,
@@ -158,8 +169,8 @@ impl VirtioPciShmCap {
     pub fn new(cfg_type: PciCapabilityType, bar: u8, offset: u64, length: u64, shmid: u8) -> Self {
         VirtioPciShmCap {
             cap: VirtioPciCap {
-                _cap_vndr: 0,
-                _cap_next: 0,
+                cap_vndr: 0,
+                cap_next: 0,
                 cap_len: std::mem::size_of::<VirtioPciShmCap>() as u8,
                 cfg_type: cfg_type as u8,
                 bar,
@@ -255,7 +266,7 @@ impl VirtioPciDevice {
                 &PciDisplaySubclass::Other as &dyn PciSubclass,
             ),
             _ => (
-                PciClassCode::Other,
+                PciClassCode::TooOld,
                 &PciVirtioSubclass::NonTransitionalBase as &dyn PciSubclass,
             ),
         };
@@ -273,7 +284,6 @@ impl VirtioPciDevice {
             pci_device_subclass,
             None,
             PciHeaderType::Device,
-            false,
             VIRTIO_PCI_VENDOR_ID,
             pci_device_id,
             VIRTIO_PCI_REVISION_ID,
@@ -448,8 +458,12 @@ impl PciDevice for VirtioPciDevice {
         self.interrupt_evt = Some(irq_evt.try_clone().ok()?);
         self.interrupt_resample_evt = Some(irq_resample_evt.try_clone().ok()?);
         let gsi = irq_num?;
-        self.config_regs.set_irq(gsi as u8, PciInterruptPin::IntA);
-        Some((gsi, PciInterruptPin::IntA))
+        let pin = self.pci_address.map_or(
+            PciInterruptPin::IntA,
+            PciConfiguration::suggested_interrupt_pin,
+        );
+        self.config_regs.set_irq(gsi as u8, pin);
+        Some((gsi, pin))
     }
 
     fn allocate_io_bars(

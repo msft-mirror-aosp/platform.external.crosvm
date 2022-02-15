@@ -35,7 +35,7 @@ pub trait Hypervisor: Send {
         Self: Sized;
 
     /// Checks if a particular `HypervisorCap` is available.
-    fn check_capability(&self, cap: &HypervisorCap) -> bool;
+    fn check_capability(&self, cap: HypervisorCap) -> bool;
 }
 
 /// A wrapper for using a VM and getting/setting its state.
@@ -51,6 +51,9 @@ pub trait Vm: Send {
     /// on the particular `Vm` instance. This method is encouraged because it more accurately
     /// reflects the usable capabilities.
     fn check_capability(&self, c: VmCap) -> bool;
+
+    /// Get the guest physical address size in bits.
+    fn get_guest_phys_addr_bits(&self) -> u8;
 
     /// Gets the guest-mapped memory for the Vm.
     fn get_memory(&self) -> &GuestMemory;
@@ -366,11 +369,9 @@ pub enum VcpuExit {
     Watchdog,
     S390Tsch,
     Epr,
-    /// The cpu triggered a system level event which is specified by the type field.
-    /// The first field is the event type and the second field is flags.
-    /// The possible event types are shutdown, reset, or crash.  So far there
-    /// are not any flags defined.
-    SystemEvent(u32 /* event_type */, u64 /* flags */),
+    SystemEventShutdown,
+    SystemEventReset,
+    SystemEventCrash,
 }
 
 /// A device type to create with `Vm.create_device`.
@@ -438,4 +439,17 @@ pub enum MPState {
     SipiReceived,
     /// the vcpu is stopped (arm/arm64)
     Stopped,
+}
+
+/// Whether the VM should be run in protected mode or not.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProtectionType {
+    /// The VM should be run in the unprotected mode, where the host has access to its memory.
+    Unprotected,
+    /// The VM should be run in protected mode, so the host cannot access its memory directly. It
+    /// should be booted via the protected VM firmware, so that it can access its secrets.
+    Protected,
+    /// The VM should be run in protected mode, but booted directly without pVM firmware. The host
+    /// will still be unable to access the VM memory, but it won't be given any secrets.
+    ProtectedWithoutFirmware,
 }

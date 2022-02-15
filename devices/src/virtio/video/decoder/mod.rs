@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use backend::*;
 use base::{error, Tube, WaitContext};
+use vm_memory::GuestMemory;
 
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
@@ -170,9 +171,6 @@ enum PendingResponse {
 struct Context<S: DecoderSession> {
     stream_id: StreamId,
 
-    in_resource_type: ResourceType,
-    out_resource_type: ResourceType,
-
     in_params: Params,
     out_params: Params,
 
@@ -194,18 +192,36 @@ impl<S: DecoderSession> Context<S> {
         in_resource_type: ResourceType,
         out_resource_type: ResourceType,
     ) -> Self {
+        const DEFAULT_WIDTH: u32 = 640;
+        const DEFAULT_HEIGHT: u32 = 480;
+        const DEFAULT_INPUT_BUFFER_SIZE: u32 = 1024 * 1024;
+
+        let out_plane_formats =
+            PlaneFormat::get_plane_layout(Format::NV12, DEFAULT_WIDTH, DEFAULT_HEIGHT).unwrap();
+
         Context {
             stream_id,
-            in_resource_type,
-            out_resource_type,
             in_params: Params {
                 format: Some(format),
+                frame_width: DEFAULT_WIDTH,
+                frame_height: DEFAULT_HEIGHT,
+                resource_type: in_resource_type,
                 min_buffers: 1,
                 max_buffers: 32,
-                plane_formats: vec![Default::default()],
+                plane_formats: vec![PlaneFormat {
+                    plane_size: DEFAULT_INPUT_BUFFER_SIZE,
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
-            out_params: Default::default(),
+            out_params: Params {
+                format: Some(Format::NV12),
+                frame_width: DEFAULT_WIDTH,
+                frame_height: DEFAULT_HEIGHT,
+                resource_type: out_resource_type,
+                plane_formats: out_plane_formats,
+                ..Default::default()
+            },
             in_res: Default::default(),
             out_res: Default::default(),
             is_resetting: false,
@@ -308,26 +324,16 @@ impl<S: DecoderSession> Context<S> {
         // We only support NV12.
         let format = Some(Format::NV12);
 
-        let rect_width: u32 = (visible_rect.right - visible_rect.left) as u32;
-        let rect_height: u32 = (visible_rect.bottom - visible_rect.top) as u32;
+        let plane_formats =
+            PlaneFormat::get_plane_layout(Format::NV12, width as u32, height as u32).unwrap();
 
-        let plane_formats = vec![
-            // Y plane, 1 sample per pixel.
-            PlaneFormat {
-                plane_size: rect_width * rect_height,
-                stride: rect_width,
-            },
-            // UV plane, 1 sample per group of 4 pixels for U and V.
-            PlaneFormat {
-                // Add one vertical line so odd resolutions result in an extra UV line to cover all the
-                // Y samples.
-                plane_size: rect_width * ((rect_height + 1) / 2),
-                stride: rect_width,
-            },
-        ];
+        self.in_params.frame_width = width as u32;
+        self.in_params.frame_height = height as u32;
 
         self.out_params = Params {
             format,
+            // The resource type is not changed by a provide picture buffers event.
+            resource_type: self.out_params.resource_type,
             // Note that rect_width is sometimes smaller.
             frame_width: width as u32,
             frame_height: height as u32,
@@ -337,8 +343,8 @@ impl<S: DecoderSession> Context<S> {
             crop: Crop {
                 left: visible_rect.left as u32,
                 top: visible_rect.top as u32,
-                width: rect_width,
-                height: rect_height,
+                width: (visible_rect.right - visible_rect.left) as u32,
+                height: (visible_rect.bottom - visible_rect.top) as u32,
             },
             plane_formats,
             // No need to set `frame_rate`, as it's only for the encoder.
@@ -408,11 +414,12 @@ pub struct Decoder<D: DecoderBackend> {
     capability: Capability,
     contexts: ContextMap<D::Session>,
     resource_bridge: Tube,
+    mem: GuestMemory,
 }
 
 impl<'a, D: DecoderBackend> Decoder<D> {
     /// Build a new decoder using the provided `backend`.
-    pub fn new(backend: D, resource_bridge: Tube) -> Self {
+    pub fn new(backend: D, resource_bridge: Tube, mem: GuestMemory) -> Self {
         let capability = backend.get_capabilities();
 
         Self {
@@ -420,6 +427,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
             capability,
             contexts: Default::default(),
             resource_bridge,
+            mem,
         }
     }
 
@@ -498,7 +506,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         queue_type: QueueType,
         resource_id: ResourceId,
         plane_offsets: Vec<u32>,
-        resource: UnresolvedGuestResource,
+        plane_entries: Vec<Vec<UnresolvedResourceEntry>>,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
 
@@ -513,17 +521,45 @@ impl<'a, D: DecoderBackend> Decoder<D> {
             )?);
         }
 
+        // We only support single-buffer resources for now.
+        let entries = if plane_entries.len() != 1 {
+            return Err(VideoError::InvalidArgument);
+        } else {
+            // unwrap() is safe because we just tested that `plane_entries` had exactly one element.
+            plane_entries.get(0).unwrap()
+        };
+
         // Now try to resolve our resource.
-        let resource_type = match queue_type {
-            QueueType::Input => ctx.in_resource_type,
-            QueueType::Output => ctx.out_resource_type,
+        let (resource_type, plane_formats) = match queue_type {
+            QueueType::Input => (ctx.in_params.resource_type, &ctx.in_params.plane_formats),
+            QueueType::Output => (ctx.out_params.resource_type, &ctx.out_params.plane_formats),
         };
 
         let resource = match resource_type {
-            ResourceType::Object => GuestResource::from_virtio_object_entry(
+            ResourceType::VirtioObject => {
+                // Virtio object resources only have one entry.
+                if entries.len() != 1 {
+                    return Err(VideoError::InvalidArgument);
+                }
+                GuestResource::from_virtio_object_entry(
+                    // Safe because we confirmed the correct type for the resource.
+                    // unwrap() is also safe here because we just tested above that `entries` had
+                    // exactly one element.
+                    unsafe { entries.get(0).unwrap().object },
+                    &self.resource_bridge,
+                )
+                .map_err(|_| VideoError::InvalidArgument)?
+            }
+            ResourceType::GuestPages => GuestResource::from_virtio_guest_mem_entry(
                 // Safe because we confirmed the correct type for the resource.
-                unsafe { resource.object },
-                &self.resource_bridge,
+                unsafe {
+                    std::slice::from_raw_parts(
+                        entries.as_ptr() as *const protocol::virtio_video_mem_entry,
+                        entries.len(),
+                    )
+                },
+                &self.mem,
+                plane_formats,
             )
             .map_err(|_| VideoError::InvalidArgument)?,
         };
@@ -711,6 +747,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         &self,
         stream_id: StreamId,
         queue_type: QueueType,
+        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get(&stream_id)?;
         let params = match queue_type {
@@ -720,6 +757,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         Ok(VideoCmdResponseType::Sync(CmdResponse::GetParams {
             queue_type,
             params,
+            is_ext,
         }))
     }
 
@@ -728,6 +766,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         stream_id: StreamId,
         queue_type: QueueType,
         params: Params,
+        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
         match queue_type {
@@ -740,9 +779,21 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 // Only a few parameters can be changed by the guest.
                 ctx.in_params.format = params.format;
                 ctx.in_params.plane_formats = params.plane_formats;
+                // The resource type can only be changed through the SET_PARAMS_EXT command.
+                if is_ext {
+                    ctx.in_params.resource_type = params.resource_type;
+                }
             }
             QueueType::Output => {
-                // The guest cannot update parameters for output queue in the decoder.
+                // The guest can only change the resource type of the output queue if no resource
+                // has been imported yet.
+                if ctx.out_res.output_params_set {
+                    error!("parameter for output cannot be changed once resources are imported");
+                    return Err(VideoError::InvalidParameter);
+                }
+                if is_ext {
+                    ctx.out_params.resource_type = params.resource_type;
+                }
             }
         };
         Ok(VideoCmdResponseType::Sync(CmdResponse::NoData))
@@ -885,14 +936,14 @@ impl<D: DecoderBackend> Device for Decoder<D> {
                 queue_type,
                 resource_id,
                 plane_offsets,
-                resource,
+                plane_entries,
             } => self.create_resource(
                 wait_ctx,
                 stream_id,
                 queue_type,
                 resource_id,
                 plane_offsets,
-                resource,
+                plane_entries,
             ),
             ResourceDestroyAll {
                 stream_id,
@@ -922,12 +973,14 @@ impl<D: DecoderBackend> Device for Decoder<D> {
             GetParams {
                 stream_id,
                 queue_type,
-            } => self.get_params(stream_id, queue_type),
+                is_ext,
+            } => self.get_params(stream_id, queue_type, is_ext),
             SetParams {
                 stream_id,
                 queue_type,
                 params,
-            } => self.set_params(stream_id, queue_type, params),
+                is_ext,
+            } => self.set_params(stream_id, queue_type, params, is_ext),
             QueryControl { query_ctrl_type } => self.query_control(query_ctrl_type),
             GetControl {
                 stream_id,

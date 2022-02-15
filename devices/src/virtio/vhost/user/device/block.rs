@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
 
 use anyhow::{anyhow, bail, Context};
+use argh::FromArgs;
 use futures::future::{AbortHandle, Abortable};
-use getopts::Options;
 use once_cell::sync::OnceCell;
 use sync::Mutex;
 use vmm_vhost::message::*;
@@ -19,15 +19,16 @@ use base::{error, iov_max, warn, Event, Timer};
 use cros_async::{sync::Mutex as AsyncMutex, EventAsync, Executor, TimerAsync};
 use data_model::DataInit;
 use disk::create_async_disk_file;
+use hypervisor::ProtectionType;
 use vm_memory::GuestMemory;
 
 use crate::virtio::block::asynchronous::{flush_disk, process_one_chain};
 use crate::virtio::block::*;
-use crate::virtio::vhost::user::device::handler::{
-    CallEvent, DeviceRequestHandler, VhostUserBackend,
+use crate::virtio::vhost::user::device::{
+    handler::{DeviceRequestHandler, Doorbell, VhostUserBackend},
+    vvu::pci::VvuPciDevice,
 };
 use crate::virtio::{self, base_features, copy_config, Queue};
-use crate::ProtectionType;
 
 static BLOCK_EXECUTOR: OnceCell<Executor> = OnceCell::new();
 
@@ -53,7 +54,7 @@ impl BlockBackend {
     ///
     /// * `ex_cell`: `OnceCell` that must be initialized with an executor which is used in this device thread.
     /// * `filename`: Name of the disk image file.
-    /// * `options`: Vector of flie options.
+    /// * `options`: Vector of file options.
     ///   - `read-only`
     pub(crate) fn new(
         ex_cell: OnceCell<Executor>,
@@ -159,7 +160,6 @@ impl VhostUserBackend for BlockBackend {
     const MAX_QUEUE_NUM: usize = NUM_QUEUES as usize;
     const MAX_VRING_LEN: u16 = QUEUE_SIZE;
 
-    type Doorbell = CallEvent;
     type Error = anyhow::Error;
 
     fn features(&self) -> u64 {
@@ -214,7 +214,7 @@ impl VhostUserBackend for BlockBackend {
         idx: usize,
         mut queue: virtio::Queue,
         mem: GuestMemory,
-        call_evt: Arc<Mutex<CallEvent>>,
+        doorbell: Arc<Mutex<Doorbell>>,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
@@ -241,7 +241,7 @@ impl VhostUserBackend for BlockBackend {
                 disk_state,
                 Rc::new(RefCell::new(queue)),
                 kick_evt,
-                call_evt,
+                doorbell,
                 timer,
                 timer_armed,
             ),
@@ -268,7 +268,7 @@ async fn handle_queue(
     disk_state: Rc<AsyncMutex<DiskState>>,
     queue: Rc<RefCell<Queue>>,
     evt: EventAsync,
-    interrupt: Arc<Mutex<CallEvent>>,
+    interrupt: Arc<Mutex<Doorbell>>,
     flush_timer: Rc<RefCell<TimerAsync>>,
     flush_timer_armed: Rc<RefCell<bool>>,
 ) {
@@ -303,37 +303,42 @@ async fn handle_queue(
     }
 }
 
+#[derive(FromArgs)]
+#[argh(description = "")]
+struct Options {
+    #[argh(
+        option,
+        description = "path and options of the disk file.",
+        arg_name = "PATH<:read-only>"
+    )]
+    file: String,
+    #[argh(option, description = "path to a vhost-user socket", arg_name = "PATH")]
+    socket: Option<String>,
+    #[argh(
+        option,
+        description = "VFIO-PCI device name (e.g. '0000:00:07.0')",
+        arg_name = "STRING"
+    )]
+    vfio: Option<String>,
+}
+
 /// Starts a vhost-user block device.
 /// Returns an error if the given `args` is invalid or the device fails to run.
-pub fn run_block_device(program_name: &str, args: std::env::Args) -> anyhow::Result<()> {
-    let mut opts = Options::new();
-    opts.optopt(
-        "",
-        "file",
-        "path and options of the disk file",
-        "PATH<:read-only>",
-    );
-    opts.optflag("h", "help", "print this help menu");
-    opts.optopt("", "socket", "path to a socket", "PATH");
-
-    let matches = match opts.parse(args) {
-        Ok(m) => m,
+pub fn run_block_device(program_name: &str, args: &[&str]) -> anyhow::Result<()> {
+    let opts = match Options::from_args(&[program_name], args) {
+        Ok(opts) => opts,
         Err(e) => {
-            bail!("failed to parse arguments: {}", e);
+            if e.status.is_err() {
+                bail!(e.output);
+            } else {
+                println!("{}", e.output);
+            }
+            return Ok(());
         }
     };
 
-    if matches.opt_present("h") {
-        println!("{}", opts.usage(program_name));
-        return Ok(());
-    }
-
-    if !matches.opt_present("file") {
-        bail!("Must specify the file for the block device.");
-    }
-
-    if !matches.opt_present("socket") {
-        bail!("Must specify the socket for the vhost user device.");
+    if !(opts.socket.is_some() ^ opts.vfio.is_some()) {
+        bail!("Exactly one of `--socket` or `--vfio` is required");
     }
 
     let ex = Executor::new().context("failed to create executor")?;
@@ -341,17 +346,20 @@ pub fn run_block_device(program_name: &str, args: std::env::Args) -> anyhow::Res
         .set(ex.clone())
         .map_err(|_| anyhow!("failed to set executor"))?;
 
-    // We can unwrap after `opt_str()` safely because they are required options.
-    let socket = matches.opt_str("socket").unwrap();
-    let filearg = matches.opt_str("file").unwrap();
-    let fileopts = filearg.split(':').collect::<Vec<&str>>();
-    let filename = fileopts.get(0).context("Must specify the filename")?;
-    let block = BlockBackend::new(BLOCK_EXECUTOR.clone(), filename, fileopts[1..].to_vec())?;
+    let mut fileopts = opts.file.split(":").collect::<Vec<_>>();
+    let filename = fileopts.remove(0);
+
+    let block = BlockBackend::new(BLOCK_EXECUTOR.clone(), filename, fileopts)?;
     let handler = DeviceRequestHandler::new(block);
-
-    if let Err(e) = ex.run_until(handler.run(socket, &ex)) {
-        bail!("error occurred: {}", e);
+    match (opts.socket, opts.vfio) {
+        (Some(socket), None) => {
+            // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
+            ex.run_until(handler.run(socket, &ex))?
+        }
+        (None, Some(device_name)) => {
+            let device = VvuPciDevice::new(device_name.as_str(), BlockBackend::MAX_QUEUE_NUM)?;
+            ex.run_until(handler.run_vvu(device, &ex))?
+        }
+        _ => unreachable!("Must be checked above"),
     }
-
-    Ok(())
 }

@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, bail, Context};
+use argh::FromArgs;
 use base::{error, validate_raw_descriptor, warn, Event, RawDescriptor};
 use cros_async::{EventAsync, Executor, IoSourceExt};
 use data_model::DataInit;
 use futures::future::{AbortHandle, Abortable};
-use getopts::Options;
+use hypervisor::ProtectionType;
 use net_util::{MacAddress, Tap, TapT};
 use once_cell::sync::OnceCell;
 use sync::Mutex;
@@ -20,14 +21,14 @@ use virtio_sys::virtio_net;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 
+use crate::virtio;
 use crate::virtio::net::{
     build_config, process_ctrl, process_rx, process_tx, validate_and_configure_tap,
     virtio_features_to_tap_offload, NetError,
 };
 use crate::virtio::vhost::user::device::handler::{
-    CallEvent, DeviceRequestHandler, VhostUserBackend,
+    DeviceRequestHandler, Doorbell, VhostUserBackend,
 };
-use crate::{virtio, ProtectionType};
 
 thread_local! {
     static NET_EXECUTOR: OnceCell<Executor> = OnceCell::new();
@@ -37,7 +38,7 @@ async fn run_tx_queue(
     mut queue: virtio::Queue,
     mem: GuestMemory,
     mut tap: Tap,
-    call_evt: Arc<Mutex<CallEvent>>,
+    doorbell: Arc<Mutex<Doorbell>>,
     kick_evt: EventAsync,
 ) {
     loop {
@@ -46,7 +47,7 @@ async fn run_tx_queue(
             break;
         }
 
-        process_tx(&call_evt, &mut queue, &mem, &mut tap);
+        process_tx(&doorbell, &mut queue, &mem, &mut tap);
     }
 }
 
@@ -54,7 +55,7 @@ async fn run_rx_queue(
     mut queue: virtio::Queue,
     mem: GuestMemory,
     mut tap: Box<dyn IoSourceExt<Tap>>,
-    call_evt: Arc<Mutex<CallEvent>>,
+    doorbell: Arc<Mutex<Doorbell>>,
     kick_evt: EventAsync,
 ) {
     loop {
@@ -63,7 +64,7 @@ async fn run_rx_queue(
             break;
         }
 
-        match process_rx(&call_evt, &mut queue, &mem, tap.as_source_mut()) {
+        match process_rx(&doorbell, &mut queue, &mem, tap.as_source_mut()) {
             Ok(()) => {}
             Err(NetError::RxDescriptorsExhausted) => {
                 if let Err(e) = kick_evt.next_val().await {
@@ -83,7 +84,7 @@ async fn run_ctrl_queue(
     mut queue: virtio::Queue,
     mem: GuestMemory,
     mut tap: Tap,
-    call_evt: Arc<Mutex<CallEvent>>,
+    doorbell: Arc<Mutex<Doorbell>>,
     kick_evt: EventAsync,
     acked_features: u64,
     vq_pairs: u16,
@@ -95,7 +96,7 @@ async fn run_ctrl_queue(
         }
 
         if let Err(e) = process_ctrl(
-            &call_evt,
+            &doorbell,
             &mut queue,
             &mem,
             &mut tap,
@@ -213,7 +214,6 @@ impl VhostUserBackend for NetBackend {
     const MAX_QUEUE_NUM: usize = 3; /* rx, tx, ctrl */
     const MAX_VRING_LEN: u16 = 256;
 
-    type Doorbell = CallEvent;
     type Error = anyhow::Error;
 
     fn features(&self) -> u64 {
@@ -267,7 +267,7 @@ impl VhostUserBackend for NetBackend {
         idx: usize,
         mut queue: virtio::Queue,
         mem: GuestMemory,
-        call_evt: Arc<Mutex<CallEvent>>,
+        doorbell: Arc<Mutex<Doorbell>>,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
@@ -293,14 +293,14 @@ impl VhostUserBackend for NetBackend {
                         .context("failed to create async tap device")?;
 
                     ex.spawn_local(Abortable::new(
-                        run_rx_queue(queue, mem, tap, call_evt, kick_evt),
+                        run_rx_queue(queue, mem, tap, doorbell, kick_evt),
                         registration,
                     ))
                     .detach();
                 }
                 1 => {
                     ex.spawn_local(Abortable::new(
-                        run_tx_queue(queue, mem, tap, call_evt, kick_evt),
+                        run_tx_queue(queue, mem, tap, doorbell, kick_evt),
                         registration,
                     ))
                     .detach();
@@ -311,7 +311,7 @@ impl VhostUserBackend for NetBackend {
                             queue,
                             mem,
                             tap,
-                            call_evt,
+                            doorbell,
                             kick_evt,
                             self.acked_features,
                             1, /* vq_pairs */
@@ -335,46 +335,48 @@ impl VhostUserBackend for NetBackend {
     }
 }
 
+#[derive(FromArgs)]
+#[argh(description = "")]
+struct Options {
+    #[argh(
+        option,
+        description = "TAP device config. (e.g. \
+        \"/path/to/sock,10.0.2.2,255.255.255.0,12:34:56:78:9a:bc\")",
+        arg_name = "SOCKET_PATH,IP_ADDR,NET_MASK,MAC_ADDR"
+    )]
+    device: Vec<String>,
+    #[argh(
+        option,
+        description = "TAP FD with a socket path",
+        arg_name = "SOCKET_PATH,TAP_FD"
+    )]
+    tap_fd: Vec<String>,
+}
+
 /// Starts a vhost-user net device.
 /// Returns an error if the given `args` is invalid or the device fails to run.
-pub fn run_net_device(program_name: &str, args: std::env::Args) -> anyhow::Result<()> {
-    let mut opts = Options::new();
-    opts.optflag("h", "help", "print this help menu");
-    opts.optmulti(
-        "",
-        "device",
-        "TAP device config. (e.g. \"/path/to/sock,10.0.2.2,255.255.255.0,12:34:56:78:9a:bc\")",
-        "SOCKET_PATH,IP_ADDR,NET_MASK,MAC_ADDR",
-    );
-    opts.optmulti(
-        "",
-        "tap-fd",
-        "TAP FD with a socket path",
-        "SOCKET_PATH,TAP_FD",
-    );
-
-    let matches = match opts.parse(args) {
-        Ok(m) => m,
+pub fn run_net_device(program_name: &str, args: &[&str]) -> anyhow::Result<()> {
+    let opts = match Options::from_args(&[program_name], args) {
+        Ok(opts) => opts,
         Err(e) => {
-            bail!("failed to parse arguments: {}", e);
+            if e.status.is_err() {
+                bail!(e.output);
+            } else {
+                println!("{}", e.output);
+            }
+            return Ok(());
         }
     };
 
-    if matches.opt_present("h") {
-        println!("{}", opts.usage(program_name));
-        return Ok(());
-    }
+    let num_devices = opts.device.len() + opts.tap_fd.len();
 
-    let device_args = matches.opt_strs("device");
-    let tap_fd_args = matches.opt_strs("tap-fd");
-    let num_devices = device_args.len() + tap_fd_args.len();
     if num_devices == 0 {
         bail!("no device option was passed");
     }
 
     let mut devices: Vec<(String, NetBackend)> = Vec::with_capacity(num_devices);
 
-    for arg in device_args {
+    for arg in opts.device.iter() {
         let pos = match arg.find(',') {
             Some(p) => p,
             None => {
@@ -389,7 +391,7 @@ pub fn run_net_device(program_name: &str, args: std::env::Args) -> anyhow::Resul
         devices.push((socket.to_string(), backend));
     }
 
-    for arg in tap_fd_args {
+    for arg in opts.tap_fd.iter() {
         let pos = match arg.find(',') {
             Some(p) => p,
             None => {
@@ -410,20 +412,19 @@ pub fn run_net_device(program_name: &str, args: std::env::Args) -> anyhow::Resul
         let handler = DeviceRequestHandler::new(backend);
         let ex = Executor::new().context("failed to create executor")?;
 
-        threads.push(thread::spawn(move || {
+        threads.push(thread::spawn(move || -> anyhow::Result<()> {
             NET_EXECUTOR.with(|thread_ex| {
                 let _ = thread_ex.set(ex.clone());
             });
-            if let Err(e) = ex.run_until(handler.run(&socket, &ex)) {
-                bail!("error occurred: {}", e);
-            }
-            Ok(())
+            // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
+            ex.run_until(handler.run(&socket, &ex))?
         }));
     }
 
     for t in threads {
-        if let Err(e) = t.join() {
-            bail!("failed to join threads: {:?}", e);
+        match t.join() {
+            Ok(r) => r?,
+            Err(e) => bail!("thread panicked: {:?}", e),
         }
     }
     Ok(())

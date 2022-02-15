@@ -6,7 +6,8 @@
     dead_code,
     non_camel_case_types,
     non_snake_case,
-    non_upper_case_globals
+    non_upper_case_globals,
+    warnings
 )]
 
 /*
@@ -35,6 +36,7 @@ pub type __int32_t = ::std::os::raw::c_int;
 pub type __uint32_t = ::std::os::raw::c_uint;
 pub const vda_impl_type_FAKE: vda_impl_type = 0;
 pub const vda_impl_type_GAVDA: vda_impl_type = 1;
+pub const vda_impl_type_GAVD: vda_impl_type = 2;
 pub type vda_impl_type = u32;
 pub use self::vda_impl_type as vda_impl_type_t;
 pub const vda_result_SUCCESS: vda_result = 0;

@@ -9,12 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
+use argh::FromArgs;
 use base::{error, get_max_open_files, warn, Event, RawDescriptor, Tube, UnlinkUnixListener};
 use cros_async::{EventAsync, Executor};
 use data_model::{DataInit, Le32};
 use fuse::Server;
 use futures::future::{AbortHandle, Abortable};
-use getopts::Options;
+use hypervisor::ProtectionType;
 use minijail::{self, Minijail};
 use once_cell::sync::OnceCell;
 use sync::Mutex;
@@ -26,16 +27,15 @@ use crate::virtio::copy_config;
 use crate::virtio::fs::passthrough::PassthroughFs;
 use crate::virtio::fs::{process_fs_queue, virtio_fs_config, FS_MAX_TAG_LEN};
 use crate::virtio::vhost::user::device::handler::{
-    CallEvent, DeviceRequestHandler, VhostUserBackend,
+    DeviceRequestHandler, Doorbell, VhostUserBackend,
 };
-use crate::ProtectionType;
 
 static FS_EXECUTOR: OnceCell<Executor> = OnceCell::new();
 
 async fn handle_fs_queue(
     mut queue: virtio::Queue,
     mem: GuestMemory,
-    call_evt: Arc<Mutex<CallEvent>>,
+    doorbell: Arc<Mutex<Doorbell>>,
     kick_evt: EventAsync,
     server: Arc<fuse::Server<PassthroughFs>>,
     tube: Arc<Mutex<Tube>>,
@@ -48,7 +48,7 @@ async fn handle_fs_queue(
             error!("Failed to read kick event for fs queue: {}", e);
             break;
         }
-        if let Err(e) = process_fs_queue(&mem, &call_evt, &mut queue, &server, &tube, slot) {
+        if let Err(e) = process_fs_queue(&mem, &doorbell, &mut queue, &server, &tube, slot) {
             error!("Process FS queue failed: {}", e);
             break;
         }
@@ -162,7 +162,6 @@ impl VhostUserBackend for FsBackend {
     const MAX_QUEUE_NUM: usize = 2; /* worker queue and high priority queue */
     const MAX_VRING_LEN: u16 = 1024;
 
-    type Doorbell = CallEvent;
     type Error = anyhow::Error;
 
     fn features(&self) -> u64 {
@@ -219,7 +218,7 @@ impl VhostUserBackend for FsBackend {
         idx: usize,
         mut queue: virtio::Queue,
         mem: GuestMemory,
-        call_evt: Arc<Mutex<CallEvent>>,
+        doorbell: Arc<Mutex<Doorbell>>,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
@@ -242,7 +241,7 @@ impl VhostUserBackend for FsBackend {
             handle_fs_queue(
                 queue,
                 mem,
-                call_evt,
+                doorbell,
                 kick_evt,
                 self.server.clone(),
                 Arc::new(Mutex::new(fs_device_tube)),
@@ -262,73 +261,49 @@ impl VhostUserBackend for FsBackend {
     }
 }
 
+#[derive(FromArgs)]
+#[argh(description = "")]
+struct Options {
+    #[argh(option, description = "path to a socket", arg_name = "PATH")]
+    socket: String,
+    #[argh(option, description = "the virtio-fs tag", arg_name = "TAG")]
+    tag: String,
+    #[argh(option, description = "path to a directory to share", arg_name = "DIR")]
+    shared_dir: PathBuf,
+    #[argh(option, description = "uid map to use", arg_name = "UIDMAP")]
+    uid_map: Option<String>,
+    #[argh(option, description = "gid map to use", arg_name = "GIDMAP")]
+    gid_map: Option<String>,
+}
+
 /// Starts a vhost-user fs device.
 /// Returns an error if the given `args` is invalid or the device fails to run.
-pub fn run_fs_device(program_name: &str, args: std::env::Args) -> anyhow::Result<()> {
-    let mut opts = Options::new();
-    opts.optflag("h", "help", "print this help menu");
-    opts.optopt("", "socket", "path to a socket", "PATH");
-    opts.optopt("", "tag", "the virtio-fs tag", "TAG");
-    opts.optopt("", "shared-dir", "path to a directory to share", "DIR");
-    opts.optopt("", "uid-map", "uid map to use", "UIDMAP");
-    opts.optopt("", "gid-map", "gid map to use", "GIDMAP");
-
-    let matches = match opts.parse(args) {
-        Ok(m) => m,
+pub fn run_fs_device(program_name: &str, args: &[&str]) -> anyhow::Result<()> {
+    let opts = match Options::from_args(&[program_name], args) {
+        Ok(opts) => opts,
         Err(e) => {
-            eprintln!("{}", e);
-            eprintln!("{}", opts.short_usage(program_name));
+            if e.status.is_err() {
+                bail!(e.output);
+            } else {
+                println!("{}", e.output);
+            }
             return Ok(());
         }
     };
 
-    if matches.opt_present("h") {
-        println!("{}", opts.usage(program_name));
-        return Ok(());
-    }
-
-    if !matches.opt_present("socket") {
-        println!("Must specify the socket for the vhost user device.");
-        println!("{}", opts.usage(program_name));
-        return Ok(());
-    }
-
-    if !matches.opt_present("tag") {
-        println!("Must specify the filesystem tag.");
-        println!("{}", opts.usage(program_name));
-        return Ok(());
-    }
-
-    if !matches.opt_present("shared-dir") {
-        println!("Must specify the directory to share.");
-        println!("{}", opts.usage(program_name));
-        return Ok(());
-    }
-
-    // We can unwrap after `opt_str()` safely because these are required options that we just
-    // checked
-    let socket = matches.opt_str("socket").unwrap();
-    let tag = matches.opt_str("tag").unwrap();
-    let dir_path = PathBuf::from(matches.opt_str("shared-dir").unwrap());
-
     base::syslog::init().context("Failed to initialize syslog")?;
 
-    let fs_device = FsBackend::new(&tag)?;
+    let fs_device = FsBackend::new(&opts.tag)?;
 
     // Create and bind unix socket
-    let listener = UnixListener::bind(socket).map(UnlinkUnixListener)?;
+    let listener = UnixListener::bind(opts.socket).map(UnlinkUnixListener)?;
     let mut keep_rds = fs_device.keep_rds.clone();
     keep_rds.push(listener.as_raw_fd());
     base::syslog::push_descriptors(&mut keep_rds);
 
     let handler = DeviceRequestHandler::new(fs_device);
 
-    let pid = jail_and_fork(
-        keep_rds,
-        dir_path,
-        matches.opt_str("uid-map"),
-        matches.opt_str("gid-map"),
-    )?;
+    let pid = jail_and_fork(keep_rds, opts.shared_dir, opts.uid_map, opts.gid_map)?;
 
     // Parent, nothing to do but wait and then exit
     if pid != 0 {
@@ -361,9 +336,6 @@ pub fn run_fs_device(program_name: &str, args: std::env::Args) -> anyhow::Result
 
     let _ = FS_EXECUTOR.set(ex.clone());
 
-    if let Err(e) = ex.run_until(handler.run_with_listener(listener, &ex)) {
-        bail!(e);
-    }
-
-    Ok(())
+    // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
+    ex.run_until(handler.run_with_listener(listener, &ex))?
 }

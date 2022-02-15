@@ -39,6 +39,13 @@ mod resource;
 mod response;
 mod worker;
 
+#[cfg(all(feature = "video-decoder", not(feature = "libvda")))]
+compile_error!("The \"video-decoder\" feature requires \"libvda\" to also be enabled.");
+
+#[cfg(all(feature = "video-encoder", not(feature = "libvda")))]
+compile_error!("The \"video-encoder\" feature requires \"libvda\" to also be enabled.");
+
+#[cfg(feature = "libvda")]
 mod vda;
 
 use command::ReadCmdError;
@@ -121,7 +128,10 @@ impl Drop for VideoDevice {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VideoBackendType {
+    #[cfg(feature = "libvda")]
     Libvda,
+    #[cfg(feature = "libvda")]
+    LibvdaVd,
 }
 
 impl VirtioDevice for VideoDevice {
@@ -147,16 +157,35 @@ impl VirtioDevice for VideoDevice {
     }
 
     fn features(&self) -> u64 {
-        self.base_features
-            | 1u64 << protocol::VIRTIO_VIDEO_F_RESOURCE_NON_CONTIG
-            | 1u64 << protocol::VIRTIO_VIDEO_F_RESOURCE_VIRTIO_OBJECT
+        // We specify the type to avoid an extra compilation error in case no backend is enabled
+        // and this match statement becomes empty.
+        let backend_features: u64 = match self.backend {
+            #[cfg(feature = "libvda")]
+            VideoBackendType::Libvda | VideoBackendType::LibvdaVd => {
+                vda::supported_virtio_features()
+            }
+        };
+
+        self.base_features | backend_features
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        let mut device_name = [0u8; 32];
+        match self.backend {
+            #[cfg(feature = "libvda")]
+            VideoBackendType::Libvda => {
+                (&mut device_name[0..6]).copy_from_slice("libvda".as_bytes())
+            }
+            #[cfg(feature = "libvda")]
+            VideoBackendType::LibvdaVd => {
+                (&mut device_name[0..8]).copy_from_slice("libvdavd".as_bytes())
+            }
+        };
         let mut cfg = protocol::virtio_video_config {
             version: Le32::from(0),
             max_caps_length: Le32::from(1024), // Set a big number
             max_resp_length: Le32::from(1024), // Set a big number
+            device_name,
         };
         copy_config(data, 0, cfg.as_mut_slice(), offset);
     }
@@ -207,7 +236,7 @@ impl VirtioDevice for VideoDevice {
         };
         let mut worker = Worker::new(
             interrupt,
-            mem,
+            mem.clone(),
             cmd_queue,
             cmd_evt,
             event_queue,
@@ -220,15 +249,31 @@ impl VirtioDevice for VideoDevice {
                 .name("virtio video decoder".to_owned())
                 .spawn(move || {
                     let device: Box<dyn Device> = match backend {
+                        #[cfg(feature = "libvda")]
                         VideoBackendType::Libvda => {
-                            let vda = match decoder::backend::vda::LibvdaDecoder::new() {
+                            let vda = match decoder::backend::vda::LibvdaDecoder::new(
+                                libvda::decode::VdaImplType::Gavda,
+                            ) {
                                 Ok(vda) => vda,
                                 Err(e) => {
                                     error!("Failed to initialize VDA for decoder: {}", e);
                                     return;
                                 }
                             };
-                            Box::new(decoder::Decoder::new(vda, resource_bridge))
+                            Box::new(decoder::Decoder::new(vda, resource_bridge, mem))
+                        }
+                        #[cfg(feature = "libvda")]
+                        VideoBackendType::LibvdaVd => {
+                            let vda = match decoder::backend::vda::LibvdaDecoder::new(
+                                libvda::decode::VdaImplType::Gavd,
+                            ) {
+                                Ok(vda) => vda,
+                                Err(e) => {
+                                    error!("Failed to initialize VD for decoder: {}", e);
+                                    return;
+                                }
+                            };
+                            Box::new(decoder::Decoder::new(vda, resource_bridge, mem))
                         }
                     };
 
@@ -242,6 +287,7 @@ impl VirtioDevice for VideoDevice {
                 .name("virtio video encoder".to_owned())
                 .spawn(move || {
                     let device: Box<dyn Device> = match backend {
+                        #[cfg(feature = "libvda")]
                         VideoBackendType::Libvda => {
                             let vda = match encoder::backend::vda::LibvdaEncoder::new() {
                                 Ok(vda) => vda,
@@ -251,13 +297,18 @@ impl VirtioDevice for VideoDevice {
                                 }
                             };
 
-                            match encoder::EncoderDevice::new(vda, resource_bridge) {
+                            match encoder::EncoderDevice::new(vda, resource_bridge, mem) {
                                 Ok(encoder) => Box::new(encoder),
                                 Err(e) => {
                                     error!("Failed to create encoder device: {}", e);
                                     return;
                                 }
                             }
+                        }
+                        #[cfg(feature = "libvda")]
+                        VideoBackendType::LibvdaVd => {
+                            error!("Invalid backend for encoder");
+                            return;
                         }
                     };
 

@@ -8,15 +8,16 @@ rustflags = [
     # "-Dwarnings",
 
     # TODO(crbug/908640): To be resolved.
+    "-Aclippy::needless_return",
+    "-Aclippy::needless_doctest_main",
+    "-Aclippy::blocks_in_if_conditions",
     "-Aclippy::missing_safety_doc", # 26 errors
 
-    # False positives affecting WlVfd @ `devices/src/virtio/wl.rs`.
-    # Bug: https://github.com/rust-lang/rust-clippy/issues/6312
-    "-Aclippy::field_reassign_with_default",
-
     # We don't care about these lints. Okay to remain suppressed globally.
+    "-Aclippy::bool_assert_comparison",
     "-Aclippy::cast_lossless",
     "-Aclippy::cognitive_complexity",
+    "-Aclippy::collapsible_if",
     "-Aclippy::enum_variant_names",
     "-Aclippy::identity_op",
     "-Aclippy::len_without_is_empty",
@@ -26,7 +27,9 @@ rustflags = [
     "-Aclippy::module_inception",
     "-Aclippy::needless_bool",
     "-Aclippy::new_without_default",
+    "-Aclippy::new-ret-no-self",
     "-Aclippy::or_fun_call",
+    "-Aclippy::result-unit-err",
     "-Aclippy::should_implement_trait",
     "-Aclippy::single_char_pattern",
     "-Aclippy::too_many_arguments",
@@ -35,7 +38,7 @@ rustflags = [
     "-Aclippy::unreadable_literal",
     "-Aclippy::useless_let_if_seq",
     "-Aclippy::useless_transmute",
-    "-Aclippy::new-ret-no-self",
-    "-Aclippy::result-unit-err",
-    "-Aclippy::collapsible_if",
 ]
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"

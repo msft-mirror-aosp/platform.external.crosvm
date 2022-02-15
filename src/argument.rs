@@ -411,7 +411,7 @@ impl<'a> KeyValuePair<'a> {
                 "Failed to parse parameter `{}` as {}: {}",
                 self.key,
                 std::any::type_name::<T>(),
-                e.to_string()
+                e
             ))
         })
     }
@@ -514,7 +514,7 @@ impl<'a> KeyValuePair<'a> {
 /// ```
 ///
 /// TODO: upgrade `delimiter` to generic Pattern support once that has been stabilized
-/// (https://github.com/rust-lang/rust/issues/27721)
+/// at <https://github.com/rust-lang/rust/issues/27721>.
 pub fn parse_key_value_options<'a>(
     flagname: &'a str,
     s: &'a str,

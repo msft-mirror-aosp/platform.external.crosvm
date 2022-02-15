@@ -640,7 +640,7 @@ impl IrqChip for KvmSplitIrqChip {
             IrqChipCap::TscDeadlineTimer => self
                 .vm
                 .get_hypervisor()
-                .check_capability(&HypervisorCap::TscDeadlineTimer),
+                .check_capability(HypervisorCap::TscDeadlineTimer),
             IrqChipCap::X2Apic => true,
         }
     }
@@ -720,19 +720,21 @@ mod tests {
 
     use super::*;
     use base::EventReadResult;
-    use hypervisor::kvm::Kvm;
+    use hypervisor::{
+        kvm::Kvm, IoapicRedirectionTableEntry, PitRWMode, ProtectionType, TriggerMode, Vm, VmX86_64,
+    };
+    use resources::{MemRegion, SystemAllocator, SystemAllocatorConfig};
     use vm_memory::GuestMemory;
 
-    use hypervisor::{IoapicRedirectionTableEntry, PitRWMode, TriggerMode, Vm, VmX86_64};
-
-    use super::super::super::tests::*;
+    use crate::irqchip::tests::*;
     use crate::IrqChip;
 
     /// Helper function for setting up a KvmKernelIrqChip
     fn get_kernel_chip() -> KvmKernelIrqChip {
         let kvm = Kvm::new().expect("failed to instantiate Kvm");
         let mem = GuestMemory::new(&[]).unwrap();
-        let vm = KvmVm::new(&kvm, mem).expect("failed tso instantiate vm");
+        let vm =
+            KvmVm::new(&kvm, mem, ProtectionType::Unprotected).expect("failed tso instantiate vm");
 
         let mut chip = KvmKernelIrqChip::new(vm.try_clone().expect("failed to clone vm"), 1)
             .expect("failed to instantiate KvmKernelIrqChip");
@@ -748,7 +750,8 @@ mod tests {
     fn get_split_chip() -> KvmSplitIrqChip {
         let kvm = Kvm::new().expect("failed to instantiate Kvm");
         let mem = GuestMemory::new(&[]).unwrap();
-        let vm = KvmVm::new(&kvm, mem).expect("failed tso instantiate vm");
+        let vm =
+            KvmVm::new(&kvm, mem, ProtectionType::Unprotected).expect("failed tso instantiate vm");
 
         let (_, device_tube) = Tube::pair().expect("failed to create irq tube");
 
@@ -901,12 +904,23 @@ mod tests {
 
         let mmio_bus = Bus::new();
         let io_bus = Bus::new();
-        let mut resources = SystemAllocator::builder()
-            .add_io_addresses(0xc000, 0x10000)
-            .add_low_mmio_addresses(0, 2048)
-            .add_high_mmio_addresses(2048, 4096)
-            .create_allocator(5)
-            .expect("failed to create SystemAllocator");
+        let mut resources = SystemAllocator::new(SystemAllocatorConfig {
+            io: Some(MemRegion {
+                base: 0xc000,
+                size: 0x1_0000,
+            }),
+            low_mmio: MemRegion {
+                base: 0,
+                size: 2048,
+            },
+            high_mmio: MemRegion {
+                base: 2048,
+                size: 4096,
+            },
+            platform_mmio: None,
+            first_irq: 5,
+        })
+        .expect("failed to create SystemAllocator");
 
         // setup an event and a resample event for irq line 1
         let evt = Event::new().expect("failed to create event");
@@ -1019,12 +1033,23 @@ mod tests {
 
         let mmio_bus = Bus::new();
         let io_bus = Bus::new();
-        let mut resources = SystemAllocator::builder()
-            .add_io_addresses(0xc000, 0x10000)
-            .add_low_mmio_addresses(0, 2048)
-            .add_high_mmio_addresses(2048, 4096)
-            .create_allocator(5)
-            .expect("failed to create SystemAllocator");
+        let mut resources = SystemAllocator::new(SystemAllocatorConfig {
+            io: Some(MemRegion {
+                base: 0xc000,
+                size: 0x1_0000,
+            }),
+            low_mmio: MemRegion {
+                base: 0,
+                size: 2048,
+            },
+            high_mmio: MemRegion {
+                base: 2048,
+                size: 4096,
+            },
+            platform_mmio: None,
+            first_irq: 5,
+        })
+        .expect("failed to create SystemAllocator");
 
         // setup an event and a resample event for irq line 1
         let evt = Event::new().expect("failed to create event");

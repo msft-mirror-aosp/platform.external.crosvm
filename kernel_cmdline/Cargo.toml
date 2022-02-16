@@ -5,8 +5,6 @@ edition = "2018"
 
 [dependencies]
 libc = "*"
-remain = "*"
-thiserror = "*"
 
 [lib]
 path = "src/kernel_cmdline.rs"

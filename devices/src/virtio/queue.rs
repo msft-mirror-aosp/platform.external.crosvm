@@ -6,7 +6,6 @@ use std::cmp::min;
 use std::num::Wrapping;
 use std::sync::atomic::{fence, Ordering};
 
-use anyhow::{bail, Context};
 use base::error;
 use cros_async::{AsyncError, EventAsync};
 use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -86,18 +85,15 @@ impl DescriptorChain {
         queue_size: u16,
         index: u16,
         required_flags: u16,
-    ) -> anyhow::Result<DescriptorChain> {
+    ) -> Option<DescriptorChain> {
         if index >= queue_size {
-            bail!("index ({}) >= queue_size ({})", index, queue_size);
+            return None;
         }
 
-        let desc_head = mem
-            .checked_offset(desc_table, (index as u64) * 16)
-            .context("desc_table checked_offset failed")?;
+        let desc_head = mem.checked_offset(desc_table, (index as u64) * 16)?;
         // These reads can't fail unless Guest memory is hopelessly broken.
         let addr = GuestAddress(mem.read_obj_from_addr::<u64>(desc_head).unwrap() as u64);
-        mem.checked_offset(desc_head, 16)
-            .context("desc_head checked_offset failed")?;
+        mem.checked_offset(desc_head, 16)?;
         let len: u32 = mem.read_obj_from_addr(desc_head.unchecked_add(8)).unwrap();
         let flags: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(12)).unwrap();
         let next: u16 = mem.read_obj_from_addr(desc_head.unchecked_add(14)).unwrap();
@@ -114,9 +110,9 @@ impl DescriptorChain {
         };
 
         if chain.is_valid() && chain.flags & required_flags == required_flags {
-            Ok(chain)
+            Some(chain)
         } else {
-            bail!("chain is invalid")
+            None
         }
     }
 
@@ -165,22 +161,17 @@ impl DescriptorChain {
         if self.has_next() {
             // Once we see a write-only descriptor, all subsequent descriptors must be write-only.
             let required_flags = self.flags & VIRTQ_DESC_F_WRITE;
-            match DescriptorChain::checked_new(
+            DescriptorChain::checked_new(
                 &self.mem,
                 self.desc_table,
                 self.queue_size,
                 self.next,
                 required_flags,
-            ) {
-                Ok(mut c) => {
-                    c.ttl = self.ttl - 1;
-                    Some(c)
-                }
-                Err(e) => {
-                    error!("{:#}", e);
-                    None
-                }
-            }
+            )
+            .map(|mut c| {
+                c.ttl = self.ttl - 1;
+                c
+            })
         } else {
             None
         }
@@ -230,8 +221,8 @@ pub struct Queue {
     /// Guest physical address of the used ring
     pub used_ring: GuestAddress,
 
-    pub next_avail: Wrapping<u16>,
-    pub next_used: Wrapping<u16>,
+    next_avail: Wrapping<u16>,
+    next_used: Wrapping<u16>,
 
     // Device feature bits accepted by the driver
     features: u64,
@@ -338,10 +329,11 @@ impl Queue {
     // All available ring entries between `self.next_avail` and `get_avail_index()` are available
     // to be processed by the device.
     fn get_avail_index(&self, mem: &GuestMemory) -> Wrapping<u16> {
-        fence(Ordering::SeqCst);
-
         let avail_index_addr = self.avail_ring.unchecked_add(2);
         let avail_index: u16 = mem.read_obj_from_addr(avail_index_addr).unwrap();
+
+        // Make sure following reads (e.g. desc_idx) don't pass the avail_index read.
+        fence(Ordering::Acquire);
 
         Wrapping(avail_index)
     }
@@ -353,8 +345,6 @@ impl Queue {
     //
     // This value is only used if the `VIRTIO_F_EVENT_IDX` feature has been negotiated.
     fn set_avail_event(&mut self, mem: &GuestMemory, avail_index: Wrapping<u16>) {
-        fence(Ordering::SeqCst);
-
         let avail_event_addr = self
             .used_ring
             .unchecked_add(4 + 8 * u64::from(self.actual_size()));
@@ -365,11 +355,9 @@ impl Queue {
     // Query the value of a single-bit flag in the available ring.
     //
     // Returns `true` if `flag` is currently set (by the driver) in the available ring flags.
+    #[allow(dead_code)]
     fn get_avail_flag(&self, mem: &GuestMemory, flag: u16) -> bool {
-        fence(Ordering::SeqCst);
-
         let avail_flags: u16 = mem.read_obj_from_addr(self.avail_ring).unwrap();
-
         avail_flags & flag == flag
     }
 
@@ -381,13 +369,10 @@ impl Queue {
     //
     // This value is only valid if the `VIRTIO_F_EVENT_IDX` feature has been negotiated.
     fn get_used_event(&self, mem: &GuestMemory) -> Wrapping<u16> {
-        fence(Ordering::SeqCst);
-
         let used_event_addr = self
             .avail_ring
             .unchecked_add(4 + 2 * u64::from(self.actual_size()));
         let used_event: u16 = mem.read_obj_from_addr(used_event_addr).unwrap();
-
         Wrapping(used_event)
     }
 
@@ -396,7 +381,8 @@ impl Queue {
     // This indicates to the driver that all entries up to (but not including) `used_index` have
     // been used by the device and may be processed by the driver.
     fn set_used_index(&mut self, mem: &GuestMemory, used_index: Wrapping<u16>) {
-        fence(Ordering::SeqCst);
+        // This fence ensures all descriptor writes are visible before the index update.
+        fence(Ordering::Release);
 
         let used_index_addr = self.used_ring.unchecked_add(2);
         mem.write_obj_at_addr(used_index.0, used_index_addr)
@@ -407,8 +393,6 @@ impl Queue {
     //
     // Changes the bit specified by the mask in `flag` to `value`.
     fn set_used_flag(&mut self, mem: &GuestMemory, flag: u16, value: bool) {
-        fence(Ordering::SeqCst);
-
         let mut used_flags: u16 = mem.read_obj_from_addr(self.used_ring).unwrap();
         if value {
             used_flags |= flag;
@@ -440,11 +424,6 @@ impl Queue {
         let descriptor_index: u16 = mem.read_obj_from_addr(desc_idx_addr).unwrap();
 
         DescriptorChain::checked_new(mem, self.desc_table, queue_size, descriptor_index, 0)
-            .map_err(|e| {
-                error!("{:#}", e);
-                e
-            })
-            .ok()
     }
 
     /// Remove the first available descriptor chain from the queue.
@@ -509,6 +488,11 @@ impl Queue {
         self.set_used_index(mem, self.next_used);
     }
 
+    /// Updates the index at which the driver should signal the device next.
+    pub fn update_int_required(&mut self, mem: &GuestMemory) {
+        self.set_avail_event(mem, self.get_avail_index(mem));
+    }
+
     /// Enable / Disable guest notify device that requests are available on
     /// the descriptor chain.
     pub fn set_notify(&mut self, mem: &GuestMemory, enable: bool) {
@@ -518,9 +502,9 @@ impl Queue {
             self.notification_disable_count += 1;
         }
 
-        // We should only set VIRTQ_USED_F_NO_NOTIFY when the VIRTIO_RING_F_EVENT_IDX feature has
-        // not been negotiated.
-        if self.features & ((1u64) << VIRTIO_RING_F_EVENT_IDX) == 0 {
+        if self.features & ((1u64) << VIRTIO_RING_F_EVENT_IDX) != 0 {
+            self.update_int_required(mem);
+        } else {
             self.set_used_flag(
                 mem,
                 VIRTQ_USED_F_NO_NOTIFY,
@@ -539,7 +523,13 @@ impl Queue {
             // so no need to inject new interrupt.
             self.next_used - used_event - Wrapping(1) < self.next_used - self.last_used
         } else {
-            !self.get_avail_flag(mem, VIRTQ_AVAIL_F_NO_INTERRUPT)
+            // TODO(b/172975852): This branch should check the flag that requests interrupt
+            // supression:
+            // ```
+            // !self.get_avail_flag(mem, VIRTQ_AVAIL_F_NO_INTERRUPT)
+            // ```
+            // Re-enable the flag check once the missing interrupt issue is debugged.
+            true
         }
     }
 
@@ -679,7 +669,7 @@ mod tests {
     fn queue_event_id_guest_fast() {
         let mut queue = Queue::new(QUEUE_SIZE.try_into().unwrap());
         let memory_start_addr = GuestAddress(0x0);
-        let mem = GuestMemory::new(&[(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
+        let mem = GuestMemory::new(&vec![(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
         setup_vq(&mut queue, &mem);
 
         let interrupt = Interrupt::new(
@@ -691,7 +681,6 @@ mod tests {
         );
 
         // Calculating the offset of used_event within Avail structure
-        #[allow(deref_nullptr)]
         let used_event_offset: u64 =
             unsafe { &(*(::std::ptr::null::<Avail>())).used_event as *const _ as u64 };
         let used_event_address = GuestAddress(AVAIL_OFFSET + used_event_offset);
@@ -756,7 +745,7 @@ mod tests {
     fn queue_event_id_guest_slow() {
         let mut queue = Queue::new(QUEUE_SIZE.try_into().unwrap());
         let memory_start_addr = GuestAddress(0x0);
-        let mem = GuestMemory::new(&[(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
+        let mem = GuestMemory::new(&vec![(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
         setup_vq(&mut queue, &mem);
 
         let interrupt = Interrupt::new(
@@ -768,7 +757,6 @@ mod tests {
         );
 
         // Calculating the offset of used_event within Avail structure
-        #[allow(deref_nullptr)]
         let used_event_offset: u64 =
             unsafe { &(*(::std::ptr::null::<Avail>())).used_event as *const _ as u64 };
         let used_event_address = GuestAddress(AVAIL_OFFSET + used_event_offset);

@@ -4,16 +4,15 @@
 
 //! rutabaga_utils: Utility enums, structs, and implementations needed by the rest of the crate.
 
+use std::fmt::{self, Display};
 use std::io::Error as IoError;
 use std::num::TryFromIntError;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::str::Utf8Error;
 
-use base::{Error as BaseError, ExternalMappingError, SafeDescriptor};
+use base::{Error as SysError, ExternalMappingError, SafeDescriptor};
 use data_model::VolatileMemoryError;
-use remain::sorted;
-use thiserror::Error;
 
 #[cfg(feature = "vulkano")]
 use vulkano::device::DeviceCreationError;
@@ -26,22 +25,17 @@ use vulkano::memory::DeviceMemoryAllocError;
 
 /// Represents a buffer.  `base` contains the address of a buffer, while `len` contains the length
 /// of the buffer.
-#[repr(C)]
 #[derive(Copy, Clone)]
 pub struct RutabagaIovec {
     pub base: *mut c_void,
     pub len: usize,
 }
 
-unsafe impl Send for RutabagaIovec {}
-unsafe impl Sync for RutabagaIovec {}
-
 /// 3D resource creation parameters.  Also used to create 2D resource.  Constants based on Mesa's
 /// (internal) Gallium interface.  Not in the virtio-gpu spec, but should be since dumb resources
 /// can't work with gfxstream/virglrenderer without this.
 pub const RUTABAGA_PIPE_TEXTURE_2D: u32 = 2;
 pub const RUTABAGA_PIPE_BIND_RENDER_TARGET: u32 = 2;
-#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceCreate3D {
     pub target: u32,
@@ -64,7 +58,6 @@ pub const RUTABAGA_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 pub const RUTABAGA_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const RUTABAGA_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 pub const RUTABAGA_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
-#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceCreateBlob {
     pub blob_mem: u32,
@@ -91,21 +84,19 @@ pub struct VulkanInfo {
     pub physical_device_idx: u32,
 }
 
-/// Rutabaga context init capset id mask.
+/// Rutabaga context init capset id mask (not upstreamed).
 pub const RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK: u32 = 0x00ff;
 
-/// Rutabaga flags for creating fences.
+/// Rutabaga flags for creating fences (fence ctx idx info not upstreamed).
 pub const RUTABAGA_FLAG_FENCE: u32 = 1 << 0;
-pub const RUTABAGA_FLAG_INFO_RING_IDX: u32 = 1 << 1;
+pub const RUTABAGA_FLAG_INFO_FENCE_CTX_IDX: u32 = 1 << 1;
 
 /// Convenience struct for Rutabaga fences
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct RutabagaFence {
+pub struct RutabagaFenceData {
     pub flags: u32,
     pub fence_id: u64,
     pub ctx_id: u32,
-    pub ring_idx: u8,
+    pub fence_ctx_idx: u32,
 }
 
 /// Mapped memory caching flags (see virtio_gpu spec)
@@ -116,131 +107,127 @@ pub const RUTABAGA_MAP_CACHE_WC: u32 = 0x03;
 /// Rutabaga capsets.
 pub const RUTABAGA_CAPSET_VIRGL: u32 = 1;
 pub const RUTABAGA_CAPSET_VIRGL2: u32 = 2;
+/// The following capsets are not upstreamed.
 pub const RUTABAGA_CAPSET_GFXSTREAM: u32 = 3;
 pub const RUTABAGA_CAPSET_VENUS: u32 = 4;
 pub const RUTABAGA_CAPSET_CROSS_DOMAIN: u32 = 5;
 
 /// An error generated while using this crate.
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum RutabagaError {
     /// Indicates `Rutabaga` was already initialized since only one Rutabaga instance per process
     /// is allowed.
-    #[error("attempted to use a rutabaga asset already in use")]
     AlreadyInUse,
-    /// Base error returned as a result of rutabaga library operation.
-    #[error("rutabaga received a base error: {0}")]
-    BaseError(BaseError),
     /// Checked Arithmetic error
-    #[error("arithmetic failed: {}({}) {op} {}({})", .field1.0, .field1.1, .field2.0, .field2.1)]
     CheckedArithmetic {
         field1: (&'static str, usize),
         field2: (&'static str, usize),
         op: &'static str,
     },
     /// Checked Range error
-    #[error("range check failed: {}({}) vs {}({})", .field1.0, .field1.1, .field2.0, .field2.1)]
     CheckedRange {
         field1: (&'static str, usize),
         field2: (&'static str, usize),
     },
-    /// An internal Rutabaga component error was returned.
-    #[error("rutabaga component failed with error {0}")]
-    ComponentError(i32),
-    /// Invalid 2D info
-    #[error("invalid 2D info")]
-    Invalid2DInfo,
+    /// The Rutabaga component failed to export a RutabagaHandle.
+    ExportedRutabagaHandle,
     /// Invalid Capset
-    #[error("invalid capset")]
     InvalidCapset,
     /// A command size was submitted that was invalid.
-    #[error("command buffer submitted with invalid size: {0}")]
     InvalidCommandSize(usize),
     /// Invalid RutabagaComponent
-    #[error("invalid rutabaga component")]
     InvalidComponent,
     /// Invalid Context ID
-    #[error("invalid context id")]
     InvalidContextId,
-    /// Invalid cross domain channel
-    #[error("invalid cross domain channel")]
-    InvalidCrossDomainChannel,
-    /// Invalid cross domain item ID
-    #[error("invalid cross domain item id")]
-    InvalidCrossDomainItemId,
-    /// Invalid cross domain item type
-    #[error("invalid cross domain item type")]
-    InvalidCrossDomainItemType,
-    /// Invalid cross domain state
-    #[error("invalid cross domain state")]
-    InvalidCrossDomainState,
-    /// Invalid gralloc backend.
-    #[error("invalid gralloc backend")]
-    InvalidGrallocBackend,
-    /// Invalid gralloc dimensions.
-    #[error("invalid gralloc dimensions")]
-    InvalidGrallocDimensions,
-    /// Invalid gralloc DRM format.
-    #[error("invalid gralloc DRM format")]
-    InvalidGrallocDrmFormat,
-    /// Invalid GPU type.
-    #[error("invalid GPU type for gralloc")]
-    InvalidGrallocGpuType,
-    /// Invalid number of YUV planes.
-    #[error("invalid number of YUV planes")]
-    InvalidGrallocNumberOfPlanes,
     /// The indicated region of guest memory is invalid.
-    #[error("an iovec is outside of guest memory's range")]
     InvalidIovec,
     /// Invalid Resource ID.
-    #[error("invalid resource id")]
     InvalidResourceId,
     /// Indicates an error in the RutabagaBuilder.
-    #[error("invalid rutabaga build parameters")]
     InvalidRutabagaBuild,
-    /// An error with the RutabagaHandle
-    #[error("invalid rutabaga handle")]
-    InvalidRutabagaHandle,
-    /// Invalid Vulkan info
-    #[error("invalid vulkan info")]
-    InvalidVulkanInfo,
     /// An input/output error occured.
-    #[error("an input/output error occur: {0}")]
     IoError(IoError),
     /// The mapping failed.
-    #[error("The mapping failed for the following reason: {0}")]
     MappingFailed(ExternalMappingError),
+    /// An internal Rutabaga component error was returned.
+    ComponentError(i32),
     /// Violation of the Rutabaga spec occured.
-    #[error("violation of the rutabaga spec: {0}")]
-    SpecViolation(&'static str),
+    SpecViolation,
+    /// System error returned as a result of rutabaga library operation.
+    SysError(SysError),
     /// An attempted integer conversion failed.
-    #[error("int conversion failed: {0}")]
     TryFromIntError(TryFromIntError),
     /// The command is unsupported.
-    #[error("the requested function is not implemented")]
     Unsupported,
     /// Utf8 error.
-    #[error("an utf8 error occured: {0}")]
     Utf8Error(Utf8Error),
-    /// Device creation error
-    #[cfg(feature = "vulkano")]
-    #[error("vulkano device creation failure {0}")]
-    VkDeviceCreationError(DeviceCreationError),
-    /// Device memory allocation error
-    #[cfg(feature = "vulkano")]
-    #[error("vulkano device memory allocation failure {0}")]
-    VkDeviceMemoryAllocError(DeviceMemoryAllocError),
+    /// Volatile memory error
+    VolatileMemoryError(VolatileMemoryError),
     /// Image creation error
     #[cfg(feature = "vulkano")]
-    #[error("vulkano image creation failure {0}")]
     VkImageCreationError(ImageCreationError),
     /// Instance creation error
     #[cfg(feature = "vulkano")]
-    #[error("vulkano instance creation failure {0}")]
     VkInstanceCreationError(InstanceCreationError),
-    /// Volatile memory error
-    #[error("noticed a volatile memory error {0}")]
-    VolatileMemoryError(VolatileMemoryError),
+    /// Device creation error
+    #[cfg(feature = "vulkano")]
+    VkDeviceCreationError(DeviceCreationError),
+    /// Device memory allocation error
+    #[cfg(feature = "vulkano")]
+    VkDeviceMemoryAllocError(DeviceMemoryAllocError),
+}
+
+impl Display for RutabagaError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::RutabagaError::*;
+        match self {
+            AlreadyInUse => write!(f, "attempted to use a rutabaga asset already in use"),
+            CheckedArithmetic {
+                field1: (label1, value1),
+                field2: (label2, value2),
+                op,
+            } => write!(
+                f,
+                "arithmetic failed: {}({}) {} {}({})",
+                label1, value1, op, label2, value2
+            ),
+            CheckedRange {
+                field1: (label1, value1),
+                field2: (label2, value2),
+            } => write!(
+                f,
+                "range check failed: {}({}) vs {}({})",
+                label1, value1, label2, value2
+            ),
+            ExportedRutabagaHandle => write!(f, "failed to export Rutabaga handle"),
+            InvalidCapset => write!(f, "invalid capset"),
+            InvalidCommandSize(s) => write!(f, "command buffer submitted with invalid size: {}", s),
+            InvalidComponent => write!(f, "invalid rutabaga component"),
+            InvalidContextId => write!(f, "invalid context id"),
+            InvalidIovec => write!(f, "an iovec is outside of guest memory's range"),
+            InvalidResourceId => write!(f, "invalid resource id"),
+            InvalidRutabagaBuild => write!(f, "invalid rutabaga build parameters"),
+            IoError(e) => write!(f, "an input/output error occur: {}", e),
+            MappingFailed(s) => write!(f, "The mapping failed for the following reason: {}", s),
+            ComponentError(ret) => write!(f, "rutabaga component failed with error {}", ret),
+            SpecViolation => write!(f, "violation of the rutabaga spec"),
+            SysError(e) => write!(f, "rutabaga received a system error: {}", e),
+            TryFromIntError(e) => write!(f, "int conversion failed: {}", e),
+            Unsupported => write!(f, "feature or function unsupported"),
+            Utf8Error(e) => write!(f, "an utf8 error occured: {}", e),
+            VolatileMemoryError(e) => write!(f, "noticed a volatile memory error {}", e),
+            #[cfg(feature = "vulkano")]
+            VkDeviceCreationError(e) => write!(f, "vulkano device creation failure {}", e),
+            #[cfg(feature = "vulkano")]
+            VkDeviceMemoryAllocError(e) => {
+                write!(f, "vulkano device memory allocation failure {}", e)
+            }
+            #[cfg(feature = "vulkano")]
+            VkImageCreationError(e) => write!(f, "vulkano image creation failure {}", e),
+            #[cfg(feature = "vulkano")]
+            VkInstanceCreationError(e) => write!(f, "vulkano instance creation failure {}", e),
+        }
+    }
 }
 
 impl From<IoError> for RutabagaError {
@@ -249,9 +236,9 @@ impl From<IoError> for RutabagaError {
     }
 }
 
-impl From<BaseError> for RutabagaError {
-    fn from(e: BaseError) -> RutabagaError {
-        RutabagaError::BaseError(e)
+impl From<SysError> for RutabagaError {
+    fn from(e: SysError) -> RutabagaError {
+        RutabagaError::SysError(e)
     }
 }
 
@@ -278,6 +265,7 @@ pub type RutabagaResult<T> = std::result::Result<T, RutabagaError>;
 
 /// Flags for virglrenderer.  Copied from virglrenderer bindings.
 const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
+#[allow(dead_code)]
 const VIRGLRENDERER_THREAD_SYNC: u32 = 1 << 1;
 const VIRGLRENDERER_USE_GLX: u32 = 1 << 2;
 const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
@@ -285,8 +273,6 @@ const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
 const VIRGLRENDERER_USE_EXTERNAL_BLOB: u32 = 1 << 5;
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
-const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 
 /// virglrenderer flag struct.
 #[derive(Copy, Clone)]
@@ -300,7 +286,6 @@ impl Default for VirglRendererFlags {
             .use_egl(true)
             .use_surfaceless(true)
             .use_gles(true)
-            .use_render_server(false)
     }
 }
 
@@ -339,11 +324,6 @@ impl VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_EGL, v)
     }
 
-    /// Use a dedicated thread for fence synchronization.
-    pub fn use_thread_sync(self, v: bool) -> VirglRendererFlags {
-        self.set_flag(VIRGLRENDERER_THREAD_SYNC, v)
-    }
-
     /// Use GLX for context creation.
     pub fn use_glx(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_GLX, v)
@@ -362,15 +342,6 @@ impl VirglRendererFlags {
     /// Use external memory when creating blob resources.
     pub fn use_external_blob(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_EXTERNAL_BLOB, v)
-    }
-
-    /// Retire fence directly from sync thread.
-    pub fn use_async_fence_cb(self, v: bool) -> VirglRendererFlags {
-        self.set_flag(VIRGLRENDERER_USE_ASYNC_FENCE_CB, v)
-    }
-
-    pub fn use_render_server(self, v: bool) -> VirglRendererFlags {
-        self.set_flag(VIRGLRENDERER_RENDER_SERVER, v)
     }
 }
 
@@ -446,8 +417,7 @@ impl From<GfxstreamFlags> for i32 {
 }
 
 /// Transfers {to, from} 1D buffers, 2D textures, 3D textures, and cubemaps.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub struct Transfer3D {
     pub x: u32,
     pub y: u32,
@@ -510,10 +480,9 @@ pub enum RutabagaComponentType {
 pub const RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0001;
 pub const RUTABAGA_MEM_HANDLE_TYPE_DMABUF: u32 = 0x0002;
 pub const RUTABAGE_MEM_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0003;
-pub const RUTABAGA_MEM_HANDLE_TYPE_SHM: u32 = 0x0004;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0010;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0011;
-pub const RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0012;
+pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0004;
+pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0005;
+pub const RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0006;
 
 /// Handle to OS-specific memory or synchronization objects.
 pub struct RutabagaHandle {
@@ -527,53 +496,10 @@ impl RutabagaHandle {
         let clone = self
             .os_handle
             .try_clone()
-            .map_err(|_| RutabagaError::InvalidRutabagaHandle)?;
+            .map_err(|_| RutabagaError::Unsupported)?;
         Ok(RutabagaHandle {
             os_handle: clone,
             handle_type: self.handle_type,
         })
-    }
-}
-
-/// Trait for fence completion handlers
-pub trait RutabagaFenceCallback: Send {
-    fn call(&self, data: RutabagaFence);
-    fn clone_box(&self) -> RutabagaFenceHandler;
-}
-
-/// Wrapper type to allow cloning while respecting object-safety
-pub type RutabagaFenceHandler = Box<dyn RutabagaFenceCallback>;
-
-impl Clone for RutabagaFenceHandler {
-    fn clone(&self) -> Self {
-        self.clone_box()
-    }
-}
-
-/// Fence handler implementation that wraps a closure
-#[derive(Clone)]
-pub struct RutabagaFenceClosure<T> {
-    closure: T,
-}
-
-impl<T> RutabagaFenceClosure<T>
-where
-    T: Fn(RutabagaFence) + Clone + Send + 'static,
-{
-    pub fn new(closure: T) -> RutabagaFenceHandler {
-        Box::new(RutabagaFenceClosure { closure })
-    }
-}
-
-impl<T> RutabagaFenceCallback for RutabagaFenceClosure<T>
-where
-    T: Fn(RutabagaFence) + Clone + Send + 'static,
-{
-    fn call(&self, data: RutabagaFence) {
-        (self.closure)(data)
-    }
-
-    fn clone_box(&self) -> RutabagaFenceHandler {
-        Box::new(self.clone())
     }
 }

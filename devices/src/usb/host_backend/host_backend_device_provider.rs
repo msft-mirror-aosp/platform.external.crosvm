@@ -11,8 +11,6 @@ use crate::usb::xhci::usb_hub::UsbHub;
 use crate::usb::xhci::xhci_backend_device_provider::XhciBackendDeviceProvider;
 use crate::utils::AsyncJobQueue;
 use crate::utils::{EventHandler, EventLoop, FailHandle};
-
-use anyhow::Context;
 use base::{error, AsRawDescriptor, Descriptor, RawDescriptor, Tube, WatchingEvents};
 use std::collections::HashMap;
 use std::mem;
@@ -191,18 +189,11 @@ impl ProviderInner {
             error!("failed to reset device after attach: {:?}", e);
         }
 
-        let host_device = match HostDevice::new(
+        let host_device = Box::new(HostDevice::new(
             self.fail_handle.clone(),
             self.job_queue.clone(),
             arc_mutex_device,
-        ) {
-            Ok(host_device) => Box::new(host_device),
-            Err(e) => {
-                error!("failed to initialize HostDevice: {}", e);
-                return UsbControlResult::FailedToInitHostDevice;
-            }
-        };
-
+        ));
         let port = self.usb_hub.connect_backend(host_device);
         match port {
             Ok(port) => {
@@ -275,9 +266,10 @@ impl ProviderInner {
 }
 
 impl EventHandler for ProviderInner {
-    fn on_event(&self) -> anyhow::Result<()> {
-        self.on_event_helper()
-            .context("host backend device provider failed")
+    fn on_event(&self) -> std::result::Result<(), ()> {
+        self.on_event_helper().map_err(|e| {
+            error!("host backend device provider failed: {}", e);
+        })
     }
 }
 
@@ -286,10 +278,7 @@ struct UsbUtilEventHandler {
 }
 
 impl EventHandler for UsbUtilEventHandler {
-    fn on_event(&self) -> anyhow::Result<()> {
-        self.device
-            .lock()
-            .poll_transfers()
-            .context("UsbUtilEventHandler poll_transfers failed")
+    fn on_event(&self) -> std::result::Result<(), ()> {
+        self.device.lock().poll_transfers().map_err(|_e| ())
     }
 }

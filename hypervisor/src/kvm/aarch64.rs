@@ -5,55 +5,16 @@
 use libc::{EINVAL, ENOMEM, ENOSYS, ENXIO};
 
 use base::{
-    errno_result, error, ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val, Error,
-    MemoryMappingBuilder, Result,
+    errno_result, error, ioctl_with_mut_ref, ioctl_with_ref, Error, MemoryMappingBuilder, Result,
 };
 use kvm_sys::*;
 use vm_memory::GuestAddress;
 
-use super::{Kvm, KvmCap, KvmVcpu, KvmVm};
+use super::{KvmCap, KvmVcpu, KvmVm};
 use crate::{
-    ClockState, DeviceKind, Hypervisor, IrqSourceChip, ProtectionType, PsciVersion, VcpuAArch64,
-    VcpuFeature, Vm, VmAArch64, VmCap,
+    ClockState, DeviceKind, Hypervisor, IrqSourceChip, PsciVersion, VcpuAArch64, VcpuFeature, Vm,
+    VmAArch64, VmCap,
 };
-
-impl Kvm {
-    // Compute the machine type, which should be the IPA range for the VM
-    // Ideally, this would take a description of the memory map and return
-    // the closest machine type for this VM. Here, we just return the maximum
-    // the kernel support.
-    pub fn get_vm_type(&self, protection_type: ProtectionType) -> Result<u32> {
-        // Safe because we know self is a real kvm fd
-        let ipa_size = match unsafe {
-            ioctl_with_val(self, KVM_CHECK_EXTENSION(), KVM_CAP_ARM_VM_IPA_SIZE.into())
-        } {
-            // Not supported? Use 0 as the machine type, which implies 40bit IPA
-            ret if ret < 0 => 0,
-            ipa => ipa as u32,
-        };
-        let protection_flag = match protection_type {
-            ProtectionType::Unprotected => 0,
-            ProtectionType::Protected | ProtectionType::ProtectedWithoutFirmware => {
-                KVM_VM_TYPE_ARM_PROTECTED
-            }
-        };
-        // Use the lower 8 bits representing the IPA space as the machine type
-        Ok((ipa_size & KVM_VM_TYPE_ARM_IPA_SIZE_MASK) | protection_flag)
-    }
-
-    /// Get the size of guest physical addresses (IPA) in bits.
-    pub fn get_guest_phys_addr_bits(&self) -> u8 {
-        // Safe because we know self is a real kvm fd
-        let vm_ipa_size = match unsafe {
-            ioctl_with_val(self, KVM_CHECK_EXTENSION(), KVM_CAP_ARM_VM_IPA_SIZE.into())
-        } {
-            // Default physical address size is 40 bits if the extension is not supported.
-            ret if ret <= 0 => 40,
-            ipa => ipa as u8,
-        };
-        vm_ipa_size
-    }
-}
 
 impl KvmVm {
     /// Checks if a particular `VmCap` is available, or returns None if arch-independent
@@ -106,17 +67,6 @@ impl KvmVm {
         }?;
         Ok(info)
     }
-
-    fn set_protected_vm_firmware_ipa(&self, fw_addr: GuestAddress) -> Result<()> {
-        // Safe because none of the args are pointers.
-        unsafe {
-            self.enable_raw_capability(
-                KvmCap::ArmProtectedVm,
-                KVM_CAP_ARM_PROTECTED_VM_FLAGS_SET_FW_IPA,
-                &[fw_addr.0, 0, 0, 0],
-            )
-        }
-    }
 }
 
 #[repr(C)]
@@ -130,14 +80,13 @@ impl VmAArch64 for KvmVm {
         &self.kvm
     }
 
-    fn load_protected_vm_firmware(
-        &mut self,
-        fw_addr: GuestAddress,
-        fw_max_size: u64,
-    ) -> Result<()> {
+    fn enable_protected_vm(&mut self, fw_addr: GuestAddress, fw_max_size: u64) -> Result<()> {
+        if !self.check_capability(VmCap::Protected) {
+            return Err(Error::new(ENOSYS));
+        }
         let info = self.get_protected_vm_info()?;
-        if info.firmware_size == 0 {
-            Err(Error::new(EINVAL))
+        let memslot = if info.firmware_size == 0 {
+            u64::MAX
         } else {
             if info.firmware_size > fw_max_size {
                 return Err(Error::new(ENOMEM));
@@ -145,8 +94,15 @@ impl VmAArch64 for KvmVm {
             let mem = MemoryMappingBuilder::new(info.firmware_size as usize)
                 .build()
                 .map_err(|_| Error::new(EINVAL))?;
-            self.add_memory_region(fw_addr, Box::new(mem), false, false)?;
-            self.set_protected_vm_firmware_ipa(fw_addr)
+            self.add_memory_region(fw_addr, Box::new(mem), false, false)? as u64
+        };
+        // Safe because none of the args are pointers.
+        unsafe {
+            self.enable_raw_capability(
+                KvmCap::ArmProtectedVm,
+                KVM_CAP_ARM_PROTECTED_VM_FLAGS_ENABLE,
+                &[memslot, 0, 0, 0],
+            )
         }
     }
 
@@ -238,47 +194,6 @@ impl VcpuAArch64 for KvmVcpu {
         Ok(())
     }
 
-    fn has_pvtime_support(&self) -> bool {
-        // The in-kernel PV time structure is initialized by setting the base
-        // address with KVM_ARM_VCPU_PVTIME_IPA
-        let pvtime_attr = kvm_device_attr {
-            group: KVM_ARM_VCPU_PVTIME_CTRL,
-            attr: KVM_ARM_VCPU_PVTIME_IPA as u64,
-            addr: 0,
-            flags: 0,
-        };
-        // Safe because we allocated the struct and we know the kernel will read exactly the size of
-        // the struct.
-        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_HAS_DEVICE_ATTR(), &pvtime_attr) };
-        if ret < 0 {
-            return false;
-        }
-
-        return true;
-    }
-
-    fn init_pvtime(&self, pvtime_ipa: u64) -> Result<()> {
-        let pvtime_ipa_addr = &pvtime_ipa as *const u64;
-
-        // The in-kernel PV time structure is initialized by setting the base
-        // address with KVM_ARM_VCPU_PVTIME_IPA
-        let pvtime_attr = kvm_device_attr {
-            group: KVM_ARM_VCPU_PVTIME_CTRL,
-            attr: KVM_ARM_VCPU_PVTIME_IPA as u64,
-            addr: pvtime_ipa_addr as u64,
-            flags: 0,
-        };
-
-        // Safe because we allocated the struct and we know the kernel will read exactly the size of
-        // the struct.
-        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_SET_DEVICE_ATTR(), &pvtime_attr) };
-        if ret < 0 {
-            return errno_result();
-        }
-
-        Ok(())
-    }
-
     fn set_one_reg(&self, reg_id: u64, data: u64) -> Result<()> {
         let data_ref = &data as *const u64;
         let onereg = kvm_one_reg {
@@ -358,7 +273,7 @@ mod tests {
     fn set_gsi_routing() {
         let kvm = Kvm::new().unwrap();
         let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
+        let vm = KvmVm::new(&kvm, gm).unwrap();
         vm.create_irq_chip().unwrap();
         vm.set_gsi_routing(&[]).unwrap();
         vm.set_gsi_routing(&[IrqRoute {

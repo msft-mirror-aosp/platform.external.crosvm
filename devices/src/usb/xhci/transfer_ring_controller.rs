@@ -6,9 +6,7 @@ use crate::usb::xhci::ring_buffer_controller::{
     Error as RingBufferControllerError, RingBufferController, TransferDescriptorHandler,
 };
 use crate::utils::EventLoop;
-
-use anyhow::Context;
-use base::Event;
+use base::{error, Event};
 use std::sync::Arc;
 use sync::Mutex;
 use vm_memory::GuestMemory;
@@ -38,7 +36,7 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
         &self,
         descriptor: TransferDescriptor,
         completion_event: Event,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ()> {
         let xhci_transfer = self.transfer_manager.create_transfer(
             self.mem.clone(),
             self.port.clone(),
@@ -48,9 +46,9 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
             descriptor,
             completion_event,
         );
-        xhci_transfer
-            .send_to_backend_if_valid()
-            .context("failed to send transfer to backend")
+        xhci_transfer.send_to_backend_if_valid().map_err(|e| {
+            error!("failed to send transfer to backend: {}", e);
+        })
     }
 
     fn stop(&self) -> bool {

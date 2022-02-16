@@ -19,13 +19,13 @@ use base::MappedRegion;
 use crate::rutabaga_gralloc::gralloc::{Gralloc, ImageAllocationInfo, ImageMemoryRequirements};
 use crate::rutabaga_utils::*;
 
-use vulkano::device::physical::{MemoryType, PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceCreationError, DeviceExtensions};
-use vulkano::image::{
-    sys, ImageCreateFlags, ImageCreationError, ImageDimensions, ImageUsage, SampleCount,
-};
+use vulkano::image::{sys, ImageCreateFlags, ImageCreationError, ImageDimensions, ImageUsage};
 
-use vulkano::instance::{Instance, InstanceCreationError, InstanceExtensions, Version};
+use vulkano::instance::{
+    Instance, InstanceCreationError, InstanceExtensions, MemoryType, PhysicalDevice,
+    PhysicalDeviceType,
+};
 
 use vulkano::memory::{
     DedicatedAlloc, DeviceMemoryAllocError, DeviceMemoryBuilder, DeviceMemoryMapping,
@@ -70,12 +70,7 @@ impl VulkanoGralloc {
     pub fn init() -> RutabagaResult<Box<dyn Gralloc>> {
         // Initialization copied from triangle.rs in Vulkano.  Look there for a more detailed
         // explanation of VK initialization.
-        let instance_extensions = InstanceExtensions {
-            khr_external_memory_capabilities: true,
-            khr_get_physical_device_properties2: true,
-            ..InstanceExtensions::none()
-        };
-        let instance = Instance::new(None, Version::V1_1, &instance_extensions, None)?;
+        let instance = Instance::new(None, &InstanceExtensions::none(), None)?;
 
         let mut devices: Map<PhysicalDeviceType, Arc<Device>> = Default::default();
         let mut has_integrated_gpu = false;
@@ -87,45 +82,36 @@ impl VulkanoGralloc {
                     // We take the first queue family that supports graphics.
                     q.supports_graphics()
                 })
-                .ok_or(RutabagaError::SpecViolation(
-                    "need graphics queue family to proceed",
-                ))?;
+                .ok_or(RutabagaError::Unsupported)?;
 
-            let supported_extensions = physical.supported_extensions();
+            let supported_extensions = DeviceExtensions::supported_by_device(physical);
 
             let desired_extensions = DeviceExtensions {
                 khr_dedicated_allocation: true,
                 khr_get_memory_requirements2: true,
                 khr_external_memory: true,
                 khr_external_memory_fd: true,
-                ext_external_memory_dma_buf: true,
+                ext_external_memory_dmabuf: true,
                 ..DeviceExtensions::none()
             };
 
             let intersection = supported_extensions.intersection(&desired_extensions);
 
-            if let Ok(device, mut _queues) = Device::new(
+            let (device, mut _queues) = Device::new(
                 physical,
                 physical.supported_features(),
                 &intersection,
                 [(queue_family, 0.5)].iter().cloned(),
-            ) {
-                let device_type = device.physical_device().properties().device_type;
-                if device_type == PhysicalDeviceType::IntegratedGpu {
-                    has_integrated_gpu = true
-                }
+            )?;
 
-                // If we have two devices of the same type (two integrated GPUs), the old value is
-                // dropped.  Vulkano is verbose enough such that a keener selection algorithm may
-                // be used, but the need for such complexity does not seem to exist now.
-                devices.insert(device_type, device);
-            };
-        }
+            if device.physical_device().ty() == PhysicalDeviceType::IntegratedGpu {
+                has_integrated_gpu = true
+            }
 
-        if devices.is_empty() {
-            return Err(RutabagaError::SpecViolation(
-                "no matching VK devices available",
-            ));
+            // If we have two devices of the same type (two integrated GPUs), the old value is
+            // dropped.  Vulkano is verbose enough such that a keener selection algorithm may
+            // be used, but the need for such complexity does not seem to exist now.
+            devices.insert(device.physical_device().ty(), device);
         }
 
         Ok(Box::new(VulkanoGralloc {
@@ -148,11 +134,11 @@ impl VulkanoGralloc {
         let device = if self.has_integrated_gpu {
             self.devices
                 .get(&PhysicalDeviceType::IntegratedGpu)
-                .ok_or(RutabagaError::InvalidGrallocGpuType)?
+                .ok_or(RutabagaError::Unsupported)?
         } else {
             self.devices
                 .get(&PhysicalDeviceType::DiscreteGpu)
-                .ok_or(RutabagaError::InvalidGrallocGpuType)?
+                .ok_or(RutabagaError::Unsupported)?
         };
 
         let usage = match info.flags.uses_rendering() {
@@ -168,12 +154,12 @@ impl VulkanoGralloc {
 
         // Reasonable bounds on image width.
         if info.width == 0 || info.width > 4096 {
-            return Err(RutabagaError::InvalidGrallocDimensions);
+            return Err(RutabagaError::SpecViolation);
         }
 
         // Reasonable bounds on image height.
         if info.height == 0 || info.height > 4096 {
-            return Err(RutabagaError::InvalidGrallocDimensions);
+            return Err(RutabagaError::SpecViolation);
         }
 
         let vulkan_format = info.drm_format.vulkan_format()?;
@@ -187,7 +173,7 @@ impl VulkanoGralloc {
                 height: info.height,
                 array_layers: 1,
             },
-            SampleCount::Sample1,
+            1, /* number of samples */
             1, /* mipmap count */
             Sharing::Exclusive::<Empty<_>>,
             true,  /* linear images only currently */
@@ -201,7 +187,7 @@ impl VulkanoGralloc {
 impl Gralloc for VulkanoGralloc {
     fn supports_external_gpu_memory(&self) -> bool {
         for device in self.devices.values() {
-            if !device.enabled_extensions().khr_external_memory {
+            if !device.loaded_extensions().khr_external_memory {
                 return false;
             }
         }
@@ -211,7 +197,7 @@ impl Gralloc for VulkanoGralloc {
 
     fn supports_dmabuf(&self) -> bool {
         for device in self.devices.values() {
-            if !device.enabled_extensions().ext_external_memory_dma_buf {
+            if !device.loaded_extensions().ext_external_memory_dmabuf {
                 return false;
             }
         }
@@ -230,11 +216,11 @@ impl Gralloc for VulkanoGralloc {
         let device = if self.has_integrated_gpu {
             self.devices
                 .get(&PhysicalDeviceType::IntegratedGpu)
-                .ok_or(RutabagaError::InvalidGrallocGpuType)?
+                .ok_or(RutabagaError::Unsupported)?
         } else {
             self.devices
                 .get(&PhysicalDeviceType::DiscreteGpu)
-                .ok_or(RutabagaError::InvalidGrallocGpuType)?
+                .ok_or(RutabagaError::Unsupported)?
         };
 
         let planar_layout = info.drm_format.planar_layout()?;
@@ -289,9 +275,7 @@ impl Gralloc for VulkanoGralloc {
                 .chain(second_loop)
                 .filter(|&(t, _)| (memory_requirements.memory_type_bits & (1 << t.id())) != 0)
                 .find(|&(t, rq)| filter(t) == rq)
-                .ok_or(RutabagaError::SpecViolation(
-                    "unable to find required memory type",
-                ))?
+                .ok_or(RutabagaError::Unsupported)?
                 .0
         };
 
@@ -317,25 +301,25 @@ impl Gralloc for VulkanoGralloc {
     fn allocate_memory(&mut self, reqs: ImageMemoryRequirements) -> RutabagaResult<RutabagaHandle> {
         let (unsafe_image, memory_requirements) = unsafe { self.create_image(reqs.info)? };
 
-        let vulkan_info = reqs.vulkan_info.ok_or(RutabagaError::InvalidVulkanInfo)?;
+        let vulkan_info = reqs.vulkan_info.ok_or(RutabagaError::SpecViolation)?;
 
         let device = if self.has_integrated_gpu {
             self.devices
                 .get(&PhysicalDeviceType::IntegratedGpu)
-                .ok_or(RutabagaError::InvalidGrallocGpuType)?
+                .ok_or(RutabagaError::Unsupported)?
         } else {
             self.devices
                 .get(&PhysicalDeviceType::DiscreteGpu)
-                .ok_or(RutabagaError::InvalidGrallocGpuType)?
+                .ok_or(RutabagaError::Unsupported)?
         };
 
         let memory_type = device
             .physical_device()
             .memory_type_by_id(vulkan_info.memory_idx)
-            .ok_or(RutabagaError::InvalidVulkanInfo)?;
+            .ok_or(RutabagaError::SpecViolation)?;
 
         let (handle_type, rutabaga_type) =
-            match device.enabled_extensions().ext_external_memory_dma_buf {
+            match device.loaded_extensions().ext_external_memory_dmabuf {
                 true => (
                     ExternalMemoryHandleType {
                         dma_buf: true,
@@ -352,7 +336,7 @@ impl Gralloc for VulkanoGralloc {
                 ),
             };
 
-        let dedicated = match device.enabled_extensions().khr_dedicated_allocation {
+        let dedicated = match device.loaded_extensions().khr_dedicated_allocation {
             true => {
                 if memory_requirements.prefer_dedicated {
                     DedicatedAlloc::Image(&unsafe_image)
@@ -363,10 +347,11 @@ impl Gralloc for VulkanoGralloc {
             false => DedicatedAlloc::None,
         };
 
-        let device_memory = DeviceMemoryBuilder::new(device.clone(), memory_type.id(), reqs.size)
-            .dedicated_info(dedicated)
-            .export_info(handle_type)
-            .build()?;
+        let device_memory =
+            DeviceMemoryBuilder::new(device.clone(), memory_type.id(), reqs.size as usize)
+                .dedicated_info(dedicated)
+                .export_info(handle_type)
+                .build()?;
 
         let descriptor = device_memory.export_fd(handle_type)?.into();
 
@@ -389,7 +374,7 @@ impl Gralloc for VulkanoGralloc {
             .find(|device| {
                 device.physical_device().index() as u32 == vulkan_info.physical_device_idx
             })
-            .ok_or(RutabagaError::InvalidVulkanInfo)?;
+            .ok_or(RutabagaError::Unsupported)?;
 
         let handle_type = match handle.handle_type {
             RUTABAGA_MEM_HANDLE_TYPE_DMABUF => ExternalMemoryHandleType {
@@ -400,15 +385,17 @@ impl Gralloc for VulkanoGralloc {
                 opaque_fd: true,
                 ..ExternalMemoryHandleType::none()
             },
-            _ => return Err(RutabagaError::InvalidRutabagaHandle),
+            _ => return Err(RutabagaError::Unsupported),
         };
 
-        let device_memory = DeviceMemoryBuilder::new(device.clone(), vulkan_info.memory_idx, size)
-            .import_info(handle.os_handle.into(), handle_type)
-            .build()?;
+        let valid_size: usize = size.try_into()?;
+        let device_memory =
+            DeviceMemoryBuilder::new(device.clone(), vulkan_info.memory_idx, valid_size)
+                .import_info(handle.os_handle.into(), handle_type)
+                .build()?;
         let mapping = DeviceMemoryMapping::new(device.clone(), device_memory.clone(), 0, size, 0)?;
 
-        Ok(Box::new(VulkanoMapping::new(mapping, size.try_into()?)))
+        Ok(Box::new(VulkanoMapping::new(mapping, valid_size)))
     }
 }
 

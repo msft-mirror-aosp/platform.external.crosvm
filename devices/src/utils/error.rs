@@ -3,28 +3,37 @@
 // found in the LICENSE file.
 
 use base::Error as SysError;
-use remain::sorted;
-use thiserror::Error;
+use std::fmt::{self, Display};
 
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("failed to create event: {0}")]
-    CreateEvent(SysError),
-    #[error("failed to create poll context: {0}")]
-    CreateWaitContext(SysError),
-    #[error("event loop already failed due to previous errors")]
     EventLoopAlreadyFailed,
-    #[error("failed to read event: {0}")]
+    CreateEvent(SysError),
     ReadEvent(SysError),
-    #[error("failed to start thread: {0}")]
-    StartThread(std::io::Error),
-    #[error("failed to add fd to poll context: {0}")]
-    WaitContextAddDescriptor(SysError),
-    #[error("failed to delete fd from poll context: {0}")]
-    WaitContextDeleteDescriptor(SysError),
-    #[error("failed to write event: {0}")]
     WriteEvent(SysError),
+    CreateWaitContext(SysError),
+    WaitContextAddDescriptor(SysError),
+    WaitContextDeleteDescriptor(SysError),
+    StartThread(std::io::Error),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            EventLoopAlreadyFailed => write!(f, "event loop already failed due to previous errors"),
+            CreateEvent(e) => write!(f, "failed to create event: {}", e),
+            ReadEvent(e) => write!(f, "failed to read event: {}", e),
+            WriteEvent(e) => write!(f, "failed to write event: {}", e),
+            CreateWaitContext(e) => write!(f, "failed to create poll context: {}", e),
+            WaitContextAddDescriptor(e) => write!(f, "failed to add fd to poll context: {}", e),
+            WaitContextDeleteDescriptor(e) => {
+                write!(f, "failed to delete fd from poll context: {}", e)
+            }
+            StartThread(e) => write!(f, "failed to start thread: {}", e),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

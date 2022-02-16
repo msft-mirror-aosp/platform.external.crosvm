@@ -5,7 +5,7 @@ authors = ["The Chromium OS Authors"]
 edition = "2018"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { path = "../tempfile" }
 crosvm = { path = ".." }
 arch = { path = "../arch" }
 base = "*"

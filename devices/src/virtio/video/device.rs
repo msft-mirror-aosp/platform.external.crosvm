@@ -4,7 +4,7 @@
 
 //! Definition of the trait `Device` that each backend video device must implement.
 
-use base::{PollToken, WaitContext};
+use base::{PollToken, Tube, WaitContext};
 
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
@@ -38,7 +38,6 @@ pub enum AsyncCmdTag {
         queue_type: QueueType,
     },
     // Used exclusively by the encoder.
-    #[cfg(feature = "video-encoder")]
     GetParams {
         stream_id: u32,
         queue_type: QueueType,
@@ -102,6 +101,7 @@ pub trait Device {
         &mut self,
         cmd: VideoCmd,
         wait_ctx: &WaitContext<Token>,
+        resource_bridge: &Tube,
     ) -> (
         VideoCmdResponseType,
         Option<(u32, Vec<VideoEvtResponseType>)>,

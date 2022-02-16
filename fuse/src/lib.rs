@@ -5,7 +5,6 @@
 use std::ffi::FromBytesWithNulError;
 use std::io;
 
-use remain::sorted;
 use thiserror::Error as ThisError;
 
 pub mod filesystem;
@@ -21,7 +20,6 @@ pub use mount::mount;
 pub use server::{Mapper, Reader, Server, Writer};
 
 /// Errors that may occur during the creation or operation of an Fs device.
-#[sorted]
 #[derive(ThisError, Debug)]
 pub enum Error {
     /// A request is missing readable descriptors.
@@ -31,12 +29,15 @@ pub enum Error {
     /// Failed to encode protocol messages.
     #[error("failed to encode fuse message: {0}")]
     EncodeMessage(io::Error),
-    /// Failed to set up FUSE endpoint to talk with.
-    #[error("failed to set up FUSE endpoint to talk with: {0}")]
-    EndpointSetup(io::Error),
     /// Failed to flush protocol messages.
     #[error("failed to flush fuse message: {0}")]
     FlushMessage(io::Error),
+    /// Failed to set up FUSE endpoint to talk with.
+    #[error("failed to set up FUSE endpoint to talk with: {0}")]
+    EndpointSetup(io::Error),
+    /// One or more parameters are missing.
+    #[error("one or more parameters are missing")]
+    MissingParameter,
     /// A C string parameter is invalid.
     #[error("a c string parameter is invalid: {0}")]
     InvalidCString(FromBytesWithNulError),
@@ -50,9 +51,6 @@ pub enum Error {
              length of the decoded value: size = {0}, value.len() = {1}"
     )]
     InvalidXattrSize(u32, usize),
-    /// One or more parameters are missing.
-    #[error("one or more parameters are missing")]
-    MissingParameter,
     /// Requested too many `iovec`s for an `ioctl` retry.
     #[error(
         "requested too many `iovec`s for an `ioctl` retry reply: requested\

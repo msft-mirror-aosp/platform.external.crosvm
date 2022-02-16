@@ -3,20 +3,19 @@
 // found in the LICENSE file.
 
 use std::cmp::min;
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use base::{
-    get_filesystem_type, info, AsRawDescriptors, FileAllocate, FileReadWriteAtVolatile, FileSetLen,
-    FileSync, PunchHole, SeekHole, WriteZeroesAt,
+    AsRawDescriptors, FileAllocate, FileReadWriteAtVolatile, FileSetLen, FileSync, PunchHole,
+    SeekHole, WriteZeroesAt,
 };
 use cros_async::Executor;
 use libc::EINVAL;
 use remain::sorted;
-use thiserror::Error as ThisError;
 use vm_memory::GuestMemory;
 
 mod qcow;
@@ -26,63 +25,30 @@ pub use qcow::{QcowFile, QCOW_MAGIC};
 mod composite;
 #[cfg(feature = "composite-disk")]
 use composite::{CompositeDiskFile, CDISK_MAGIC, CDISK_MAGIC_LEN};
-#[cfg(feature = "composite-disk")]
-mod gpt;
-#[cfg(feature = "composite-disk")]
-pub use composite::{
-    create_composite_disk, create_zero_filler, Error as CompositeError, ImagePartitionType,
-    PartitionInfo,
-};
-#[cfg(feature = "composite-disk")]
-pub use gpt::Error as GptError;
 
 mod android_sparse;
 use android_sparse::{AndroidSparse, SPARSE_HEADER_MAGIC};
 
-/// Nesting depth limit for disk formats that can open other disk files.
-pub const MAX_NESTING_DEPTH: u32 = 10;
-
 #[sorted]
-#[derive(ThisError, Debug)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("failed to create block device: {0}")]
     BlockDeviceNew(base::Error),
-    #[error("requested file conversion not supported")]
     ConversionNotSupported,
-    #[error("failure in android sparse disk: {0}")]
     CreateAndroidSparseDisk(android_sparse::Error),
     #[cfg(feature = "composite-disk")]
-    #[error("failure in composite disk: {0}")]
     CreateCompositeDisk(composite::Error),
-    #[error("failure creating single file disk: {0}")]
     CreateSingleFileDisk(cros_async::AsyncError),
-    #[error("failure with fallocate: {0}")]
     Fallocate(cros_async::AsyncError),
-    #[error("failure with fsync: {0}")]
     Fsync(cros_async::AsyncError),
-    #[error("checking host fs type: {0}")]
-    HostFsType(base::Error),
-    #[error("maximum disk nesting depth exceeded")]
-    MaxNestingDepthExceeded,
-    #[error("failure in qcow: {0}")]
     QcowError(qcow::Error),
-    #[error("failed to read data: {0}")]
     ReadingData(io::Error),
-    #[error("failed to read header: {0}")]
     ReadingHeader(io::Error),
-    #[error("failed to read to memory: {0}")]
     ReadToMem(cros_async::AsyncError),
-    #[error("failed to seek file: {0}")]
     SeekingFile(io::Error),
-    #[error("failed to set file size: {0}")]
     SettingFileSize(io::Error),
-    #[error("unknown disk type")]
     UnknownType,
-    #[error("failed to write from memory: {0}")]
     WriteFromMem(cros_async::AsyncError),
-    #[error("failed to write from vec: {0}")]
     WriteFromVec(cros_async::AsyncError),
-    #[error("failed to write data: {0}")]
     WritingData(io::Error),
 }
 
@@ -147,6 +113,35 @@ pub trait ToAsyncDisk: DiskFile {
 impl ToAsyncDisk for File {
     fn to_async_disk(self: Box<Self>, ex: &Executor) -> Result<Box<dyn AsyncDisk>> {
         Ok(Box::new(SingleFileDisk::new(*self, ex)?))
+    }
+}
+
+impl Display for Error {
+    #[remain::check]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        #[sorted]
+        match self {
+            BlockDeviceNew(e) => write!(f, "failed to create block device: {}", e),
+            ConversionNotSupported => write!(f, "requested file conversion not supported"),
+            CreateAndroidSparseDisk(e) => write!(f, "failure in android sparse disk: {}", e),
+            #[cfg(feature = "composite-disk")]
+            CreateCompositeDisk(e) => write!(f, "failure in composite disk: {}", e),
+            CreateSingleFileDisk(e) => write!(f, "failure creating single file disk: {}", e),
+            Fallocate(e) => write!(f, "failure with fallocate: {}", e),
+            Fsync(e) => write!(f, "failure with fsync: {}", e),
+            QcowError(e) => write!(f, "failure in qcow: {}", e),
+            ReadingData(e) => write!(f, "failed to read data: {}", e),
+            ReadingHeader(e) => write!(f, "failed to read header: {}", e),
+            ReadToMem(e) => write!(f, "failed to read to memory: {}", e),
+            SeekingFile(e) => write!(f, "failed to seek file: {}", e),
+            SettingFileSize(e) => write!(f, "failed to set file size: {}", e),
+            UnknownType => write!(f, "unknown disk type"),
+            WriteFromMem(e) => write!(f, "failed to write from memory: {}", e),
+            WriteFromVec(e) => write!(f, "failed to write from vec: {}", e),
+            WritingData(e) => write!(f, "failed to write data: {}", e),
+        }
     }
 }
 
@@ -252,17 +247,11 @@ where
 /// Copy the contents of a disk image in `src_file` into `dst_file`.
 /// The type of `src_file` is automatically detected, and the output file type is
 /// determined by `dst_type`.
-pub fn convert(
-    src_file: File,
-    dst_file: File,
-    dst_type: ImageType,
-    src_max_nesting_depth: u32,
-) -> Result<()> {
+pub fn convert(src_file: File, dst_file: File, dst_type: ImageType) -> Result<()> {
     let src_type = detect_image_type(&src_file)?;
     match src_type {
         ImageType::Qcow2 => {
-            let mut src_reader =
-                QcowFile::from(src_file, src_max_nesting_depth).map_err(Error::QcowError)?;
+            let mut src_reader = QcowFile::from(src_file).map_err(Error::QcowError)?;
             convert_reader(&mut src_reader, dst_file, dst_type)
         }
         ImageType::Raw => {
@@ -275,12 +264,6 @@ pub fn convert(
     }
 }
 
-fn log_host_fs_type(file: &File) -> Result<()> {
-    let fstype = get_filesystem_type(file).map_err(Error::HostFsType)?;
-    info!("Disk image file is hosted on file system type {:x}", fstype);
-    Ok(())
-}
-
 /// Detect the type of an image file by checking for a valid header of the supported formats.
 pub fn detect_image_type(file: &File) -> Result<ImageType> {
     let mut f = file;
@@ -288,17 +271,9 @@ pub fn detect_image_type(file: &File) -> Result<ImageType> {
     let orig_seek = f.seek(SeekFrom::Current(0)).map_err(Error::SeekingFile)?;
     f.seek(SeekFrom::Start(0)).map_err(Error::SeekingFile)?;
 
-    info!("disk size {}, ", disk_size);
-    log_host_fs_type(f)?;
     // Try to read the disk in a nicely-aligned block size unless the whole file is smaller.
     const MAGIC_BLOCK_SIZE: usize = 4096;
-    #[repr(align(4096))]
-    struct BlockAlignedBuffer {
-        data: [u8; MAGIC_BLOCK_SIZE],
-    }
-    let mut magic = BlockAlignedBuffer {
-        data: [0u8; MAGIC_BLOCK_SIZE],
-    };
+    let mut magic = [0u8; MAGIC_BLOCK_SIZE];
     let magic_read_len = if disk_size > MAGIC_BLOCK_SIZE as u64 {
         MAGIC_BLOCK_SIZE
     } else {
@@ -307,19 +282,19 @@ pub fn detect_image_type(file: &File) -> Result<ImageType> {
         disk_size as usize
     };
 
-    f.read_exact(&mut magic.data[0..magic_read_len])
+    f.read_exact(&mut magic[0..magic_read_len])
         .map_err(Error::ReadingHeader)?;
     f.seek(SeekFrom::Start(orig_seek))
         .map_err(Error::SeekingFile)?;
 
     #[cfg(feature = "composite-disk")]
-    if let Some(cdisk_magic) = magic.data.get(0..CDISK_MAGIC_LEN) {
+    if let Some(cdisk_magic) = magic.get(0..CDISK_MAGIC_LEN) {
         if cdisk_magic == CDISK_MAGIC.as_bytes() {
             return Ok(ImageType::CompositeDisk);
         }
     }
 
-    if let Some(magic4) = magic.data.get(0..4) {
+    if let Some(magic4) = magic.get(0..4) {
         if magic4 == QCOW_MAGIC.to_be_bytes() {
             return Ok(ImageType::Qcow2);
         } else if magic4 == SPARSE_HEADER_MAGIC.to_le_bytes() {
@@ -351,26 +326,18 @@ pub fn create_async_disk_file(raw_image: File) -> Result<Box<dyn ToAsyncDisk>> {
 }
 
 /// Inspect the image file type and create an appropriate disk file to match it.
-pub fn create_disk_file(raw_image: File, mut max_nesting_depth: u32) -> Result<Box<dyn DiskFile>> {
-    if max_nesting_depth == 0 {
-        return Err(Error::MaxNestingDepthExceeded);
-    }
-    max_nesting_depth -= 1;
-
+pub fn create_disk_file(raw_image: File) -> Result<Box<dyn DiskFile>> {
     let image_type = detect_image_type(&raw_image)?;
     Ok(match image_type {
         ImageType::Raw => Box::new(raw_image) as Box<dyn DiskFile>,
         ImageType::Qcow2 => {
-            Box::new(QcowFile::from(raw_image, max_nesting_depth).map_err(Error::QcowError)?)
-                as Box<dyn DiskFile>
+            Box::new(QcowFile::from(raw_image).map_err(Error::QcowError)?) as Box<dyn DiskFile>
         }
         #[cfg(feature = "composite-disk")]
         ImageType::CompositeDisk => {
             // Valid composite disk header present
-            Box::new(
-                CompositeDiskFile::from_file(raw_image, max_nesting_depth)
-                    .map_err(Error::CreateCompositeDisk)?,
-            ) as Box<dyn DiskFile>
+            Box::new(CompositeDiskFile::from_file(raw_image).map_err(Error::CreateCompositeDisk)?)
+                as Box<dyn DiskFile>
         }
         #[cfg(not(feature = "composite-disk"))]
         ImageType::CompositeDisk => return Err(Error::UnknownType),
@@ -464,7 +431,7 @@ impl AsyncDisk for SingleFileDisk {
         mem_offsets: &'a [cros_async::MemRegion],
     ) -> Result<usize> {
         self.inner
-            .read_to_mem(Some(file_offset), mem, mem_offsets)
+            .read_to_mem(file_offset, mem, mem_offsets)
             .await
             .map_err(Error::ReadToMem)
     }
@@ -476,7 +443,7 @@ impl AsyncDisk for SingleFileDisk {
         mem_offsets: &'a [cros_async::MemRegion],
     ) -> Result<usize> {
         self.inner
-            .write_from_mem(Some(file_offset), mem, mem_offsets)
+            .write_from_mem(file_offset, mem, mem_offsets)
             .await
             .map_err(Error::WriteFromMem)
     }
@@ -515,7 +482,7 @@ impl AsyncDisk for SingleFileDisk {
             let buf = vec![0u8; write_size];
             nwritten += self
                 .inner
-                .write_from_vec(Some(file_offset + nwritten as u64), buf)
+                .write_from_vec(file_offset + nwritten as u64, buf)
                 .await
                 .map(|(n, _)| n as u64)
                 .map_err(Error::WriteFromVec)?;
@@ -590,7 +557,7 @@ mod tests {
         // detect_image_type is ever updated to validate more of the header, this test would need
         // to be updated.
         let buf: &[u8] = &[0x51, 0x46, 0x49, 0xfb];
-        t.write_all(buf).unwrap();
+        t.write_all(&buf).unwrap();
         let image_type = detect_image_type(&t).expect("failed to detect image type");
         assert_eq!(image_type, ImageType::Qcow2);
     }
@@ -602,7 +569,7 @@ mod tests {
         // detect_image_type is ever updated to validate more of the header, this test would need
         // to be updated.
         let buf: &[u8] = &[0x3a, 0xff, 0x26, 0xed];
-        t.write_all(buf).unwrap();
+        t.write_all(&buf).unwrap();
         let image_type = detect_image_type(&t).expect("failed to detect image type");
         assert_eq!(image_type, ImageType::AndroidSparse);
     }
@@ -615,7 +582,7 @@ mod tests {
         // detect_image_type is ever updated to validate more of the header, this test would need
         // to be updated.
         let buf = "composite_disk\x1d".as_bytes();
-        t.write_all(buf).unwrap();
+        t.write_all(&buf).unwrap();
         let image_type = detect_image_type(&t).expect("failed to detect image type");
         assert_eq!(image_type, ImageType::CompositeDisk);
     }
@@ -626,7 +593,7 @@ mod tests {
         // Write a file smaller than the four-byte qcow2/sparse magic to ensure the small file logic
         // works correctly and handles it as a raw file.
         let buf: &[u8] = &[0xAA, 0xBB];
-        t.write_all(buf).unwrap();
+        t.write_all(&buf).unwrap();
         let image_type = detect_image_type(&t).expect("failed to detect image type");
         assert_eq!(image_type, ImageType::Raw);
     }

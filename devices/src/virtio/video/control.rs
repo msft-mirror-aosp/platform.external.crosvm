@@ -9,7 +9,7 @@ use std::io;
 
 use data_model::Le32;
 
-use crate::virtio::video::format::{BitrateMode, Format, Level, Profile};
+use crate::virtio::video::format::{Format, Level, Profile};
 use crate::virtio::video::protocol::*;
 use crate::virtio::video::response::Response;
 use crate::virtio::Writer;
@@ -54,9 +54,6 @@ pub enum CtrlType {
     Profile,
     Level,
     ForceKeyframe,
-    BitrateMode,
-    BitratePeak,
-    PrependSpsPpsToIdr,
 }
 
 #[derive(Debug, Clone)]
@@ -64,10 +61,7 @@ pub enum CtrlVal {
     Bitrate(u32),
     Profile(Profile),
     Level(Level),
-    ForceKeyframe,
-    BitrateMode(BitrateMode),
-    BitratePeak(u32),
-    PrependSpsPpsToIdr(bool),
+    ForceKeyframe(),
 }
 
 impl Response for CtrlVal {
@@ -75,14 +69,6 @@ impl Response for CtrlVal {
         match self {
             CtrlVal::Bitrate(r) => w.write_obj(virtio_video_control_val_bitrate {
                 bitrate: Le32::from(*r),
-                ..Default::default()
-            }),
-            CtrlVal::BitratePeak(r) => w.write_obj(virtio_video_control_val_bitrate_peak {
-                bitrate_peak: Le32::from(*r),
-                ..Default::default()
-            }),
-            CtrlVal::BitrateMode(m) => w.write_obj(virtio_video_control_val_bitrate_mode {
-                bitrate_mode: Le32::from(*m as u32),
                 ..Default::default()
             }),
             CtrlVal::Profile(p) => w.write_obj(virtio_video_control_val_profile {
@@ -93,16 +79,10 @@ impl Response for CtrlVal {
                 level: Le32::from(*l as u32),
                 ..Default::default()
             }),
-            CtrlVal::ForceKeyframe => Err(io::Error::new(
+            CtrlVal::ForceKeyframe() => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Button controls should not be queried.",
             )),
-            CtrlVal::PrependSpsPpsToIdr(p) => {
-                w.write_obj(virtio_video_control_val_prepend_spspps_to_idr {
-                    prepend_spspps_to_idr: Le32::from(*p as u32),
-                    ..Default::default()
-                })
-            }
         }
     }
 }

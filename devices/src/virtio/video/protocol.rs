@@ -6,8 +6,8 @@
 //!
 //! ```shell
 //! $ bindgen virtio_video.h              \
-//!     --allowlist-type "virtio_video.*" \
-//!     --allowlist-var "VIRTIO_VIDEO_.*" \
+//!     --whitelist-type "virtio_video.*" \
+//!     --whitelist-var "VIRTIO_VIDEO_.*" \
 //!     --with-derive-default            \
 //!     --no-layout-tests                \
 //!     --no-prepend-enum-name > protocol.rs
@@ -19,8 +19,6 @@
 //! * Removed `hdr` from each command struct so that we can read the header and a command body separately.
 //!   (cf. [related discussion](https://markmail.org/message/tr5g6axqq2zzq64y))
 //! * Added implementations of DataInit for each struct.
-//! * Added GET_PARAMS_EXT and SET_PARAMS_EXT to allow querying and changing the resource type
-//!   dynamically.
 
 #![allow(dead_code, non_snake_case, non_camel_case_types)]
 
@@ -95,17 +93,12 @@ pub const VIRTIO_VIDEO_LEVEL_H264_5_0: virtio_video_level = 269;
 pub const VIRTIO_VIDEO_LEVEL_H264_5_1: virtio_video_level = 270;
 pub const VIRTIO_VIDEO_LEVEL_H264_MAX: virtio_video_level = 270;
 pub type virtio_video_level = u32;
-pub const VIRTIO_VIDEO_BITRATE_MODE_VBR: virtio_video_bitrate_mode = 0;
-pub const VIRTIO_VIDEO_BITRATE_MODE_CBR: virtio_video_bitrate_mode = 1;
-pub type virtio_video_bitrate_mode = u32;
-
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct virtio_video_config {
     pub version: Le32,
     pub max_caps_length: Le32,
     pub max_resp_length: Le32,
-    pub device_name: [u8; 32],
 }
 // Safe because auto-generated structs have no implicit padding.
 unsafe impl DataInit for virtio_video_config {}
@@ -123,8 +116,6 @@ pub const VIRTIO_VIDEO_CMD_SET_PARAMS: virtio_video_cmd_type = 265;
 pub const VIRTIO_VIDEO_CMD_QUERY_CONTROL: virtio_video_cmd_type = 266;
 pub const VIRTIO_VIDEO_CMD_GET_CONTROL: virtio_video_cmd_type = 267;
 pub const VIRTIO_VIDEO_CMD_SET_CONTROL: virtio_video_cmd_type = 268;
-pub const VIRTIO_VIDEO_CMD_GET_PARAMS_EXT: virtio_video_cmd_type = 269;
-pub const VIRTIO_VIDEO_CMD_SET_PARAMS_EXT: virtio_video_cmd_type = 270;
 pub const VIRTIO_VIDEO_RESP_OK_NODATA: virtio_video_cmd_type = 512;
 pub const VIRTIO_VIDEO_RESP_OK_QUERY_CAPABILITY: virtio_video_cmd_type = 513;
 pub const VIRTIO_VIDEO_RESP_OK_RESOURCE_QUEUE: virtio_video_cmd_type = 514;
@@ -250,6 +241,8 @@ pub struct virtio_video_mem_entry {
 pub struct virtio_video_object_entry {
     pub uuid: [u8; 16usize],
 }
+// Safe because auto-generated structs have no implicit padding.
+unsafe impl DataInit for virtio_video_object_entry {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -366,49 +359,10 @@ pub struct virtio_video_set_params {
 // Safe because auto-generated structs have no implicit padding.
 unsafe impl DataInit for virtio_video_set_params {}
 
-/// Extension of the {GET,SET}_PARAMS data to also include the resource type. Not including it
-/// was an oversight and the {GET,SET}_PARAMS_EXT commands use this structure to fix it, while
-/// the older {GET,SET}_PARAMS commands are kept for backward compatibility.
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct virtio_video_params_ext {
-    pub base: virtio_video_params,
-    pub resource_type: Le32,
-    pub padding: [u8; 4usize],
-}
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct virtio_video_get_params_ext {
-    pub queue_type: Le32,
-    pub padding: [u8; 4usize],
-}
-// Safe because auto-generated structs have no implicit padding.
-unsafe impl DataInit for virtio_video_get_params_ext {}
-
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct virtio_video_get_params_ext_resp {
-    pub hdr: virtio_video_cmd_hdr,
-    pub params: virtio_video_params_ext,
-}
-// Safe because auto-generated structs have no implicit padding.
-unsafe impl DataInit for virtio_video_get_params_ext_resp {}
-
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct virtio_video_set_params_ext {
-    pub params: virtio_video_params_ext,
-}
-// Safe because auto-generated structs have no implicit padding.
-unsafe impl DataInit for virtio_video_set_params_ext {}
-
 pub const VIRTIO_VIDEO_CONTROL_BITRATE: virtio_video_control_type = 1;
 pub const VIRTIO_VIDEO_CONTROL_PROFILE: virtio_video_control_type = 2;
 pub const VIRTIO_VIDEO_CONTROL_LEVEL: virtio_video_control_type = 3;
 pub const VIRTIO_VIDEO_CONTROL_FORCE_KEYFRAME: virtio_video_control_type = 4;
-pub const VIRTIO_VIDEO_CONTROL_BITRATE_MODE: virtio_video_control_type = 5;
-pub const VIRTIO_VIDEO_CONTROL_BITRATE_PEAK: virtio_video_control_type = 6;
-pub const VIRTIO_VIDEO_CONTROL_PREPEND_SPSPPS_TO_IDR: virtio_video_control_type = 7;
 pub type virtio_video_control_type = u32;
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -483,24 +437,6 @@ unsafe impl DataInit for virtio_video_control_val_bitrate {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
-pub struct virtio_video_control_val_bitrate_peak {
-    pub bitrate_peak: Le32,
-    pub padding: [u8; 4usize],
-}
-// Safe because auto-generated structs have no implicit padding.
-unsafe impl DataInit for virtio_video_control_val_bitrate_peak {}
-
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct virtio_video_control_val_bitrate_mode {
-    pub bitrate_mode: Le32,
-    pub padding: [u8; 4usize],
-}
-// Safe because auto-generated structs have no implicit padding.
-unsafe impl DataInit for virtio_video_control_val_bitrate_mode {}
-
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
 pub struct virtio_video_control_val_profile {
     pub profile: Le32,
     pub padding: [u8; 4usize],
@@ -516,15 +452,6 @@ pub struct virtio_video_control_val_level {
 }
 // Safe because auto-generated structs have no implicit padding.
 unsafe impl DataInit for virtio_video_control_val_level {}
-
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct virtio_video_control_val_prepend_spspps_to_idr {
-    pub prepend_spspps_to_idr: Le32,
-    pub padding: [u8; 4usize],
-}
-// Safe because auto-generated structs have no implicit padding.
-unsafe impl DataInit for virtio_video_control_val_prepend_spspps_to_idr {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]

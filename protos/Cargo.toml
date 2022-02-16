@@ -7,6 +7,7 @@ edition = "2018"
 [features]
 plugin = ["kvm_sys"]
 composite-disk = []
+trunks = []
 
 [dependencies]
 kvm_sys = { path = "../kvm_sys", optional = true }

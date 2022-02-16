@@ -6,11 +6,12 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::convert::TryInto;
 
 use backend::*;
-use base::{error, Tube, WaitContext};
-use vm_memory::GuestMemory;
+use base::{error, IntoRawDescriptor, Tube, WaitContext};
 
+use crate::virtio::resource_bridge::{self, BufferInfo, ResourceInfo, ResourceRequest};
 use crate::virtio::video::async_cmd_desc_map::AsyncCmdDescMap;
 use crate::virtio::video::command::{QueueType, VideoCmd};
 use crate::virtio::video::control::{CtrlType, CtrlVal, QueryCtrlType};
@@ -20,10 +21,9 @@ use crate::virtio::video::event::*;
 use crate::virtio::video::format::*;
 use crate::virtio::video::params::Params;
 use crate::virtio::video::protocol;
-use crate::virtio::video::resource::*;
 use crate::virtio::video::response::CmdResponse;
 
-pub mod backend;
+mod backend;
 mod capability;
 
 use capability::*;
@@ -42,6 +42,7 @@ type OutputResourceId = u32;
 // we don't need this value and can pass OutputResourceId to Chrome directly.
 type FrameBufferId = i32;
 
+type ResourceHandle = u32;
 type Timestamp = u64;
 
 // The result of OutputResources.queue_resource().
@@ -57,7 +58,7 @@ struct InputResources {
     timestamp_to_res_id: BTreeMap<Timestamp, InputResourceId>,
 
     // InputResourceId -> ResourceHandle
-    res_id_to_res_handle: BTreeMap<InputResourceId, GuestResource>,
+    res_id_to_res_handle: BTreeMap<InputResourceId, ResourceHandle>,
 
     // InputResourceId -> data offset
     res_id_to_offset: BTreeMap<InputResourceId, u32>,
@@ -78,16 +79,16 @@ struct OutputResources {
     // destroyed.
     eos_resource_id: Option<OutputResourceId>,
 
-    // This is a flag that shows whether the device's set_output_parameters has called.
-    // This will be set to true when ResourceQueue for OutputBuffer is called for the first time.
+    // This is a flag that shows whether the device's set_output_buffer_count is called.
+    // This will be set to true when ResourceCreate for OutputBuffer is called for the first time.
     //
     // TODO(b/1518105): This field is added as a hack because the current virtio-video v3 spec
     // doesn't have a way to send a number of frame buffers the guest provides.
     // Once we have the way in the virtio-video protocol, we should remove this flag.
-    output_params_set: bool,
+    is_output_buffer_count_set: bool,
 
     // OutputResourceId -> ResourceHandle
-    res_id_to_res_handle: BTreeMap<OutputResourceId, GuestResource>,
+    res_id_to_res_handle: BTreeMap<OutputResourceId, ResourceHandle>,
 }
 
 impl OutputResources {
@@ -149,25 +150,24 @@ impl OutputResources {
         self.queued_res_ids.take(&self.eos_resource_id?)
     }
 
-    fn output_params_set(&mut self) -> bool {
-        if !self.output_params_set {
-            self.output_params_set = true;
+    fn set_output_buffer_count(&mut self) -> bool {
+        if !self.is_output_buffer_count_set {
+            self.is_output_buffer_count_set = true;
             return true;
         }
         false
     }
 }
 
-enum PendingResponse {
-    PictureReady {
-        picture_buffer_id: i32,
-        bitstream_id: i32,
-    },
-    FlushCompleted,
+struct PictureReadyEvent {
+    picture_buffer_id: i32,
+    bitstream_id: i32,
+    visible_rect: Rect,
 }
 
 // Context is associated with one `DecoderSession`, which corresponds to one stream from the
 // virtio-video's point of view.
+#[derive(Default)]
 struct Context<S: DecoderSession> {
     stream_id: StreamId,
 
@@ -180,134 +180,116 @@ struct Context<S: DecoderSession> {
     // Set the flag when we ask the decoder reset, and unset when the reset is done.
     is_resetting: bool,
 
-    pending_responses: VecDeque<PendingResponse>,
+    pending_ready_pictures: VecDeque<PictureReadyEvent>,
 
     session: Option<S>,
 }
 
 impl<S: DecoderSession> Context<S> {
-    fn new(
-        stream_id: StreamId,
-        format: Format,
-        in_resource_type: ResourceType,
-        out_resource_type: ResourceType,
-    ) -> Self {
-        const DEFAULT_WIDTH: u32 = 640;
-        const DEFAULT_HEIGHT: u32 = 480;
-        const DEFAULT_INPUT_BUFFER_SIZE: u32 = 1024 * 1024;
-
-        let out_plane_formats =
-            PlaneFormat::get_plane_layout(Format::NV12, DEFAULT_WIDTH, DEFAULT_HEIGHT).unwrap();
-
+    fn new(stream_id: StreamId, format: Format) -> Self {
         Context {
             stream_id,
             in_params: Params {
                 format: Some(format),
-                frame_width: DEFAULT_WIDTH,
-                frame_height: DEFAULT_HEIGHT,
-                resource_type: in_resource_type,
                 min_buffers: 1,
                 max_buffers: 32,
-                plane_formats: vec![PlaneFormat {
-                    plane_size: DEFAULT_INPUT_BUFFER_SIZE,
-                    ..Default::default()
-                }],
+                plane_formats: vec![Default::default()],
                 ..Default::default()
             },
-            out_params: Params {
-                format: Some(Format::NV12),
-                frame_width: DEFAULT_WIDTH,
-                frame_height: DEFAULT_HEIGHT,
-                resource_type: out_resource_type,
-                plane_formats: out_plane_formats,
-                ..Default::default()
-            },
+            out_params: Default::default(),
             in_res: Default::default(),
             out_res: Default::default(),
             is_resetting: false,
-            pending_responses: Default::default(),
+            pending_ready_pictures: Default::default(),
             session: None,
         }
     }
 
-    fn output_pending_responses(&mut self) -> Vec<VideoEvtResponseType> {
-        let mut event_responses = vec![];
-        while let Some(mut responses) = self.output_pending_response() {
-            event_responses.append(&mut responses);
+    fn output_pending_pictures(&mut self) -> Vec<VideoEvtResponseType> {
+        let mut responses = vec![];
+        while let Some(async_response) = self.output_pending_picture() {
+            responses.push(VideoEvtResponseType::AsyncCmd(async_response));
         }
-        event_responses
+        responses
     }
 
-    fn output_pending_response(&mut self) -> Option<Vec<VideoEvtResponseType>> {
-        let responses = match self.pending_responses.front()? {
-            PendingResponse::PictureReady {
+    fn output_pending_picture(&mut self) -> Option<AsyncCmdResponse> {
+        let response = {
+            let PictureReadyEvent {
                 picture_buffer_id,
                 bitstream_id,
-            } => {
-                let resource_id = self
-                    .out_res
-                    .dequeue_frame_buffer(*picture_buffer_id, self.stream_id)?;
+                visible_rect,
+            } = self.pending_ready_pictures.front()?;
 
-                vec![VideoEvtResponseType::AsyncCmd(
-                    AsyncCmdResponse::from_response(
-                        AsyncCmdTag::Queue {
-                            stream_id: self.stream_id,
-                            queue_type: QueueType::Output,
-                            resource_id,
-                        },
-                        CmdResponse::ResourceQueue {
-                            // Conversion from sec to nsec.
-                            timestamp: (*bitstream_id as u64) * 1_000_000_000,
-                            // TODO(b/149725148): Set buffer flags once libvda exposes them.
-                            flags: 0,
-                            // `size` is only used for the encoder.
-                            size: 0,
-                        },
-                    ),
-                )]
+            let plane_size = ((visible_rect.right - visible_rect.left)
+                * (visible_rect.bottom - visible_rect.top)) as u32;
+            for fmt in self.out_params.plane_formats.iter_mut() {
+                fmt.plane_size = plane_size;
+                // We don't need to set `plane_formats[i].stride` for the decoder.
             }
-            PendingResponse::FlushCompleted => {
-                let eos_resource_id = self.out_res.dequeue_eos_resource_id()?;
-                let eos_tag = AsyncCmdTag::Queue {
+
+            let resource_id = self
+                .out_res
+                .dequeue_frame_buffer(*picture_buffer_id, self.stream_id)?;
+
+            AsyncCmdResponse::from_response(
+                AsyncCmdTag::Queue {
                     stream_id: self.stream_id,
                     queue_type: QueueType::Output,
-                    resource_id: eos_resource_id,
-                };
-                let eos_response = CmdResponse::ResourceQueue {
-                    timestamp: 0,
-                    flags: protocol::VIRTIO_VIDEO_BUFFER_FLAG_EOS,
+                    resource_id,
+                },
+                CmdResponse::ResourceQueue {
+                    // Conversion from sec to nsec.
+                    timestamp: (*bitstream_id as u64) * 1_000_000_000,
+                    // TODO(b/149725148): Set buffer flags once libvda exposes them.
+                    flags: 0,
+                    // `size` is only used for the encoder.
                     size: 0,
-                };
-                vec![
-                    VideoEvtResponseType::AsyncCmd(AsyncCmdResponse::from_response(
-                        eos_tag,
-                        eos_response,
-                    )),
-                    VideoEvtResponseType::AsyncCmd(AsyncCmdResponse::from_response(
-                        AsyncCmdTag::Drain {
-                            stream_id: self.stream_id,
-                        },
-                        CmdResponse::NoData,
-                    )),
-                ]
-            }
+                },
+            )
         };
-        self.pending_responses.pop_front().unwrap();
+        self.pending_ready_pictures.pop_front().unwrap();
 
-        Some(responses)
+        Some(response)
     }
 
-    fn register_resource(
-        &mut self,
+    fn get_resource_info(
+        &self,
         queue_type: QueueType,
+        res_bridge: &Tube,
         resource_id: u32,
-        resource: GuestResource,
-    ) {
+    ) -> VideoResult<BufferInfo> {
+        let res_id_to_res_handle = match queue_type {
+            QueueType::Input => &self.in_res.res_id_to_res_handle,
+            QueueType::Output => &self.out_res.res_id_to_res_handle,
+        };
+
+        let handle = res_id_to_res_handle.get(&resource_id).copied().ok_or(
+            VideoError::InvalidResourceId {
+                stream_id: self.stream_id,
+                resource_id,
+            },
+        )?;
+        match resource_bridge::get_resource_info(
+            res_bridge,
+            ResourceRequest::GetBuffer { id: handle },
+        ) {
+            Ok(ResourceInfo::Buffer(buffer_info)) => Ok(buffer_info),
+            Ok(_) => Err(VideoError::InvalidArgument),
+            Err(e) => Err(VideoError::ResourceBridgeFailure(e)),
+        }
+    }
+
+    fn register_buffer(&mut self, queue_type: QueueType, resource_id: u32, uuid: &u128) {
+        // TODO(stevensd): `Virtio3DBackend::resource_assign_uuid` is currently implemented to use
+        // 32-bits resource_handles as UUIDs. Once it starts using real UUIDs, we need to update
+        // this conversion.
+        let handle = TryInto::<u32>::try_into(*uuid).expect("uuid is larger than 32 bits");
         let res_id_to_res_handle = match queue_type {
             QueueType::Input => &mut self.in_res.res_id_to_res_handle,
             QueueType::Output => &mut self.out_res.res_id_to_res_handle,
         };
-        res_id_to_res_handle.insert(resource_id, resource);
+        res_id_to_res_handle.insert(resource_id, handle);
     }
 
     /*
@@ -324,16 +306,18 @@ impl<S: DecoderSession> Context<S> {
         // We only support NV12.
         let format = Some(Format::NV12);
 
-        let plane_formats =
-            PlaneFormat::get_plane_layout(Format::NV12, width as u32, height as u32).unwrap();
+        let rect_width: u32 = (visible_rect.right - visible_rect.left) as u32;
+        let rect_height: u32 = (visible_rect.bottom - visible_rect.top) as u32;
 
-        self.in_params.frame_width = width as u32;
-        self.in_params.frame_height = height as u32;
+        let plane_size = rect_width * rect_height;
+        let stride = rect_width;
+        let plane_formats = vec![
+            PlaneFormat { plane_size, stride },
+            PlaneFormat { plane_size, stride },
+        ];
 
         self.out_params = Params {
             format,
-            // The resource type is not changed by a provide picture buffers event.
-            resource_type: self.out_params.resource_type,
             // Note that rect_width is sometimes smaller.
             frame_width: width as u32,
             frame_height: height as u32,
@@ -343,8 +327,8 @@ impl<S: DecoderSession> Context<S> {
             crop: Crop {
                 left: visible_rect.left as u32,
                 top: visible_rect.top as u32,
-                width: (visible_rect.right - visible_rect.left) as u32,
-                height: (visible_rect.bottom - visible_rect.top) as u32,
+                width: rect_width,
+                height: rect_height,
             },
             plane_formats,
             // No need to set `frame_rate`, as it's only for the encoder.
@@ -372,6 +356,12 @@ struct ContextMap<S: DecoderSession> {
 }
 
 impl<S: DecoderSession> ContextMap<S> {
+    fn new() -> Self {
+        ContextMap {
+            map: Default::default(),
+        }
+    }
+
     fn insert(&mut self, ctx: Context<S>) -> VideoResult<()> {
         match self.map.entry(ctx.stream_id) {
             Entry::Vacant(e) => {
@@ -400,45 +390,22 @@ impl<S: DecoderSession> ContextMap<S> {
     }
 }
 
-impl<S: DecoderSession> Default for ContextMap<S> {
-    fn default() -> Self {
-        Self {
-            map: Default::default(),
-        }
-    }
-}
-
 /// Represents information of a decoder backed by a `DecoderBackend`.
 pub struct Decoder<D: DecoderBackend> {
     decoder: D,
     capability: Capability,
     contexts: ContextMap<D::Session>,
-    resource_bridge: Tube,
-    mem: GuestMemory,
 }
 
 impl<'a, D: DecoderBackend> Decoder<D> {
-    /// Build a new decoder using the provided `backend`.
-    pub fn new(backend: D, resource_bridge: Tube, mem: GuestMemory) -> Self {
-        let capability = backend.get_capabilities();
-
-        Self {
-            decoder: backend,
-            capability,
-            contexts: Default::default(),
-            resource_bridge,
-            mem,
-        }
-    }
-
     /*
      * Functions processing virtio-video commands.
      */
 
     fn query_capabilities(&self, queue_type: QueueType) -> CmdResponse {
         let descs = match queue_type {
-            QueueType::Input => self.capability.input_formats().clone(),
-            QueueType::Output => self.capability.output_formats().clone(),
+            QueueType::Input => self.capability.in_fmts.clone(),
+            QueueType::Output => self.capability.out_fmts.clone(),
         };
 
         CmdResponse::QueryCapability(descs)
@@ -448,19 +415,13 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         &mut self,
         stream_id: StreamId,
         coded_format: Format,
-        input_resource_type: ResourceType,
-        output_resource_type: ResourceType,
     ) -> VideoResult<VideoCmdResponseType> {
         // Create an instance of `Context`.
         // Note that the `DecoderSession` will be created not here but at the first call of
         // `ResourceCreate`. This is because we need to fix a coded format for it, which
         // will be set by `SetParams`.
-        self.contexts.insert(Context::new(
-            stream_id,
-            coded_format,
-            input_resource_type,
-            output_resource_type,
-        ))?;
+        self.contexts
+            .insert(Context::new(stream_id, coded_format))?;
         Ok(VideoCmdResponseType::Sync(CmdResponse::NoData))
     }
 
@@ -471,7 +432,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
     }
 
     fn create_session(
-        decoder: &mut D,
+        decoder: &D,
         wait_ctx: &WaitContext<Token>,
         ctx: &Context<D::Session>,
         stream_id: StreamId,
@@ -506,7 +467,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         queue_type: QueueType,
         resource_id: ResourceId,
         plane_offsets: Vec<u32>,
-        plane_entries: Vec<Vec<UnresolvedResourceEntry>>,
+        uuid: u128,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
 
@@ -514,57 +475,14 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         // called here.
         if ctx.session.is_none() {
             ctx.session = Some(Self::create_session(
-                &mut self.decoder,
+                &self.decoder,
                 wait_ctx,
                 ctx,
                 stream_id,
             )?);
         }
 
-        // We only support single-buffer resources for now.
-        let entries = if plane_entries.len() != 1 {
-            return Err(VideoError::InvalidArgument);
-        } else {
-            // unwrap() is safe because we just tested that `plane_entries` had exactly one element.
-            plane_entries.get(0).unwrap()
-        };
-
-        // Now try to resolve our resource.
-        let (resource_type, plane_formats) = match queue_type {
-            QueueType::Input => (ctx.in_params.resource_type, &ctx.in_params.plane_formats),
-            QueueType::Output => (ctx.out_params.resource_type, &ctx.out_params.plane_formats),
-        };
-
-        let resource = match resource_type {
-            ResourceType::VirtioObject => {
-                // Virtio object resources only have one entry.
-                if entries.len() != 1 {
-                    return Err(VideoError::InvalidArgument);
-                }
-                GuestResource::from_virtio_object_entry(
-                    // Safe because we confirmed the correct type for the resource.
-                    // unwrap() is also safe here because we just tested above that `entries` had
-                    // exactly one element.
-                    unsafe { entries.get(0).unwrap().object },
-                    &self.resource_bridge,
-                )
-                .map_err(|_| VideoError::InvalidArgument)?
-            }
-            ResourceType::GuestPages => GuestResource::from_virtio_guest_mem_entry(
-                // Safe because we confirmed the correct type for the resource.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        entries.as_ptr() as *const protocol::virtio_video_mem_entry,
-                        entries.len(),
-                    )
-                },
-                &self.mem,
-                plane_formats,
-            )
-            .map_err(|_| VideoError::InvalidArgument)?,
-        };
-
-        ctx.register_resource(queue_type, resource_id, resource);
+        ctx.register_buffer(queue_type, resource_id, &uuid);
 
         if queue_type == QueueType::Input {
             ctx.in_res
@@ -610,26 +528,26 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn queue_input_resource(
         &mut self,
+        resource_bridge: &Tube,
         stream_id: StreamId,
         resource_id: ResourceId,
         timestamp: u64,
         data_sizes: Vec<u32>,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         if data_sizes.len() != 1 {
             error!("num_data_sizes must be 1 but {}", data_sizes.len());
             return Err(VideoError::InvalidOperation);
         }
 
-        let session = ctx.session.as_mut().ok_or(VideoError::InvalidOperation)?;
-
-        let resource = ctx.in_res.res_id_to_res_handle.get(&resource_id).ok_or(
-            VideoError::InvalidResourceId {
-                stream_id,
-                resource_id,
-            },
-        )?;
+        // Take an ownership of this file by `into_raw_descriptor()` as this file will be closed
+        // by the `DecoderBackend`.
+        let fd = ctx
+            .get_resource_info(QueueType::Input, resource_bridge, resource_id)?
+            .file
+            .into_raw_descriptor();
 
         // Register a mapping of timestamp to resource_id
         if let Some(old_resource_id) = ctx
@@ -660,10 +578,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         let ts_sec: i32 = (timestamp / 1_000_000_000) as i32;
         session.decode(
             ts_sec,
-            resource
-                .handle
-                .try_clone()
-                .map_err(|_| VideoError::InvalidParameter)?,
+            fd,
             offset,
             data_sizes[0], // bytes_used
         )?;
@@ -677,10 +592,12 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn queue_output_resource(
         &mut self,
+        resource_bridge: &Tube,
         stream_id: StreamId,
         resource_id: ResourceId,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         // Check if the current pixel format is set to NV12.
         match ctx.out_params.format {
@@ -703,37 +620,42 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 // Don't enqueue this resource to the host.
                 Ok(())
             }
-            QueueOutputResourceResult::Reused(buffer_id) => ctx
-                .session
-                .as_mut()
-                .ok_or(VideoError::InvalidOperation)?
-                .reuse_output_buffer(buffer_id),
+            QueueOutputResourceResult::Reused(buffer_id) => session.reuse_output_buffer(buffer_id),
             QueueOutputResourceResult::Registered(buffer_id) => {
-                // Take full ownership of the output resource, since we will only import it once
-                // into the backend.
-                let resource = ctx
-                    .out_res
-                    .res_id_to_res_handle
-                    .remove(&resource_id)
-                    .ok_or(VideoError::InvalidResourceId {
-                        stream_id,
-                        resource_id,
-                    })?;
-
-                let session = ctx.session.as_mut().ok_or(VideoError::InvalidOperation)?;
+                let resource_info =
+                    ctx.get_resource_info(QueueType::Output, resource_bridge, resource_id)?;
+                let planes = vec![
+                    FramePlane {
+                        offset: resource_info.planes[0].offset as i32,
+                        stride: resource_info.planes[0].stride as i32,
+                    },
+                    FramePlane {
+                        offset: resource_info.planes[1].offset as i32,
+                        stride: resource_info.planes[1].stride as i32,
+                    },
+                ];
 
                 // Set output_buffer_count before passing the first output buffer.
-                if ctx.out_res.output_params_set() {
+                if ctx.out_res.set_output_buffer_count() {
                     const OUTPUT_BUFFER_COUNT: usize = 32;
 
                     // Set the buffer count to the maximum value.
                     // TODO(b/1518105): This is a hack due to the lack of way of telling a number of
                     // frame buffers explictly in virtio-video v3 RFC. Once we have the way,
                     // set_output_buffer_count should be called with a value passed by the guest.
-                    session.set_output_parameters(OUTPUT_BUFFER_COUNT, Format::NV12)?;
+                    session.set_output_buffer_count(OUTPUT_BUFFER_COUNT)?;
                 }
 
-                session.use_output_buffer(buffer_id as i32, resource)
+                // Take ownership of this file by `into_raw_descriptor()` as this
+                // file will be closed by libvda.
+                let fd = resource_info.file.into_raw_descriptor();
+                session.use_output_buffer(
+                    buffer_id as i32,
+                    Format::NV12,
+                    fd,
+                    &planes,
+                    resource_info.modifier,
+                )
             }
         }?;
         Ok(VideoCmdResponseType::Async(AsyncCmdTag::Queue {
@@ -747,7 +669,6 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         &self,
         stream_id: StreamId,
         queue_type: QueueType,
-        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get(&stream_id)?;
         let params = match queue_type {
@@ -757,7 +678,6 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         Ok(VideoCmdResponseType::Sync(CmdResponse::GetParams {
             queue_type,
             params,
-            is_ext,
         }))
     }
 
@@ -766,7 +686,6 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         stream_id: StreamId,
         queue_type: QueueType,
         params: Params,
-        is_ext: bool,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
         match queue_type {
@@ -779,21 +698,9 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                 // Only a few parameters can be changed by the guest.
                 ctx.in_params.format = params.format;
                 ctx.in_params.plane_formats = params.plane_formats;
-                // The resource type can only be changed through the SET_PARAMS_EXT command.
-                if is_ext {
-                    ctx.in_params.resource_type = params.resource_type;
-                }
             }
             QueueType::Output => {
-                // The guest can only change the resource type of the output queue if no resource
-                // has been imported yet.
-                if ctx.out_res.output_params_set {
-                    error!("parameter for output cannot be changed once resources are imported");
-                    return Err(VideoError::InvalidParameter);
-                }
-                if is_ext {
-                    ctx.out_params.resource_type = params.resource_type;
-                }
+                // The guest cannot update parameters for output queue in the decoder.
             }
         };
         Ok(VideoCmdResponseType::Sync(CmdResponse::NoData))
@@ -858,9 +765,9 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
     fn drain_stream(&mut self, stream_id: StreamId) -> VideoResult<VideoCmdResponseType> {
         self.contexts
-            .get_mut(&stream_id)?
+            .get(&stream_id)?
             .session
-            .as_mut()
+            .as_ref()
             .ok_or(VideoError::InvalidOperation)?
             .flush()?;
         Ok(VideoCmdResponseType::Async(AsyncCmdTag::Drain {
@@ -874,7 +781,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         queue_type: QueueType,
     ) -> VideoResult<VideoCmdResponseType> {
         let ctx = self.contexts.get_mut(&stream_id)?;
-        let session = ctx.session.as_mut().ok_or(VideoError::InvalidOperation)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         // TODO(b/153406792): Though QUEUE_CLEAR is defined as a per-queue command in the
         // specification, the VDA's `Reset()` clears the input buffers and may (or may not) drop
@@ -887,7 +794,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
             QueueType::Input => {
                 session.reset()?;
                 ctx.is_resetting = true;
-                ctx.pending_responses.clear();
+                ctx.pending_ready_pictures.clear();
                 Ok(VideoCmdResponseType::Async(AsyncCmdTag::Clear {
                     stream_id,
                     queue_type: QueueType::Input,
@@ -906,6 +813,7 @@ impl<D: DecoderBackend> Device for Decoder<D> {
         &mut self,
         cmd: VideoCmd,
         wait_ctx: &WaitContext<Token>,
+        resource_bridge: &Tube,
     ) -> (
         VideoCmdResponseType,
         Option<(u32, Vec<VideoEvtResponseType>)>,
@@ -919,14 +827,7 @@ impl<D: DecoderBackend> Device for Decoder<D> {
             StreamCreate {
                 stream_id,
                 coded_format,
-                input_resource_type,
-                output_resource_type,
-            } => self.create_stream(
-                stream_id,
-                coded_format,
-                input_resource_type,
-                output_resource_type,
-            ),
+            } => self.create_stream(stream_id, coded_format),
             StreamDestroy { stream_id } => {
                 self.destroy_stream(stream_id);
                 Ok(Sync(CmdResponse::NoData))
@@ -936,14 +837,14 @@ impl<D: DecoderBackend> Device for Decoder<D> {
                 queue_type,
                 resource_id,
                 plane_offsets,
-                plane_entries,
+                uuid,
             } => self.create_resource(
                 wait_ctx,
                 stream_id,
                 queue_type,
                 resource_id,
                 plane_offsets,
-                plane_entries,
+                uuid,
             ),
             ResourceDestroyAll {
                 stream_id,
@@ -955,17 +856,23 @@ impl<D: DecoderBackend> Device for Decoder<D> {
                 resource_id,
                 timestamp,
                 data_sizes,
-            } => self.queue_input_resource(stream_id, resource_id, timestamp, data_sizes),
+            } => self.queue_input_resource(
+                resource_bridge,
+                stream_id,
+                resource_id,
+                timestamp,
+                data_sizes,
+            ),
             ResourceQueue {
                 stream_id,
                 queue_type: QueueType::Output,
                 resource_id,
                 ..
             } => {
-                let resp = self.queue_output_resource(stream_id, resource_id);
+                let resp = self.queue_output_resource(resource_bridge, stream_id, resource_id);
                 if resp.is_ok() {
                     if let Ok(ctx) = self.contexts.get_mut(&stream_id) {
-                        event_ret = Some((stream_id, ctx.output_pending_responses()));
+                        event_ret = Some((stream_id, ctx.output_pending_pictures()));
                     }
                 }
                 resp
@@ -973,14 +880,12 @@ impl<D: DecoderBackend> Device for Decoder<D> {
             GetParams {
                 stream_id,
                 queue_type,
-                is_ext,
-            } => self.get_params(stream_id, queue_type, is_ext),
+            } => self.get_params(stream_id, queue_type),
             SetParams {
                 stream_id,
                 queue_type,
                 params,
-                is_ext,
-            } => self.set_params(stream_id, queue_type, params, is_ext),
+            } => self.set_params(stream_id, queue_type, params),
             QueryControl { query_ctrl_type } => self.query_control(query_ctrl_type),
             GetControl {
                 stream_id,
@@ -1057,17 +962,17 @@ impl<D: DecoderBackend> Device for Decoder<D> {
             DecoderEvent::PictureReady {
                 picture_buffer_id, // FrameBufferId
                 bitstream_id,      // timestamp in second
-                ..
+                visible_rect,
             } => {
                 if ctx.is_resetting {
                     vec![]
                 } else {
-                    ctx.pending_responses
-                        .push_back(PendingResponse::PictureReady {
-                            picture_buffer_id,
-                            bitstream_id,
-                        });
-                    ctx.output_pending_responses()
+                    ctx.pending_ready_pictures.push_back(PictureReadyEvent {
+                        picture_buffer_id,
+                        bitstream_id,
+                        visible_rect,
+                    });
+                    ctx.output_pending_pictures()
                 }
             }
             DecoderEvent::NotifyEndOfBitstreamBuffer(bitstream_id) => {
@@ -1089,9 +994,40 @@ impl<D: DecoderBackend> Device for Decoder<D> {
             DecoderEvent::FlushCompleted(flush_result) => {
                 match flush_result {
                     Ok(()) => {
-                        ctx.pending_responses
-                            .push_back(PendingResponse::FlushCompleted);
-                        ctx.output_pending_responses()
+                        let eos_resource_id = match ctx.out_res.dequeue_eos_resource_id() {
+                            Some(r) => r,
+                            None => {
+                                // TODO(b/168750131): Instead of trigger error, we should wait for
+                                // the next output buffer enqueued, then dequeue the buffer with
+                                // EOS flag.
+                                error!(
+                                    "No EOS resource available on successful flush response (stream id {})",
+                                    stream_id);
+                                return Some(vec![Event(VideoEvt {
+                                    typ: EvtType::Error,
+                                    stream_id,
+                                })]);
+                            }
+                        };
+
+                        let eos_tag = AsyncCmdTag::Queue {
+                            stream_id,
+                            queue_type: QueueType::Output,
+                            resource_id: eos_resource_id,
+                        };
+
+                        let eos_response = CmdResponse::ResourceQueue {
+                            timestamp: 0,
+                            flags: protocol::VIRTIO_VIDEO_BUFFER_FLAG_EOS,
+                            size: 0,
+                        };
+                        vec![
+                            AsyncCmd(AsyncCmdResponse::from_response(eos_tag, eos_response)),
+                            AsyncCmd(AsyncCmdResponse::from_response(
+                                AsyncCmdTag::Drain { stream_id },
+                                CmdResponse::NoData,
+                            )),
+                        ]
                     }
                     Err(error) => {
                         // TODO(b/151810591): If `resp` is `libvda::decode::Response::Canceled`,
@@ -1149,5 +1085,17 @@ impl<D: DecoderBackend> Device for Decoder<D> {
         };
 
         Some(event_responses)
+    }
+}
+
+/// Create a new decoder instance using a Libvda decoder instance to perform
+/// the decoding.
+impl<'a> Decoder<&'a libvda::decode::VdaInstance> {
+    pub fn new(vda: &'a libvda::decode::VdaInstance) -> Self {
+        Decoder {
+            decoder: vda,
+            capability: Capability::new(vda.get_capabilities()),
+            contexts: ContextMap::new(),
+        }
     }
 }

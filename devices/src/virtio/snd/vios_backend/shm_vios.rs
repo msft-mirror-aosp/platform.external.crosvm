@@ -6,15 +6,15 @@ use crate::virtio::snd::constants::*;
 use crate::virtio::snd::layout::*;
 
 use base::{
-    error, net::UnixSeqpacket, AsRawDescriptor, Error as BaseError, Event, FromRawDescriptor,
-    IntoRawDescriptor, MemoryMapping, MemoryMappingBuilder, MmapError, PollToken, SafeDescriptor,
-    ScmSocket, WaitContext,
+    error, net::UnixSeqpacket, Error as BaseError, Event, FromRawDescriptor, IntoRawDescriptor,
+    MemoryMapping, MemoryMappingBuilder, MmapError, PollToken, SafeDescriptor, ScmSocket,
+    SharedMemory, WaitContext,
 };
-use data_model::{DataInit, VolatileMemory, VolatileMemoryError, VolatileSlice};
+use data_model::{DataInit, VolatileMemory, VolatileMemoryError};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Error as IOError, ErrorKind as IOErrorKind, IoSliceMut, Seek, SeekFrom};
+use std::io::{Error as IOError, ErrorKind as IOErrorKind, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, RecvError, Sender};
@@ -23,66 +23,62 @@ use std::thread::JoinHandle;
 
 use sync::Mutex;
 
-use remain::sorted;
 use thiserror::Error as ThisError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[sorted]
 #[derive(ThisError, Debug)]
 pub enum Error {
-    #[error("Error memory mapping client_shm: {0}")]
-    BaseMmapError(BaseError),
-    #[error("Sender was dropped without sending buffer status, the recv thread may have exited")]
-    BufferStatusSenderLost(RecvError),
-    #[error("Command failed with status {0}")]
-    CommandFailed(u32),
-    #[error("Error duplicating file descriptor: {0}")]
-    DupError(BaseError),
-    #[error("Failed to create Recv event: {0}")]
-    EventCreateError(BaseError),
-    #[error("Failed to dup Recv event: {0}")]
-    EventDupError(BaseError),
-    #[error("Failed to signal event: {0}")]
-    EventWriteError(BaseError),
-    #[error("Failed to get size of tx shared memory: {0}")]
-    FileSizeError(IOError),
-    #[error("Error accessing guest's shared memory: {0}")]
-    GuestMmapError(MmapError),
-    #[error("No jack with id {0}")]
-    InvalidJackId(u32),
-    #[error("No stream with id {0}")]
-    InvalidStreamId(u32),
-    #[error("IO buffer operation failed: status = {0}")]
-    IOBufferError(u32),
-    #[error("No PCM streams available")]
-    NoStreamsAvailable,
-    #[error("Insuficient space for the new buffer in the queue's buffer area")]
-    OutOfSpace,
-    #[error("Platform not supported")]
-    PlatformNotSupported,
-    #[error("{0}")]
-    ProtocolError(ProtocolErrorKind),
     #[error("Failed to connect to VioS server: {0:?}")]
     ServerConnectionError(IOError),
     #[error("Failed to communicate with VioS server: {0:?}")]
     ServerError(BaseError),
     #[error("Failed to communicate with VioS server: {0:?}")]
     ServerIOError(IOError),
+    #[error("Failed to get size of tx shared memory: {0}")]
+    FileSizeError(IOError),
+    #[error("Error duplicating file descriptor: {0}")]
+    DupError(BaseError),
     #[error("Error accessing VioS server's shared memory: {0}")]
     ServerMmapError(MmapError),
-    #[error("Failed to duplicate UnixSeqpacket: {0}")]
-    UnixSeqpacketDupError(IOError),
-    #[error("Unsupported frame rate: {0}")]
-    UnsupportedFrameRate(u32),
+    #[error("Error accessing guest's shared memory: {0}")]
+    GuestMmapError(MmapError),
+    #[error("Error memory mapping client_shm: {0}")]
+    BaseMmapError(BaseError),
     #[error("Error accessing volatile memory: {0}")]
     VolatileMemoryError(VolatileMemoryError),
+    #[error("{0}")]
+    ProtocolError(ProtocolErrorKind),
+    #[error("No PCM streams available")]
+    NoStreamsAvailable,
+    #[error("No stream with id {0}")]
+    InvalidStreamId(u32),
+    #[error("Stream is unexpected state: {0:?}")]
+    UnexpectedState(StreamState),
+    #[error("Invalid operation for stream direction: {0}")]
+    WrongDirection(u8),
+    #[error("Insuficient space for the new buffer in the queue's buffer area")]
+    OutOfSpace,
+    #[error("Unsupported frame rate: {0}")]
+    UnsupportedFrameRate(u32),
+    #[error("Platform not supported")]
+    PlatformNotSupported,
+    #[error("Command failed with status {0}")]
+    CommandFailed(u32),
+    #[error("IO buffer operation failed: status = {0}")]
+    IOBufferError(u32),
+    #[error("Failed to duplicate UnixSeqpacket: {0}")]
+    UnixSeqpacketDupError(IOError),
+    #[error("Sender was dropped without sending buffer status, the recv thread may have exited")]
+    BufferStatusSenderLost(RecvError),
+    #[error("Failed to create Recv event: {0}")]
+    EventCreateError(BaseError),
+    #[error("Failed to dup Recv event: {0}")]
+    EventDupError(BaseError),
     #[error("Failed to create Recv thread's WaitContext: {0}")]
     WaitContextCreateError(BaseError),
     #[error("Error waiting for events")]
     WaitError(BaseError),
-    #[error("Invalid operation for stream direction: {0}")]
-    WrongDirection(u8),
 }
 
 #[derive(ThisError, Debug)]
@@ -103,42 +99,32 @@ pub enum ProtocolErrorKind {
 /// notifications. It's thread safe, it can be encapsulated in an Arc smart pointer and shared
 /// between threads.
 pub struct VioSClient {
+    config: VioSConfig,
     // These mutexes should almost never be held simultaneously. If at some point they have to the
     // locking order should match the order in which they are declared here.
-    config: VioSConfig,
-    jacks: Vec<virtio_snd_jack_info>,
-    streams: Vec<virtio_snd_pcm_info>,
-    chmaps: Vec<virtio_snd_chmap_info>,
-    // The control socket is used from multiple threads to send and wait for a reply, which needs
-    // to happen atomically, hence the need for a mutex instead of just sharing clones of the
-    // socket.
+    streams: Mutex<Vec<VioSStreamInfo>>,
     control_socket: Mutex<UnixSeqpacket>,
-    event_socket: UnixSeqpacket,
-    // These are thread safe and don't require locking
-    tx: IoBufferQueue,
-    rx: IoBufferQueue,
-    // This is accessed by the recv_thread and whatever thread processes the events
-    events: Arc<Mutex<VecDeque<virtio_snd_event>>>,
-    event_notifier: Event,
-    // These are accessed by the recv_thread and the stream threads
-    tx_subscribers: Arc<Mutex<HashMap<usize, Sender<BufferReleaseMsg>>>>,
-    rx_subscribers: Arc<Mutex<HashMap<usize, Sender<BufferReleaseMsg>>>>,
-    recv_thread_state: Arc<Mutex<ThreadFlags>>,
-    recv_event: Event,
+    event_socket: Mutex<UnixSeqpacket>,
+    tx: Mutex<IoBufferQueue>,
+    rx: Mutex<IoBufferQueue>,
+    rx_subscribers: Arc<Mutex<HashMap<usize, Sender<(u32, usize)>>>>,
+    recv_running: Arc<Mutex<bool>>,
+    recv_event: Mutex<Event>,
     recv_thread: Mutex<Option<JoinHandle<Result<()>>>>,
 }
 
 impl VioSClient {
     /// Create a new client given the path to the audio server's socket.
     pub fn try_new<P: AsRef<Path>>(server: P) -> Result<VioSClient> {
-        let client_socket = UnixSeqpacket::connect(server).map_err(Error::ServerConnectionError)?;
+        let client_socket =
+            UnixSeqpacket::connect(server).map_err(|e| Error::ServerConnectionError(e))?;
         let mut config: VioSConfig = Default::default();
         let mut fds: Vec<RawFd> = Vec::new();
         const NUM_FDS: usize = 5;
         fds.resize(NUM_FDS, 0);
         let (recv_size, fd_count) = client_socket
-            .recv_with_fds(IoSliceMut::new(config.as_mut_slice()), &mut fds)
-            .map_err(Error::ServerError)?;
+            .recv_with_fds(config.as_mut_slice(), &mut fds)
+            .map_err(|e| Error::ServerError(e))?;
 
         // Resize the vector to the actual number of file descriptors received and wrap them in
         // SafeDescriptors to prevent leaks
@@ -195,472 +181,349 @@ impl VioSClient {
             ));
         }
 
-        let tx_subscribers: Arc<Mutex<HashMap<usize, Sender<BufferReleaseMsg>>>> =
+        let rx_subscribers: Arc<Mutex<HashMap<usize, Sender<(u32, usize)>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let rx_subscribers: Arc<Mutex<HashMap<usize, Sender<BufferReleaseMsg>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let recv_thread_state = Arc::new(Mutex::new(ThreadFlags {
-            running: true,
-            reporting_events: false,
-        }));
-        let recv_event = Event::new().map_err(Error::EventCreateError)?;
+        let recv_running = Arc::new(Mutex::new(true));
+        let recv_event = Event::new().map_err(|e| Error::EventCreateError(e))?;
 
         let mut client = VioSClient {
             config,
-            jacks: Vec::new(),
-            streams: Vec::new(),
-            chmaps: Vec::new(),
+            streams: Mutex::new(Vec::new()),
             control_socket: Mutex::new(client_socket),
-            event_socket,
-            tx: IoBufferQueue::new(tx_socket, tx_shm_file)?,
-            rx: IoBufferQueue::new(rx_socket, rx_shm_file)?,
-            events: Arc::new(Mutex::new(VecDeque::new())),
-            event_notifier: Event::new().map_err(Error::EventCreateError)?,
-            tx_subscribers,
+            event_socket: Mutex::new(event_socket),
+            tx: Mutex::new(IoBufferQueue::new(tx_socket, tx_shm_file)?),
+            rx: Mutex::new(IoBufferQueue::new(rx_socket, rx_shm_file)?),
             rx_subscribers,
-            recv_thread_state,
-            recv_event,
+            recv_running,
+            recv_event: Mutex::new(recv_event),
             recv_thread: Mutex::new(None),
         };
-        client.request_and_cache_info()?;
+        client.request_and_cache_streams_info()?;
         Ok(client)
     }
 
-    /// Get the number of jacks
-    pub fn num_jacks(&self) -> u32 {
-        self.config.jacks
-    }
-
-    /// Get the number of pcm streams
-    pub fn num_streams(&self) -> u32 {
-        self.config.streams
-    }
-
-    /// Get the number of channel maps
-    pub fn num_chmaps(&self) -> u32 {
-        self.config.chmaps
-    }
-
-    /// Get the configuration information on a jack
-    pub fn jack_info(&self, idx: u32) -> Option<virtio_snd_jack_info> {
-        self.jacks.get(idx as usize).copied()
-    }
-
-    /// Get the configuration information on a pcm stream
-    pub fn stream_info(&self, idx: u32) -> Option<virtio_snd_pcm_info> {
-        self.streams.get(idx as usize).cloned()
-    }
-
-    /// Get the configuration information on a channel map
-    pub fn chmap_info(&self, idx: u32) -> Option<virtio_snd_chmap_info> {
-        self.chmaps.get(idx as usize).copied()
-    }
-
-    /// Starts the background thread that receives release messages from the server. If the thread
-    /// was already started this function does nothing.
-    /// This thread must be started prior to attempting any stream IO operation or the calling
-    /// thread would block.
-    pub fn start_bg_thread(&self) -> Result<()> {
+    pub fn ensure_bg_thread_started(&self) -> Result<()> {
         if self.recv_thread.lock().is_some() {
             return Ok(());
         }
-        let recv_event = self.recv_event.try_clone().map_err(Error::EventDupError)?;
-        let tx_socket = self.tx.try_clone_socket()?;
-        let rx_socket = self.rx.try_clone_socket()?;
         let event_socket = self
-            .event_socket
+            .recv_event
+            .lock()
             .try_clone()
-            .map_err(Error::UnixSeqpacketDupError)?;
+            .map_err(|e| Error::EventDupError(e))?;
+        let rx_socket = self
+            .rx
+            .lock()
+            .socket
+            .try_clone()
+            .map_err(|e| Error::UnixSeqpacketDupError(e))?;
         let mut opt = self.recv_thread.lock();
         // The lock on recv_thread was released above to avoid holding more than one lock at a time
-        // while duplicating the fds. So we have to check the condition again.
+        // while duplicating the fds. So we have to check again the condition.
         if opt.is_none() {
             *opt = Some(spawn_recv_thread(
-                self.tx_subscribers.clone(),
                 self.rx_subscribers.clone(),
-                self.event_notifier
-                    .try_clone()
-                    .map_err(Error::EventDupError)?,
-                self.events.clone(),
-                recv_event,
-                self.recv_thread_state.clone(),
-                tx_socket,
-                rx_socket,
                 event_socket,
+                self.recv_running.clone(),
+                rx_socket,
             ));
         }
         Ok(())
     }
 
-    /// Stops the background thread.
-    pub fn stop_bg_thread(&self) -> Result<()> {
-        if self.recv_thread.lock().is_none() {
-            return Ok(());
-        }
-        self.recv_thread_state.lock().running = false;
-        self.recv_event
-            .write(1u64)
-            .map_err(Error::EventWriteError)?;
-        if let Some(handle) = self.recv_thread.lock().take() {
-            return match handle.join() {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("Recv thread panicked: {:?}", e);
-                    Ok(())
-                }
-            };
-        }
-        Ok(())
-    }
-
-    /// Gets an Event object that will trigger every time an event is received from the server
-    pub fn get_event_notifier(&self) -> Result<Event> {
-        // Let the background thread know that there is at least one consumer of events
-        self.recv_thread_state.lock().reporting_events = true;
-        self.event_notifier
-            .try_clone()
-            .map_err(Error::EventDupError)
-    }
-
-    /// Retrieves one event. Callers should have received a notification through the event notifier
-    /// before calling this function.
-    pub fn pop_event(&self) -> Option<virtio_snd_event> {
-        self.events.lock().pop_front()
-    }
-
-    /// Remap a jack. This should only be called if the jack announces support for the operation
-    /// through the features field in the corresponding virtio_snd_jack_info struct.
-    pub fn remap_jack(&self, jack_id: u32, association: u32, sequence: u32) -> Result<()> {
-        if jack_id >= self.config.jacks {
-            return Err(Error::InvalidJackId(jack_id));
-        }
-        let msg = virtio_snd_jack_remap {
-            hdr: virtio_snd_jack_hdr {
-                hdr: virtio_snd_hdr {
-                    code: VIRTIO_SND_R_JACK_REMAP.into(),
-                },
-                jack_id: jack_id.into(),
-            },
-            association: association.into(),
-            sequence: sequence.into(),
-        };
-        let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, msg)
+    /// Gets an unused stream id of the specified direction. `direction` must be one of
+    /// VIRTIO_SND_D_INPUT OR VIRTIO_SND_D_OUTPUT.
+    pub fn get_unused_stream_id(&self, direction: u8) -> Option<u32> {
+        self.streams
+            .lock()
+            .iter()
+            .filter(|s| s.state == StreamState::Available && s.direction == direction as u8)
+            .map(|s| s.id)
+            .next()
     }
 
     /// Configures a stream with the given parameters.
     pub fn set_stream_parameters(&self, stream_id: u32, params: VioSStreamParams) -> Result<()> {
-        self.streams
-            .get(stream_id as usize)
-            .ok_or(Error::InvalidStreamId(stream_id))?;
+        self.validate_stream_id(
+            stream_id,
+            &[StreamState::Available, StreamState::Acquired],
+            None,
+        )?;
         let raw_params: virtio_snd_pcm_set_params = (stream_id, params).into();
-        let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, raw_params)
-    }
-
-    /// Configures a stream with the given parameters.
-    pub fn set_stream_parameters_raw(&self, raw_params: virtio_snd_pcm_set_params) -> Result<()> {
-        let stream_id = raw_params.hdr.stream_id.to_native();
-        self.streams
-            .get(stream_id as usize)
-            .ok_or(Error::InvalidStreamId(stream_id))?;
-        let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, raw_params)
+        self.send_cmd(raw_params)?;
+        self.streams.lock()[stream_id as usize].state = StreamState::Acquired;
+        Ok(())
     }
 
     /// Send the PREPARE_STREAM command to the server.
     pub fn prepare_stream(&self, stream_id: u32) -> Result<()> {
-        self.common_stream_op(stream_id, VIRTIO_SND_R_PCM_PREPARE)
+        self.common_stream_op(
+            stream_id,
+            &[StreamState::Available, StreamState::Acquired],
+            StreamState::Acquired,
+            STREAM_PREPARE,
+        )
     }
 
     /// Send the RELEASE_STREAM command to the server.
     pub fn release_stream(&self, stream_id: u32) -> Result<()> {
-        self.common_stream_op(stream_id, VIRTIO_SND_R_PCM_RELEASE)
+        self.common_stream_op(
+            stream_id,
+            &[StreamState::Acquired],
+            StreamState::Available,
+            STREAM_RELEASE,
+        )
     }
 
     /// Send the START_STREAM command to the server.
     pub fn start_stream(&self, stream_id: u32) -> Result<()> {
-        self.common_stream_op(stream_id, VIRTIO_SND_R_PCM_START)
+        self.common_stream_op(
+            stream_id,
+            &[StreamState::Acquired],
+            StreamState::Active,
+            STREAM_START,
+        )
     }
 
     /// Send the STOP_STREAM command to the server.
     pub fn stop_stream(&self, stream_id: u32) -> Result<()> {
-        self.common_stream_op(stream_id, VIRTIO_SND_R_PCM_STOP)
+        self.common_stream_op(
+            stream_id,
+            &[StreamState::Active],
+            StreamState::Acquired,
+            STREAM_STOP,
+        )
     }
 
-    /// Send audio frames to the server. Blocks the calling thread until the server acknowledges
-    /// the data.
-    pub fn inject_audio_data<R, Cb: FnOnce(VolatileSlice) -> R>(
+    /// Send audio frames to the server. The audio data is taken from a shared memory resource.
+    pub fn inject_audio_data(
         &self,
         stream_id: u32,
+        buffer: &mut SharedMemory,
+        src_offset: usize,
         size: usize,
-        callback: Cb,
-    ) -> Result<(u32, R)> {
-        if self
-            .streams
-            .get(stream_id as usize)
-            .ok_or(Error::InvalidStreamId(stream_id))?
-            .direction
-            != VIRTIO_SND_D_OUTPUT
-        {
-            return Err(Error::WrongDirection(VIRTIO_SND_D_OUTPUT));
-        }
-        self.streams
-            .get(stream_id as usize)
-            .ok_or(Error::InvalidStreamId(stream_id))?;
-        let dst_offset = self.tx.allocate_buffer(size)?;
-        let buffer_slice = self.tx.buffer_at(dst_offset, size)?;
-        let ret = callback(buffer_slice);
-        // Register to receive the status before sending the buffer to the server
-        let (sender, receiver): (Sender<BufferReleaseMsg>, Receiver<BufferReleaseMsg>) = channel();
-        self.tx_subscribers.lock().insert(dst_offset, sender);
-        self.tx.send_buffer(stream_id, dst_offset, size)?;
-        let (_, latency) = await_status(receiver)?;
-        Ok((latency, ret))
+    ) -> Result<()> {
+        self.validate_stream_id(stream_id, &[StreamState::Active], Some(VIRTIO_SND_D_OUTPUT))?;
+        let mut tx_lock = self.tx.lock();
+        let tx = &mut *tx_lock;
+        let dst_offset = tx.push_buffer(buffer, src_offset, size)?;
+        let msg = IoTransferMsg::new(stream_id, dst_offset, size);
+        seq_socket_send(&tx.socket, msg)
     }
 
-    /// Request audio frames from the server. It blocks until the data is available.
-    pub fn request_audio_data<R, Cb: FnOnce(&VolatileSlice) -> R>(
+    pub fn request_audio_data(
         &self,
         stream_id: u32,
+        buffer: &mut SharedMemory,
+        dst_offset: usize,
         size: usize,
-        callback: Cb,
-    ) -> Result<(u32, R)> {
-        if self
-            .streams
-            .get(stream_id as usize)
-            .ok_or(Error::InvalidStreamId(stream_id))?
-            .direction
-            != VIRTIO_SND_D_INPUT
-        {
-            return Err(Error::WrongDirection(VIRTIO_SND_D_INPUT));
-        }
-        let src_offset = self.rx.allocate_buffer(size)?;
-        // Register to receive the status before sending the buffer to the server
-        let (sender, receiver): (Sender<BufferReleaseMsg>, Receiver<BufferReleaseMsg>) = channel();
-        self.rx_subscribers.lock().insert(src_offset, sender);
-        self.rx.send_buffer(stream_id, src_offset, size)?;
+    ) -> Result<usize> {
+        self.validate_stream_id(stream_id, &[StreamState::Active], Some(VIRTIO_SND_D_INPUT))?;
+        let (src_offset, status_promise) = {
+            let mut rx_lock = self.rx.lock();
+            let rx = &mut *rx_lock;
+            let src_offset = rx.allocate_buffer(size)?;
+            // Register to receive the status before sending the buffer to the server
+            let (sender, receiver): (Sender<(u32, usize)>, Receiver<(u32, usize)>) = channel();
+            // It's OK to acquire rx_subscriber's lock after rx_lock
+            self.rx_subscribers.lock().insert(src_offset, sender);
+            let msg = IoTransferMsg::new(stream_id, src_offset, size);
+            seq_socket_send(&rx.socket, msg)?;
+            (src_offset, receiver)
+        };
         // Make sure no mutexes are held while awaiting for the buffer to be written to
-        let (recv_size, latency) = await_status(receiver)?;
-        let buffer_slice = self.rx.buffer_at(src_offset, recv_size)?;
-        Ok((latency, callback(&buffer_slice)))
+        let recv_size = await_status(status_promise)?;
+        {
+            let mut rx_lock = self.rx.lock();
+            rx_lock
+                .pop_buffer(buffer, dst_offset, recv_size, src_offset)
+                .map(|()| recv_size)
+        }
     }
 
     /// Get a list of file descriptors used by the implementation.
     pub fn keep_fds(&self) -> Vec<RawFd> {
         let control_fd = self.control_socket.lock().as_raw_fd();
-        let event_fd = self.event_socket.as_raw_fd();
-        let recv_event = self.recv_event.as_raw_descriptor();
-        let event_notifier = self.event_notifier.as_raw_descriptor();
-        let mut ret = vec![control_fd, event_fd, recv_event, event_notifier];
-        ret.append(&mut self.tx.keep_fds());
-        ret.append(&mut self.rx.keep_fds());
-        ret
+        let event_fd = self.event_socket.lock().as_raw_fd();
+        let (tx_socket_fd, tx_shm_fd) = {
+            let lock = self.tx.lock();
+            (lock.socket.as_raw_fd(), lock.file.as_raw_fd())
+        };
+        let (rx_socket_fd, rx_shm_fd) = {
+            let lock = self.rx.lock();
+            (lock.socket.as_raw_fd(), lock.file.as_raw_fd())
+        };
+        vec![
+            control_fd,
+            event_fd,
+            tx_socket_fd,
+            tx_shm_fd,
+            rx_socket_fd,
+            rx_shm_fd,
+        ]
     }
 
-    fn common_stream_op(&self, stream_id: u32, op: u32) -> Result<()> {
-        self.streams
-            .get(stream_id as usize)
-            .ok_or(Error::InvalidStreamId(stream_id))?;
+    fn send_cmd<T: DataInit>(&self, data: T) -> Result<()> {
+        let mut control_socket_lock = self.control_socket.lock();
+        seq_socket_send(&mut *control_socket_lock, data)?;
+        recv_cmd_status(&mut *control_socket_lock)
+    }
+
+    fn validate_stream_id(
+        &self,
+        stream_id: u32,
+        permitted_states: &[StreamState],
+        direction: Option<u8>,
+    ) -> Result<()> {
+        let streams_lock = self.streams.lock();
+        let stream_idx = stream_id as usize;
+        if stream_idx >= streams_lock.len() {
+            return Err(Error::InvalidStreamId(stream_id));
+        }
+        if !permitted_states.contains(&streams_lock[stream_idx].state) {
+            return Err(Error::UnexpectedState(streams_lock[stream_idx].state));
+        }
+        match direction {
+            None => Ok(()),
+            Some(d) => {
+                if d == streams_lock[stream_idx].direction {
+                    Ok(())
+                } else {
+                    Err(Error::WrongDirection(streams_lock[stream_idx].direction))
+                }
+            }
+        }
+    }
+
+    fn common_stream_op(
+        &self,
+        stream_id: u32,
+        expected_states: &[StreamState],
+        new_state: StreamState,
+        op: u32,
+    ) -> Result<()> {
+        self.validate_stream_id(stream_id, expected_states, None)?;
         let msg = virtio_snd_pcm_hdr {
             hdr: virtio_snd_hdr { code: op.into() },
             stream_id: stream_id.into(),
         };
-        let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, msg)
-    }
-
-    fn request_and_cache_info(&mut self) -> Result<()> {
-        self.request_and_cache_jacks_info()?;
-        self.request_and_cache_streams_info()?;
-        self.request_and_cache_chmaps_info()?;
-        Ok(())
-    }
-
-    fn request_info<T: DataInit + Default + Copy + Clone>(
-        &self,
-        req_code: u32,
-        count: usize,
-    ) -> Result<Vec<T>> {
-        let info_size = std::mem::size_of::<T>();
-        let status_size = std::mem::size_of::<virtio_snd_hdr>();
-        let req = virtio_snd_query_info {
-            hdr: virtio_snd_hdr {
-                code: req_code.into(),
-            },
-            start_id: 0u32.into(),
-            count: (count as u32).into(),
-            size: (std::mem::size_of::<virtio_snd_query_info>() as u32).into(),
-        };
-        let control_socket_lock = self.control_socket.lock();
-        seq_socket_send(&*control_socket_lock, req)?;
-        let reply = control_socket_lock
-            .recv_as_vec()
-            .map_err(Error::ServerIOError)?;
-        let mut status: virtio_snd_hdr = Default::default();
-        status
-            .as_mut_slice()
-            .copy_from_slice(&reply[0..status_size]);
-        if status.code.to_native() != VIRTIO_SND_S_OK {
-            return Err(Error::CommandFailed(status.code.to_native()));
-        }
-        if reply.len() != status_size + count * info_size {
-            return Err(Error::ProtocolError(
-                ProtocolErrorKind::UnexpectedMessageSize(count * info_size, reply.len()),
-            ));
-        }
-        Ok(reply[status_size..]
-            .chunks(info_size)
-            .map(|info_buffer| {
-                let mut info: T = Default::default();
-                // Need to use copy_from_slice instead of T::from_slice because the info_buffer may
-                // not be aligned correctly
-                info.as_mut_slice().copy_from_slice(info_buffer);
-                info
-            })
-            .collect())
-    }
-
-    fn request_and_cache_jacks_info(&mut self) -> Result<()> {
-        let num_jacks = self.config.jacks as usize;
-        if num_jacks == 0 {
-            return Ok(());
-        }
-        self.jacks = self.request_info(VIRTIO_SND_R_JACK_INFO, num_jacks)?;
+        self.send_cmd(msg)?;
+        self.streams.lock()[stream_id as usize].state = new_state;
         Ok(())
     }
 
     fn request_and_cache_streams_info(&mut self) -> Result<()> {
         let num_streams = self.config.streams as usize;
-        if num_streams == 0 {
-            return Ok(());
+        let info_size = std::mem::size_of::<virtio_snd_pcm_info>();
+        let req = virtio_snd_query_info {
+            hdr: virtio_snd_hdr {
+                code: STREAM_INFO.into(),
+            },
+            start_id: 0u32.into(),
+            count: (num_streams as u32).into(),
+            size: (std::mem::size_of::<virtio_snd_query_info>() as u32).into(),
+        };
+        self.send_cmd(req)?;
+        let control_socket_lock = self.control_socket.lock();
+        let info_vec = control_socket_lock
+            .recv_as_vec()
+            .map_err(|e| Error::ServerIOError(e))?;
+        if info_vec.len() != num_streams * info_size {
+            return Err(Error::ProtocolError(
+                ProtocolErrorKind::UnexpectedMessageSize(num_streams * info_size, info_vec.len()),
+            ));
         }
-        self.streams = self.request_info(VIRTIO_SND_R_PCM_INFO, num_streams)?;
-        Ok(())
-    }
-
-    fn request_and_cache_chmaps_info(&mut self) -> Result<()> {
-        let num_chmaps = self.config.chmaps as usize;
-        if num_chmaps == 0 {
-            return Ok(());
-        }
-        self.chmaps = self.request_info(VIRTIO_SND_R_CHMAP_INFO, num_chmaps)?;
+        self.streams = Mutex::new(
+            info_vec
+                .chunks(info_size)
+                .enumerate()
+                .map(|(id, info_buffer)| {
+                    // unwrap is safe because we checked the size of the vector
+                    let virtio_stream_info = virtio_snd_pcm_info::from_slice(&info_buffer).unwrap();
+                    VioSStreamInfo::new(id as u32, &virtio_stream_info)
+                })
+                .collect(),
+        );
         Ok(())
     }
 }
 
 impl Drop for VioSClient {
     fn drop(&mut self) {
-        if let Err(e) = self.stop_bg_thread() {
-            error!("Error stopping Recv thread: {}", e);
+        // Stop the recv thread
+        *self.recv_running.lock() = false;
+        if let Err(e) = self.recv_event.lock().write(1u64) {
+            error!("Failed to notify recv thread: {:?}", e);
+        }
+        if let Some(handle) = self.recv_thread.lock().take() {
+            match handle.join() {
+                Ok(r) => {
+                    if let Err(e) = r {
+                        error!("Error detected on Recv Thread: {}", e);
+                    }
+                }
+                Err(e) => error!("Recv thread panicked: {:?}", e),
+            };
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct ThreadFlags {
-    running: bool,
-    reporting_events: bool,
 }
 
 #[derive(PollToken)]
 enum Token {
     Notification,
-    TxBufferMsg,
     RxBufferMsg,
-    EventMsg,
-}
-
-fn recv_buffer_status_msg(
-    socket: &UnixSeqpacket,
-    subscribers: &Arc<Mutex<HashMap<usize, Sender<BufferReleaseMsg>>>>,
-) -> Result<()> {
-    let mut msg: IoStatusMsg = Default::default();
-    let size = socket
-        .recv(msg.as_mut_slice())
-        .map_err(Error::ServerIOError)?;
-    if size != std::mem::size_of::<IoStatusMsg>() {
-        return Err(Error::ProtocolError(
-            ProtocolErrorKind::UnexpectedMessageSize(std::mem::size_of::<IoStatusMsg>(), size),
-        ));
-    }
-    let mut status = msg.status.status.into();
-    if status == u32::MAX {
-        // Anyone waiting for this would continue to wait for as long as status is
-        // u32::MAX
-        status -= 1;
-    }
-    let latency = msg.status.latency_bytes.into();
-    let offset = msg.buffer_offset as usize;
-    let consumed_len = msg.consumed_len as usize;
-    let promise_opt = subscribers.lock().remove(&offset);
-    match promise_opt {
-        None => error!(
-            "Received an unexpected buffer status message: {}. This is a BUG!!",
-            offset
-        ),
-        Some(sender) => {
-            if let Err(e) = sender.send(BufferReleaseMsg {
-                status,
-                latency,
-                consumed_len,
-            }) {
-                error!("Failed to notify waiting thread: {:?}", e);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn recv_event(socket: &UnixSeqpacket) -> Result<virtio_snd_event> {
-    let mut msg: virtio_snd_event = Default::default();
-    let size = socket
-        .recv(msg.as_mut_slice())
-        .map_err(Error::ServerIOError)?;
-    if size != std::mem::size_of::<virtio_snd_event>() {
-        return Err(Error::ProtocolError(
-            ProtocolErrorKind::UnexpectedMessageSize(std::mem::size_of::<virtio_snd_event>(), size),
-        ));
-    }
-    Ok(msg)
 }
 
 fn spawn_recv_thread(
-    tx_subscribers: Arc<Mutex<HashMap<usize, Sender<BufferReleaseMsg>>>>,
-    rx_subscribers: Arc<Mutex<HashMap<usize, Sender<BufferReleaseMsg>>>>,
-    event_notifier: Event,
-    event_queue: Arc<Mutex<VecDeque<virtio_snd_event>>>,
+    rx_subscribers: Arc<Mutex<HashMap<usize, Sender<(u32, usize)>>>>,
     event: Event,
-    state: Arc<Mutex<ThreadFlags>>,
-    tx_socket: UnixSeqpacket,
+    running: Arc<Mutex<bool>>,
     rx_socket: UnixSeqpacket,
-    event_socket: UnixSeqpacket,
 ) -> JoinHandle<Result<()>> {
     std::thread::spawn(move || {
         let wait_ctx: WaitContext<Token> = WaitContext::build_with(&[
-            (&tx_socket, Token::TxBufferMsg),
             (&rx_socket, Token::RxBufferMsg),
-            (&event_socket, Token::EventMsg),
             (&event, Token::Notification),
         ])
-        .map_err(Error::WaitContextCreateError)?;
-        loop {
-            let state_cpy = *state.lock();
-            if !state_cpy.running {
-                break;
-            }
-            let events = wait_ctx.wait().map_err(Error::WaitError)?;
+        .map_err(|e| Error::WaitContextCreateError(e))?;
+        while *running.lock() {
+            let events = wait_ctx.wait().map_err(|e| Error::WaitError(e))?;
             for evt in events {
                 match evt.token {
-                    Token::TxBufferMsg => recv_buffer_status_msg(&tx_socket, &tx_subscribers)?,
-                    Token::RxBufferMsg => recv_buffer_status_msg(&rx_socket, &rx_subscribers)?,
-                    Token::EventMsg => {
-                        let evt = recv_event(&event_socket)?;
-                        let state_cpy = *state.lock();
-                        if state_cpy.reporting_events {
-                            event_queue.lock().push_back(evt);
-                            event_notifier.write(1).map_err(Error::EventWriteError)?;
-                        } // else just drop the events
+                    Token::RxBufferMsg => {
+                        let mut msg: IoStatusMsg = Default::default();
+                        let size = rx_socket
+                            .recv(msg.as_mut_slice())
+                            .map_err(|e| Error::ServerIOError(e))?;
+                        if size != std::mem::size_of::<IoStatusMsg>() {
+                            return Err(Error::ProtocolError(
+                                ProtocolErrorKind::UnexpectedMessageSize(
+                                    std::mem::size_of::<IoStatusMsg>(),
+                                    size,
+                                ),
+                            ));
+                        }
+                        let mut status = msg.status.status.into();
+                        if status == u32::MAX {
+                            // Anyone waiting for this would continue to wait for as long as status is
+                            // u32::MAX
+                            status -= 1;
+                        }
+                        let offset = msg.buffer_offset as usize;
+                        let consumed_len = msg.consumed_len as usize;
+                        // Acquire and immediately release the mutex protecting the hashmap
+                        let promise_opt = rx_subscribers.lock().remove(&offset);
+                        match promise_opt {
+                            None => error!(
+                                "Received an unexpected buffer status message: {}. This is a BUG!!",
+                                offset
+                            ),
+                            Some(sender) => {
+                                if let Err(e) = sender.send((status, consumed_len)) {
+                                    error!("Failed to notify waiting thread: {:?}", e);
+                                }
+                            }
+                        }
                     }
                     Token::Notification => {
                         // Just consume the notification and check for termination on the next
@@ -676,14 +539,12 @@ fn spawn_recv_thread(
     })
 }
 
-fn await_status(promise: Receiver<BufferReleaseMsg>) -> Result<(usize, u32)> {
-    let BufferReleaseMsg {
-        status,
-        latency,
-        consumed_len,
-    } = promise.recv().map_err(Error::BufferStatusSenderLost)?;
+fn await_status(promise: Receiver<(u32, usize)>) -> Result<usize> {
+    let (status, consumed_len) = promise
+        .recv()
+        .map_err(|e| Error::BufferStatusSenderLost(e))?;
     if status == VIRTIO_SND_S_OK {
-        Ok((consumed_len, latency))
+        Ok(consumed_len)
     } else {
         Err(Error::IOBufferError(status))
     }
@@ -694,62 +555,111 @@ struct IoBufferQueue {
     file: File,
     mmap: MemoryMapping,
     size: usize,
-    next: Mutex<usize>,
+    next: usize,
 }
 
 impl IoBufferQueue {
     fn new(socket: UnixSeqpacket, mut file: File) -> Result<IoBufferQueue> {
-        let size = file.seek(SeekFrom::End(0)).map_err(Error::FileSizeError)? as usize;
+        let size = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| Error::FileSizeError(e))? as usize;
 
         let mmap = MemoryMappingBuilder::new(size)
             .from_file(&file)
             .build()
-            .map_err(Error::ServerMmapError)?;
+            .map_err(|e| Error::ServerMmapError(e))?;
 
         Ok(IoBufferQueue {
             socket,
             file,
             mmap,
             size,
-            next: Mutex::new(0),
+            next: 0,
         })
     }
 
-    fn allocate_buffer(&self, size: usize) -> Result<usize> {
+    fn allocate_buffer(&mut self, size: usize) -> Result<usize> {
         if size > self.size {
             return Err(Error::OutOfSpace);
         }
-        let mut next_lock = self.next.lock();
-        let offset = if size > self.size - *next_lock {
+        let offset = if size > self.size - self.next {
             // Can't fit the new buffer at the end of the area, so put it at the beginning
             0
         } else {
-            *next_lock
+            self.next
         };
-        *next_lock = offset + size;
+        self.next = offset + size;
         Ok(offset)
     }
 
-    fn buffer_at(&self, offset: usize, len: usize) -> Result<VolatileSlice> {
-        self.mmap
-            .get_slice(offset, len)
-            .map_err(Error::VolatileMemoryError)
+    fn push_buffer(&mut self, src: &mut SharedMemory, offset: usize, size: usize) -> Result<usize> {
+        let shm_offset = self.allocate_buffer(size)?;
+        let (src_mmap, mmap_offset) = mmap_buffer(src, offset, size)?;
+        let src_slice = src_mmap
+            .get_slice(mmap_offset, size)
+            .map_err(|e| Error::VolatileMemoryError(e))?;
+        let dst_slice = self
+            .mmap
+            .get_slice(shm_offset, size)
+            .map_err(|e| Error::VolatileMemoryError(e))?;
+        src_slice.copy_to_volatile_slice(dst_slice);
+        Ok(shm_offset)
     }
 
-    fn try_clone_socket(&self) -> Result<UnixSeqpacket> {
-        self.socket
-            .try_clone()
-            .map_err(Error::UnixSeqpacketDupError)
+    fn pop_buffer(
+        &mut self,
+        dst: &mut SharedMemory,
+        dst_offset: usize,
+        size: usize,
+        src_offset: usize,
+    ) -> Result<()> {
+        let (dst_mmap, mmap_offset) = mmap_buffer(dst, dst_offset, size)?;
+        let dst_slice = dst_mmap
+            .get_slice(mmap_offset, size)
+            .map_err(|e| Error::VolatileMemoryError(e))?;
+        let src_slice = self
+            .mmap
+            .get_slice(src_offset, size)
+            .map_err(|e| Error::VolatileMemoryError(e))?;
+        src_slice.copy_to_volatile_slice(dst_slice);
+        Ok(())
     }
+}
 
-    fn send_buffer(&self, stream_id: u32, offset: usize, size: usize) -> Result<()> {
-        let msg = IoTransferMsg::new(stream_id, offset, size);
-        seq_socket_send(&self.socket, msg)
-    }
+/// Description of a stream made available by the server.
+pub struct VioSStreamInfo {
+    pub id: u32,
+    pub hda_fn_nid: u32,
+    pub features: u32,
+    pub formats: u64,
+    pub rates: u64,
+    pub direction: u8,
+    pub channels_min: u8,
+    pub channels_max: u8,
+    state: StreamState,
+}
 
-    fn keep_fds(&self) -> Vec<RawFd> {
-        vec![self.file.as_raw_fd(), self.socket.as_raw_fd()]
+impl VioSStreamInfo {
+    fn new(id: u32, info: &virtio_snd_pcm_info) -> VioSStreamInfo {
+        VioSStreamInfo {
+            id,
+            hda_fn_nid: info.hdr.hda_fn_nid.to_native(),
+            features: info.features.to_native(),
+            formats: info.formats.to_native(),
+            rates: info.rates.to_native(),
+            direction: info.direction,
+            channels_min: info.channels_min,
+            channels_max: info.channels_max,
+            state: StreamState::Available,
+        }
     }
+}
+
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum StreamState {
+    Available,
+    Acquired,
+    Active,
 }
 
 /// Groups the parameters used to configure a stream prior to using it.
@@ -762,36 +672,53 @@ pub struct VioSStreamParams {
     pub rate: u8,
 }
 
-impl From<(u32, VioSStreamParams)> for virtio_snd_pcm_set_params {
-    fn from(val: (u32, VioSStreamParams)) -> Self {
+impl Into<virtio_snd_pcm_set_params> for (u32, VioSStreamParams) {
+    fn into(self) -> virtio_snd_pcm_set_params {
         virtio_snd_pcm_set_params {
             hdr: virtio_snd_pcm_hdr {
                 hdr: virtio_snd_hdr {
-                    code: VIRTIO_SND_R_PCM_SET_PARAMS.into(),
+                    code: STREAM_SET_PARAMS.into(),
                 },
-                stream_id: val.0.into(),
+                stream_id: self.0.into(),
             },
-            buffer_bytes: val.1.buffer_bytes.into(),
-            period_bytes: val.1.period_bytes.into(),
-            features: val.1.features.into(),
-            channels: val.1.channels,
-            format: val.1.format,
-            rate: val.1.rate,
+            buffer_bytes: self.1.buffer_bytes.into(),
+            period_bytes: self.1.period_bytes.into(),
+            features: self.1.features.into(),
+            channels: self.1.channels,
+            format: self.1.format,
+            rate: self.1.rate,
             padding: 0u8,
         }
     }
 }
 
-fn send_cmd<T: DataInit>(control_socket: &UnixSeqpacket, data: T) -> Result<()> {
-    seq_socket_send(control_socket, data)?;
-    recv_cmd_status(control_socket)
+/// Memory map a shared memory object to access an audio buffer. The buffer may not be located at an
+/// offset aligned to page size, so the offset within the mapped region is returned along with the
+/// MemoryMapping struct.
+fn mmap_buffer(
+    src: &mut SharedMemory,
+    offset: usize,
+    size: usize,
+) -> Result<(MemoryMapping, usize)> {
+    // If the buffer is not aligned to page size a bigger region needs to be mapped.
+    let aligned_offset = offset & !(base::pagesize() - 1);
+    let offset_from_mapping_start = offset - aligned_offset;
+    let extended_size = size + offset_from_mapping_start;
+
+    let mmap = MemoryMappingBuilder::new(extended_size)
+        .offset(aligned_offset as u64)
+        .from_shared_memory(src)
+        .build()
+        .map_err(|e| Error::GuestMmapError(e))?;
+
+    Ok((mmap, offset_from_mapping_start))
 }
 
-fn recv_cmd_status(control_socket: &UnixSeqpacket) -> Result<()> {
+fn recv_cmd_status(control_socket: &mut UnixSeqpacket) -> Result<()> {
     let mut status: virtio_snd_hdr = Default::default();
     control_socket
         .recv(status.as_mut_slice())
-        .map_err(Error::ServerIOError)?;
+        .map_err(|e| Error::ServerIOError(e))?;
     if status.code.to_native() == VIRTIO_SND_S_OK {
         Ok(())
     } else {
@@ -815,7 +742,7 @@ fn seq_socket_send<T: DataInit>(socket: &UnixSeqpacket, data: T) -> Result<()> {
     Ok(())
 }
 
-const VIOS_VERSION: u32 = 2;
+const VIOS_VERSION: u32 = 1;
 
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
@@ -827,12 +754,6 @@ struct VioSConfig {
 }
 // Safe because it only has data and has no implicit padding.
 unsafe impl DataInit for VioSConfig {}
-
-struct BufferReleaseMsg {
-    status: u32,
-    latency: u32,
-    consumed_len: usize,
-}
 
 #[repr(C)]
 #[derive(Copy, Clone)]

@@ -4,62 +4,88 @@
 
 //! Track memory regions that are mapped to the guest VM.
 
-use std::convert::{AsRef, TryFrom};
-use std::fs::File;
-use std::marker::{Send, Sync};
+use std::convert::AsRef;
+use std::convert::TryFrom;
+use std::fmt::{self, Display};
 use std::mem::size_of;
 use std::result;
 use std::sync::Arc;
 
+use crate::guest_address::GuestAddress;
 use base::{pagesize, Error as SysError};
 use base::{
     AsRawDescriptor, AsRawDescriptors, MappedRegion, MemfdSeals, MemoryMapping,
     MemoryMappingBuilder, MemoryMappingUnix, MmapError, RawDescriptor, SharedMemory,
     SharedMemoryUnix,
 };
-use bitflags::bitflags;
 use cros_async::{mem, BackingMemory};
 use data_model::volatile_memory::*;
 use data_model::DataInit;
-use remain::sorted;
-use thiserror::Error;
 
-use crate::guest_address::GuestAddress;
+use bitflags::bitflags;
 
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("invalid guest address {0}")]
+    DescriptorChainOverflow,
     InvalidGuestAddress(GuestAddress),
-    #[error("invalid offset {0}")]
     InvalidOffset(u64),
-    #[error("size {0} must not be zero")]
-    InvalidSize(usize),
-    #[error("invalid guest memory access at addr={0}: {1}")]
     MemoryAccess(GuestAddress, MmapError),
-    #[error("failed to set seals on shm region: {0}")]
-    MemoryAddSealsFailed(SysError),
-    #[error("failed to create shm region")]
-    MemoryCreationFailed(SysError),
-    #[error("failed to map guest memory: {0}")]
     MemoryMappingFailed(MmapError),
-    #[error("shm regions must be page aligned")]
-    MemoryNotAligned,
-    #[error("memory regions overlap")]
     MemoryRegionOverlap,
-    #[error("memory region size {0} is too large")]
-    MemoryRegionTooLarge(u128),
-    #[error("incomplete read of {completed} instead of {expected} bytes")]
-    ShortRead { expected: usize, completed: usize },
-    #[error("incomplete write of {completed} instead of {expected} bytes")]
+    MemoryRegionTooLarge(u64),
+    MemoryNotAligned,
+    MemoryCreationFailed(SysError),
+    MemoryAddSealsFailed(SysError),
     ShortWrite { expected: usize, completed: usize },
-    #[error("DescriptorChain split is out of bounds: {0}")]
+    ShortRead { expected: usize, completed: usize },
     SplitOutOfBounds(usize),
-    #[error("{0}")]
     VolatileMemoryAccess(VolatileMemoryError),
 }
-
 pub type Result<T> = result::Result<T, Error>;
+
+impl std::error::Error for Error {}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            DescriptorChainOverflow => write!(
+                f,
+                "the combined length of all the buffers in a DescriptorChain is too large"
+            ),
+            InvalidGuestAddress(addr) => write!(f, "invalid guest address {}", addr),
+            InvalidOffset(addr) => write!(f, "invalid offset {}", addr),
+            MemoryAccess(addr, e) => {
+                write!(f, "invalid guest memory access at addr={}: {}", addr, e)
+            }
+            MemoryMappingFailed(e) => write!(f, "failed to map guest memory: {}", e),
+            MemoryRegionOverlap => write!(f, "memory regions overlap"),
+            MemoryRegionTooLarge(size) => write!(f, "memory region size {} is too large", size),
+            MemoryNotAligned => write!(f, "shm regions must be page aligned"),
+            MemoryCreationFailed(_) => write!(f, "failed to create shm region"),
+            MemoryAddSealsFailed(e) => write!(f, "failed to set seals on shm region: {}", e),
+            ShortWrite {
+                expected,
+                completed,
+            } => write!(
+                f,
+                "incomplete write of {} instead of {} bytes",
+                completed, expected,
+            ),
+            ShortRead {
+                expected,
+                completed,
+            } => write!(
+                f,
+                "incomplete read of {} instead of {} bytes",
+                completed, expected,
+            ),
+            SplitOutOfBounds(off) => write!(f, "DescriptorChain split is out of bounds: {}", off),
+            VolatileMemoryAccess(e) => e.fmt(f),
+        }
+    }
+}
 
 bitflags! {
     pub struct MemoryPolicy: u32 {
@@ -67,85 +93,14 @@ bitflags! {
     }
 }
 
-/// A file-like object backing `MemoryRegion`.
-#[derive(Clone)]
-pub enum BackingObject {
-    Shm(Arc<SharedMemory>),
-    File(Arc<File>),
-}
-
-impl AsRawDescriptor for BackingObject {
-    fn as_raw_descriptor(&self) -> RawDescriptor {
-        match self {
-            Self::Shm(shm) => shm.as_raw_descriptor(),
-            Self::File(f) => f.as_raw_descriptor(),
-        }
-    }
-}
-
-impl AsRef<dyn AsRawDescriptor + Sync + Send> for BackingObject {
-    fn as_ref(&self) -> &(dyn AsRawDescriptor + Sync + Send + 'static) {
-        match self {
-            BackingObject::Shm(shm) => shm.as_ref(),
-            BackingObject::File(f) => f.as_ref(),
-        }
-    }
-}
-
-/// A regions of memory mapped memory.
-/// Holds the memory mapping with its offset in guest memory.
-/// Also holds the backing object for the mapping and the offset in that object of the mapping.
-pub struct MemoryRegion {
+struct MemoryRegion {
     mapping: MemoryMapping,
     guest_base: GuestAddress,
-
-    shared_obj: BackingObject,
-    obj_offset: u64,
+    shm_offset: u64,
+    shm: Arc<SharedMemory>,
 }
 
 impl MemoryRegion {
-    /// Creates a new MemoryRegion using the given SharedMemory object to later be attached to a VM
-    /// at `guest_base` address in the guest.
-    pub fn new_from_shm(
-        size: u64,
-        guest_base: GuestAddress,
-        offset: u64,
-        shm: Arc<SharedMemory>,
-    ) -> Result<Self> {
-        let mapping = MemoryMappingBuilder::new(size as usize)
-            .from_shared_memory(shm.as_ref())
-            .offset(offset)
-            .build()
-            .map_err(Error::MemoryMappingFailed)?;
-        Ok(MemoryRegion {
-            mapping,
-            guest_base,
-            shared_obj: BackingObject::Shm(shm),
-            obj_offset: offset,
-        })
-    }
-
-    /// Creates a new MemoryRegion using the given file to get available later at `guest_base`
-    /// address in the guest.
-    pub fn new_from_file(
-        size: u64,
-        guest_base: GuestAddress,
-        offset: u64,
-        file: Arc<File>,
-    ) -> Result<Self> {
-        let mapping = MemoryMappingBuilder::new(size as usize)
-            .from_file(&file)
-            .offset(offset)
-            .build()
-            .map_err(Error::MemoryMappingFailed)?;
-        Ok(MemoryRegion {
-            mapping,
-            guest_base,
-            shared_obj: BackingObject::File(file),
-            obj_offset: offset,
-        })
-    }
-
     fn start(&self) -> GuestAddress {
         self.guest_base
     }
@@ -160,8 +115,8 @@ impl MemoryRegion {
     }
 }
 
-/// Tracks memory regions and where they are mapped in the guest, along with shm
-/// fds of the underlying memory regions.
+/// Tracks a memory region and where it is mapped in the guest, along with a shm
+/// fd of the underlying memory regions.
 #[derive(Clone)]
 pub struct GuestMemory {
     regions: Arc<[MemoryRegion]>,
@@ -171,7 +126,7 @@ impl AsRawDescriptors for GuestMemory {
     fn as_raw_descriptors(&self) -> Vec<RawDescriptor> {
         self.regions
             .iter()
-            .map(|r| r.shared_obj.as_raw_descriptor())
+            .map(|r| r.shm.as_raw_descriptor())
             .collect()
     }
 }
@@ -223,8 +178,8 @@ impl GuestMemory {
                 }
             }
 
-            let size = usize::try_from(range.1)
-                .map_err(|_| Error::MemoryRegionTooLarge(range.1 as u128))?;
+            let size =
+                usize::try_from(range.1).map_err(|_| Error::MemoryRegionTooLarge(range.1))?;
             let mapping = MemoryMappingBuilder::new(size)
                 .from_shared_memory(shm.as_ref())
                 .offset(offset)
@@ -233,39 +188,11 @@ impl GuestMemory {
             regions.push(MemoryRegion {
                 mapping,
                 guest_base: range.0,
-                shared_obj: BackingObject::Shm(shm.clone()),
-                obj_offset: offset,
+                shm_offset: offset,
+                shm: Arc::clone(&shm),
             });
 
             offset += size as u64;
-        }
-
-        Ok(GuestMemory {
-            regions: Arc::from(regions),
-        })
-    }
-
-    /// Creates a `GuestMemory` from a collection of MemoryRegions.
-    pub fn from_regions(mut regions: Vec<MemoryRegion>) -> Result<Self> {
-        // Sort the regions and ensure non overlap.
-        regions.sort_by(|a, b| a.guest_base.cmp(&b.guest_base));
-
-        if regions.len() > 1 {
-            let mut prev_end = regions[0]
-                .guest_base
-                .checked_add(regions[0].mapping.size() as u64)
-                .ok_or(Error::MemoryRegionOverlap)?;
-            for region in &regions[1..] {
-                if prev_end > region.guest_base {
-                    return Err(Error::MemoryRegionOverlap);
-                }
-                prev_end = region
-                    .guest_base
-                    .checked_add(region.mapping.size() as u64)
-                    .ok_or(Error::MemoryRegionTooLarge(
-                        region.guest_base.0 as u128 + region.mapping.size() as u128,
-                    ))?;
-            }
         }
 
         Ok(GuestMemory {
@@ -346,8 +273,9 @@ impl GuestMemory {
             for (_, region) in self.regions.iter().enumerate() {
                 let ret = region.mapping.use_hugepages();
 
-                if let Err(err) = ret {
-                    println!("Failed to enable HUGEPAGE for mapping {}", err);
+                match ret {
+                    Err(err) => println!("Failed to enable HUGEPAGE for mapping {}", err),
+                    Ok(_) => (),
                 }
             }
         }
@@ -360,11 +288,11 @@ impl GuestMemory {
     ///  * guest_addr : GuestAddress
     ///  * size: usize
     ///  * host_addr: usize
-    ///  * shm: Descriptor of the backing memory region
+    ///  * shm: SharedMemory backing for the given region
     ///  * shm_offset: usize
     pub fn with_regions<F, E>(&self, mut cb: F) -> result::Result<(), E>
     where
-        F: FnMut(usize, GuestAddress, usize, usize, &BackingObject, u64) -> result::Result<(), E>,
+        F: FnMut(usize, GuestAddress, usize, usize, &SharedMemory, u64) -> result::Result<(), E>,
     {
         for (index, region) in self.regions.iter().enumerate() {
             cb(
@@ -372,8 +300,8 @@ impl GuestMemory {
                 region.start(),
                 region.mapping.size(),
                 region.mapping.as_ptr() as usize,
-                &region.shared_obj,
-                region.obj_offset,
+                region.shm.as_ref(),
+                region.shm_offset,
             )?;
         }
         Ok(())
@@ -712,66 +640,17 @@ impl GuestMemory {
         })
     }
 
-    /// Convert a GuestAddress into a pointer in the address space of this
-    /// process, and verify that the provided size define a valid range within
-    /// a single memory region. Similar to get_host_address(), this should only
-    /// be used for giving addresses to the kernel.
-    ///
-    /// # Arguments
-    /// * `guest_addr` - Guest address to convert.
-    /// * `size` - Size of the address range to be converted.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use vm_memory::{GuestAddress, GuestMemory};
-    /// # fn test_host_addr() -> Result<(), ()> {
-    ///     let start_addr = GuestAddress(0x1000);
-    ///     let mut gm = GuestMemory::new(&vec![(start_addr, 0x500)]).map_err(|_| ())?;
-    ///     let addr = gm.get_host_address_range(GuestAddress(0x1200), 0x200).unwrap();
-    ///     println!("Host address is {:p}", addr);
-    ///     Ok(())
-    /// # }
-    /// ```
-    pub fn get_host_address_range(
-        &self,
-        guest_addr: GuestAddress,
-        size: usize,
-    ) -> Result<*const u8> {
-        if size == 0 {
-            return Err(Error::InvalidSize(size));
-        }
-
-        // Assume no overlap among regions
-        self.do_in_region(guest_addr, |mapping, offset, _| {
-            if mapping
-                .size()
-                .checked_sub(offset)
-                .map_or(true, |v| v < size)
-            {
-                return Err(Error::InvalidGuestAddress(guest_addr));
-            }
-
-            // This is safe; `do_in_region` already checks that offset is in
-            // bounds.
-            Ok(unsafe { mapping.as_ptr().add(offset) } as *const u8)
-        })
-    }
-
-    /// Returns a reference to the region that backs the given address.
-    pub fn shm_region(
-        &self,
-        guest_addr: GuestAddress,
-    ) -> Result<&(dyn AsRawDescriptor + Send + Sync)> {
+    /// Returns a reference to the SharedMemory region that backs the given address.
+    pub fn shm_region(&self, guest_addr: GuestAddress) -> Result<&SharedMemory> {
         self.regions
             .iter()
             .find(|region| region.contains(guest_addr))
             .ok_or(Error::InvalidGuestAddress(guest_addr))
-            .map(|region| region.shared_obj.as_ref())
+            .map(|region| region.shm.as_ref())
     }
 
     /// Returns the region that contains the memory at `offset` from the base of guest memory.
-    pub fn offset_region(&self, offset: u64) -> Result<&(dyn AsRawDescriptor + Send + Sync)> {
+    pub fn offset_region(&self, offset: u64) -> Result<&SharedMemory> {
         self.shm_region(
             self.checked_offset(self.regions[0].guest_base, offset)
                 .ok_or(Error::InvalidOffset(offset))?,
@@ -799,7 +678,7 @@ impl GuestMemory {
                 cb(
                     &region.mapping,
                     guest_addr.offset_from(region.start()) as usize,
-                    region.obj_offset,
+                    region.shm_offset,
                 )
             })
     }
@@ -832,7 +711,7 @@ impl GuestMemory {
             .iter()
             .find(|region| region.contains(guest_addr))
             .ok_or(Error::InvalidGuestAddress(guest_addr))
-            .map(|region| region.obj_offset + guest_addr.offset_from(region.start()))
+            .map(|region| region.shm_offset + guest_addr.offset_from(region.start()))
     }
 }
 
@@ -880,14 +759,23 @@ mod tests {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x4000);
         let gm = GuestMemory::new(&[(start_addr1, 0x2000), (start_addr2, 0x2000)]).unwrap();
-        assert!(gm.address_in_range(GuestAddress(0x1000)));
-        assert!(!gm.address_in_range(GuestAddress(0x3000)));
-        assert!(gm.address_in_range(GuestAddress(0x5000)));
-        assert!(!gm.address_in_range(GuestAddress(0x6000)));
-        assert!(!gm.address_in_range(GuestAddress(0x6000)));
-        assert!(gm.range_overlap(GuestAddress(0x1000), GuestAddress(0x3000)));
-        assert!(!gm.range_overlap(GuestAddress(0x3000), GuestAddress(0x4000)));
-        assert!(gm.range_overlap(GuestAddress(0x3000), GuestAddress(0x7000)));
+        assert_eq!(gm.address_in_range(GuestAddress(0x1000)), true);
+        assert_eq!(gm.address_in_range(GuestAddress(0x3000)), false);
+        assert_eq!(gm.address_in_range(GuestAddress(0x5000)), true);
+        assert_eq!(gm.address_in_range(GuestAddress(0x6000)), false);
+        assert_eq!(gm.address_in_range(GuestAddress(0x6000)), false);
+        assert_eq!(
+            gm.range_overlap(GuestAddress(0x1000), GuestAddress(0x3000)),
+            true
+        );
+        assert_eq!(
+            gm.range_overlap(GuestAddress(0x3000), GuestAddress(0x4000)),
+            false
+        );
+        assert_eq!(
+            gm.range_overlap(GuestAddress(0x3000), GuestAddress(0x7000)),
+            true
+        );
         assert!(gm.checked_offset(GuestAddress(0x1000), 0x1000).is_none());
         assert!(gm.checked_offset(GuestAddress(0x5000), 0x800).is_some());
         assert!(gm.checked_offset(GuestAddress(0x5000), 0x1000).is_none());
@@ -986,31 +874,6 @@ mod tests {
     }
 
     #[test]
-    fn guest_to_host_range() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
-        let mem = GuestMemory::new(&[(start_addr1, 0x1000), (start_addr2, 0x4000)]).unwrap();
-
-        // Verify the host addresses match what we expect from the mappings.
-        let addr1_base = get_mapping(&mem, start_addr1).unwrap();
-        let addr2_base = get_mapping(&mem, start_addr2).unwrap();
-        let host_addr1 = mem.get_host_address_range(start_addr1, 0x1000).unwrap();
-        let host_addr2 = mem.get_host_address_range(start_addr2, 0x1000).unwrap();
-        assert_eq!(host_addr1, addr1_base);
-        assert_eq!(host_addr2, addr2_base);
-
-        let host_addr3 = mem.get_host_address_range(start_addr2, 0x2000).unwrap();
-        assert_eq!(host_addr3, addr2_base);
-
-        // Check that a valid guest address with an invalid size returns an error.
-        assert!(mem.get_host_address_range(start_addr1, 0x2000).is_err());
-
-        // Check that a bad address returns an error.
-        let bad_addr = GuestAddress(0x123456);
-        assert!(mem.get_host_address_range(bad_addr, 0x1000).is_err());
-    }
-
-    #[test]
     fn shm_offset() {
         if !kernel_has_memfd() {
             return;
@@ -1027,16 +890,10 @@ mod tests {
         gm.write_obj_at_addr(0x0420u16, GuestAddress(0x10000))
             .unwrap();
 
-        let _ = gm.with_regions::<_, ()>(|index, _, size, _, obj, offset| {
-            let shm = match obj {
-                BackingObject::Shm(s) => s,
-                _ => {
-                    panic!("backing object isn't SharedMemory");
-                }
-            };
+        let _ = gm.with_regions::<_, ()>(|index, _, size, _, shm, shm_offset| {
             let mmap = MemoryMappingBuilder::new(size)
                 .from_shared_memory(shm)
-                .offset(offset)
+                .offset(shm_offset)
                 .build()
                 .unwrap();
 

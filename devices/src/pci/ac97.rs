@@ -3,24 +3,22 @@
 // found in the LICENSE file.
 
 use std::default::Default;
+use std::error;
+use std::fmt::{self, Display};
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use audio_streams::shm_streams::{NullShmStreamSource, ShmStreamSource};
-use base::{error, AsRawDescriptor, Event, RawDescriptor};
-#[cfg(feature = "audio_cras")]
+use base::{error, Event, RawDescriptor};
 use libcras::{CrasClient, CrasClientType, CrasSocketType, CrasSysError};
-use remain::sorted;
 use resources::{Alloc, MmioType, SystemAllocator};
-use thiserror::Error;
 use vm_memory::GuestMemory;
 
 use crate::pci::ac97_bus_master::Ac97BusMaster;
 use crate::pci::ac97_mixer::Ac97Mixer;
 use crate::pci::ac97_regs::*;
 use crate::pci::pci_configuration::{
-    PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration,
-    PciHeaderType, PciMultimediaSubclass,
+    PciBarConfiguration, PciClassCode, PciConfiguration, PciHeaderType, PciMultimediaSubclass,
 };
 use crate::pci::pci_device::{self, PciDevice, Result};
 use crate::pci::{PciAddress, PciDeviceError, PciInterruptPin};
@@ -40,7 +38,6 @@ const PCI_DEVICE_ID_INTEL_82801AA_5: u16 = 0x2415;
 #[derive(Debug, Clone)]
 pub enum Ac97Backend {
     NULL,
-    #[cfg(feature = "audio_cras")]
     CRAS,
     VIOS,
 }
@@ -52,20 +49,27 @@ impl Default for Ac97Backend {
 }
 
 /// Errors that are possible from a `Ac97`.
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum Ac97Error {
-    #[error("Must be cras, vios or null")]
     InvalidBackend,
-    #[error("server must be provided for vios backend")]
     MissingServerPath,
+}
+
+impl error::Error for Ac97Error {}
+
+impl Display for Ac97Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Ac97Error::InvalidBackend => write!(f, "Must be cras, vios or null"),
+            Ac97Error::MissingServerPath => write!(f, "server must be provided for vios backend"),
+        }
+    }
 }
 
 impl FromStr for Ac97Backend {
     type Err = Ac97Error;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            #[cfg(feature = "audio_cras")]
             "cras" => Ok(Ac97Backend::CRAS),
             "vios" => Ok(Ac97Backend::VIOS),
             "null" => Ok(Ac97Backend::NULL),
@@ -80,31 +84,15 @@ pub struct Ac97Parameters {
     pub backend: Ac97Backend,
     pub capture: bool,
     pub vios_server_path: Option<PathBuf>,
-    #[cfg(feature = "audio_cras")]
     client_type: Option<CrasClientType>,
-    #[cfg(feature = "audio_cras")]
-    socket_type: Option<CrasSocketType>,
 }
 
 impl Ac97Parameters {
     /// Set CRAS client type by given client type string.
     ///
     /// `client_type` - The client type string.
-    #[cfg(feature = "audio_cras")]
     pub fn set_client_type(&mut self, client_type: &str) -> std::result::Result<(), CrasSysError> {
         self.client_type = Some(client_type.parse()?);
-        Ok(())
-    }
-
-    /// Set CRAS socket type by given socket type string.
-    ///
-    /// `socket_type` - The socket type string.
-    #[cfg(feature = "audio_cras")]
-    pub fn set_socket_type(
-        &mut self,
-        socket_type: &str,
-    ) -> std::result::Result<(), libcras::Error> {
-        self.socket_type = Some(socket_type.parse()?);
         Ok(())
     }
 }
@@ -127,7 +115,7 @@ impl Ac97Dev {
     pub fn new(
         mem: GuestMemory,
         backend: Ac97Backend,
-        audio_server: Box<dyn ShmStreamSource<base::Error>>,
+        audio_server: Box<dyn ShmStreamSource>,
     ) -> Self {
         let config_regs = PciConfiguration::new(
             0x8086,
@@ -156,7 +144,6 @@ impl Ac97Dev {
     /// to create `Ac97Dev` with the given back-end, it'll fallback to the null audio device.
     pub fn try_new(mem: GuestMemory, param: Ac97Parameters) -> Result<Self> {
         match param.backend {
-            #[cfg(feature = "audio_cras")]
             Ac97Backend::CRAS => Self::create_cras_audio_device(param, mem.clone()).or_else(|e| {
                 error!(
                     "Ac97Dev: create_cras_audio_device: {}. Fallback to null audio device",
@@ -172,17 +159,15 @@ impl Ac97Dev {
     /// Return the minijail policy file path for the current Ac97Dev.
     pub fn minijail_policy(&self) -> &'static str {
         match self.backend {
-            #[cfg(feature = "audio_cras")]
             Ac97Backend::CRAS => "cras_audio_device",
             Ac97Backend::VIOS => "vios_audio_device",
             Ac97Backend::NULL => "null_audio_device",
         }
     }
 
-    #[cfg(feature = "audio_cras")]
     fn create_cras_audio_device(params: Ac97Parameters, mem: GuestMemory) -> Result<Self> {
         let mut server = Box::new(
-            CrasClient::with_type(params.socket_type.unwrap_or(CrasSocketType::Unified))
+            CrasClient::with_type(CrasSocketType::Unified)
                 .map_err(pci_device::Error::CreateCrasClientFailed)?,
         );
         server.set_client_type(
@@ -204,10 +189,10 @@ impl Ac97Dev {
             let server = Box::new(
                 // The presence of vios_server_path is checked during argument parsing
                 VioSShmStreamSource::new(param.vios_server_path.expect("Missing server path"))
-                    .map_err(pci_device::Error::CreateViosClientFailed)?,
+                    .map_err(|e| pci_device::Error::CreateViosClientFailed(e))?,
             );
             let vios_audio = Self::new(mem, Ac97Backend::VIOS, server);
-            Ok(vios_audio)
+            return Ok(vios_audio);
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         Err(pci_device::Error::CreateViosClientFailed(
@@ -289,7 +274,7 @@ impl PciDevice for Ac97Dev {
 
     fn allocate_address(&mut self, resources: &mut SystemAllocator) -> Result<PciAddress> {
         if self.pci_address.is_none() {
-            self.pci_address = match resources.allocate_pci(0, self.debug_label()) {
+            self.pci_address = match resources.allocate_pci(self.debug_label()) {
                 Some(Alloc::PciBar {
                     bus,
                     dev,
@@ -304,19 +289,14 @@ impl PciDevice for Ac97Dev {
 
     fn assign_irq(
         &mut self,
-        irq_evt: &Event,
-        irq_resample_evt: &Event,
-        irq_num: Option<u32>,
-    ) -> Option<(u32, PciInterruptPin)> {
-        self.irq_evt = Some(irq_evt.try_clone().ok()?);
-        self.irq_resample_evt = Some(irq_resample_evt.try_clone().ok()?);
-        let gsi = irq_num?;
-        let pin = self.pci_address.map_or(
-            PciInterruptPin::IntA,
-            PciConfiguration::suggested_interrupt_pin,
-        );
-        self.config_regs.set_irq(gsi as u8, pin);
-        Some((gsi, pin))
+        irq_evt: Event,
+        irq_resample_evt: Event,
+        irq_num: u32,
+        irq_pin: PciInterruptPin,
+    ) {
+        self.config_regs.set_irq(irq_num as u8, irq_pin);
+        self.irq_evt = Some(irq_evt);
+        self.irq_resample_evt = Some(irq_resample_evt);
     }
 
     fn allocate_io_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<(u64, u64)>> {
@@ -338,13 +318,10 @@ impl PciDevice for Ac97Dev {
                 MIXER_REGS_SIZE,
             )
             .map_err(|e| pci_device::Error::IoAllocationFailed(MIXER_REGS_SIZE, e))?;
-        let mixer_config = PciBarConfiguration::new(
-            0,
-            MIXER_REGS_SIZE,
-            PciBarRegionType::Memory32BitRegion,
-            PciBarPrefetchable::NotPrefetchable,
-        )
-        .set_address(mixer_regs_addr);
+        let mixer_config = PciBarConfiguration::default()
+            .set_register_index(0)
+            .set_address(mixer_regs_addr)
+            .set_size(MIXER_REGS_SIZE);
         self.config_regs
             .add_pci_bar(mixer_config)
             .map_err(|e| pci_device::Error::IoRegistrationFailed(mixer_regs_addr, e))?;
@@ -364,22 +341,15 @@ impl PciDevice for Ac97Dev {
                 MASTER_REGS_SIZE,
             )
             .map_err(|e| pci_device::Error::IoAllocationFailed(MASTER_REGS_SIZE, e))?;
-        let master_config = PciBarConfiguration::new(
-            1,
-            MASTER_REGS_SIZE,
-            PciBarRegionType::Memory32BitRegion,
-            PciBarPrefetchable::NotPrefetchable,
-        )
-        .set_address(master_regs_addr);
+        let master_config = PciBarConfiguration::default()
+            .set_register_index(1)
+            .set_address(master_regs_addr)
+            .set_size(MASTER_REGS_SIZE);
         self.config_regs
             .add_pci_bar(master_config)
             .map_err(|e| pci_device::Error::IoRegistrationFailed(master_regs_addr, e))?;
         ranges.push((master_regs_addr, MASTER_REGS_SIZE));
         Ok(ranges)
-    }
-
-    fn get_bar_configuration(&self, bar_num: usize) -> Option<PciBarConfiguration> {
-        self.config_regs.get_bar_configuration(bar_num)
     }
 
     fn read_config_register(&self, reg_idx: usize) -> u32 {
@@ -391,17 +361,11 @@ impl PciDevice for Ac97Dev {
     }
 
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        let mut rds = Vec::new();
-        if let Some(mut server_fds) = self.bus_master.keep_rds() {
-            rds.append(&mut server_fds);
+        if let Some(server_fds) = self.bus_master.keep_rds() {
+            server_fds
+        } else {
+            Vec::new()
         }
-        if let Some(irq_evt) = &self.irq_evt {
-            rds.push(irq_evt.as_raw_descriptor());
-        }
-        if let Some(irq_resample_evt) = &self.irq_resample_evt {
-            rds.push(irq_resample_evt.as_raw_descriptor());
-        }
-        rds
     }
 
     fn read_bar(&mut self, addr: u64, data: &mut [u8]) {
@@ -439,7 +403,6 @@ impl PciDevice for Ac97Dev {
 mod tests {
     use super::*;
     use audio_streams::shm_streams::MockShmStreamSource;
-    use resources::{MemRegion, SystemAllocatorConfig};
     use vm_memory::GuestAddress;
 
     #[test]
@@ -447,23 +410,12 @@ mod tests {
         let mem = GuestMemory::new(&[(GuestAddress(0u64), 4 * 1024 * 1024)]).unwrap();
         let mut ac97_dev =
             Ac97Dev::new(mem, Ac97Backend::NULL, Box::new(MockShmStreamSource::new()));
-        let mut allocator = SystemAllocator::new(SystemAllocatorConfig {
-            io: Some(MemRegion {
-                base: 0x1000_0000,
-                size: 0x1000_0000,
-            }),
-            low_mmio: MemRegion {
-                base: 0x2000_0000,
-                size: 0x1000_0000,
-            },
-            high_mmio: MemRegion {
-                base: 0x3000_0000,
-                size: 0x1000_0000,
-            },
-            platform_mmio: None,
-            first_irq: 5,
-        })
-        .unwrap();
+        let mut allocator = SystemAllocator::builder()
+            .add_io_addresses(0x1000_0000, 0x1000_0000)
+            .add_low_mmio_addresses(0x2000_0000, 0x1000_0000)
+            .add_high_mmio_addresses(0x3000_0000, 0x1000_0000)
+            .create_allocator(5)
+            .unwrap();
         assert!(ac97_dev.allocate_address(&mut allocator).is_ok());
         assert!(ac97_dev.allocate_io_bars(&mut allocator).is_ok());
     }

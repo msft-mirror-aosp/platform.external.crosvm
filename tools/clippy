@@ -1,0 +1,30 @@
+#!/bin/bash
+# Copyright 2019 The Chromium OS Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# To check for violations:
+# $ ./tools/clippy
+#
+# To fix violations where possible:
+# $ ./tools/clippy --fix
+
+set -e
+cd "$(dirname $0)/.."
+
+# Note: Clippy checks are configured in .cargo/config.toml
+echo "Clippy crosvm workspace"
+cargo clippy \
+    --workspace \
+    --features all-linux \
+    --all-targets \
+    "$@" -- -Dwarnings
+
+for crate in common/*; do
+    if [ -d "${crate}" ]; then
+        echo ""
+        echo "Clippy ${crate}"
+        (cd "${crate}" &&
+            cargo clippy --all-targets --all-features "$@" -- -Dwarnings)
+    fi
+done

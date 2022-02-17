@@ -7,20 +7,21 @@
 use std::fs::{File, OpenOptions};
 use std::os::raw::c_uint;
 
+use std::io;
 use std::path::Path;
-use std::{fmt, io};
 
 use base::{
-    ioctl_iow_nr, ioctl_with_ptr, pagesize, AsRawDescriptor, FromRawDescriptor, MappedRegion,
-    SafeDescriptor,
+    ioctl_iow_nr, ioctl_with_ptr, pagesize, FromRawDescriptor, MappedRegion, SafeDescriptor,
 };
 
-use data_model::{FlexibleArray, FlexibleArrayWrapper};
+use data_model::{flexible_array_impl, FlexibleArray, FlexibleArrayWrapper};
 
 use rutabaga_gfx::{RutabagaHandle, RUTABAGA_MEM_HANDLE_TYPE_DMABUF};
 
 use super::udmabuf_bindings::*;
 
+use remain::sorted;
+use thiserror::Error;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 const UDMABUF_IOCTL_BASE: c_uint = 0x75;
@@ -33,45 +34,20 @@ ioctl_iow_nr!(
     udmabuf_create_list
 );
 
-// It's possible to make the flexible array trait implementation a macro one day...
-impl FlexibleArray<udmabuf_create_item> for udmabuf_create_list {
-    fn set_len(&mut self, len: usize) {
-        self.count = len as u32;
-    }
-
-    fn get_len(&self) -> usize {
-        self.count as usize
-    }
-
-    fn get_slice(&self, len: usize) -> &[udmabuf_create_item] {
-        unsafe { self.list.as_slice(len) }
-    }
-
-    fn get_mut_slice(&mut self, len: usize) -> &mut [udmabuf_create_item] {
-        unsafe { self.list.as_mut_slice(len) }
-    }
-}
-
+flexible_array_impl!(udmabuf_create_list, udmabuf_create_item, count, list);
 type UdmabufCreateList = FlexibleArrayWrapper<udmabuf_create_list, udmabuf_create_item>;
 
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 pub enum UdmabufError {
-    DriverOpenFailed(io::Error),
-    NotPageAligned,
-    InvalidOffset(GuestMemoryError),
+    #[error("failed to create buffer: {0:?}")]
     DmabufCreationFail(io::Error),
-}
-
-impl fmt::Display for UdmabufError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::UdmabufError::*;
-        match self {
-            DriverOpenFailed(e) => write!(f, "failed to open udmabuf driver: {:?}", e),
-            NotPageAligned => write!(f, "All guest addresses must aligned to 4KiB"),
-            InvalidOffset(e) => write!(f, "failed to get region offset: {:?}", e),
-            DmabufCreationFail(e) => write!(f, "failed to create buffer: {:?}", e),
-        }
-    }
+    #[error("failed to open udmabuf driver: {0:?}")]
+    DriverOpenFailed(io::Error),
+    #[error("failed to get region offset: {0:?}")]
+    InvalidOffset(GuestMemoryError),
+    #[error("All guest addresses must aligned to 4KiB")]
+    NotPageAligned,
 }
 
 /// The result of an operation in this file.
@@ -98,7 +74,7 @@ fn memory_offset(mem: &GuestMemory, guest_addr: GuestAddress, len: u64) -> Udmab
             return Err(GuestMemoryError::InvalidGuestAddress(guest_addr));
         }
 
-        return Ok(memfd_offset + map_offset);
+        Ok(memfd_offset + map_offset)
     })
     .map_err(UdmabufError::InvalidOffset)
 }
@@ -186,7 +162,7 @@ mod tests {
         let start_addr2 = GuestAddress(0x1100);
         let start_addr3 = GuestAddress(0x2100);
 
-        let mem = GuestMemory::new(&vec![
+        let mem = GuestMemory::new(&[
             (start_addr1, 0x1000),
             (start_addr2, 0x1000),
             (start_addr3, 0x1000),
@@ -233,10 +209,10 @@ mod tests {
         let mem = GuestMemory::new(&sg_list[..]).unwrap();
 
         let mut udmabuf_create_list = vec![
-            (start_addr3, 0x1000 as usize),
-            (start_addr2, 0x1000 as usize),
-            (start_addr1, 0x1000 as usize),
-            (GuestAddress(0x4000), 0x1000 as usize),
+            (start_addr3, 0x1000),
+            (start_addr2, 0x1000),
+            (start_addr1, 0x1000),
+            (GuestAddress(0x4000), 0x1000),
         ];
 
         let result = driver.create_udmabuf(&mem, &udmabuf_create_list[..]);

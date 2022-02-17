@@ -4,7 +4,7 @@
 
 //! minigbm: implements swapchain allocation using ChromeOS's minigbm library.
 //!
-//! External code found at https://chromium.googlesource.com/chromiumos/platform/minigbm.
+//! External code found at <https://chromium.googlesource.com/chromiumos/platform/minigbm>.
 
 #![cfg(feature = "minigbm")]
 
@@ -14,7 +14,7 @@ use std::io::{Seek, SeekFrom};
 use std::os::raw::c_char;
 use std::rc::Rc;
 
-use base::{AsRawDescriptor, Error as SysError, FromRawDescriptor};
+use base::{AsRawDescriptor, Error as BaseError, FromRawDescriptor};
 
 use crate::rutabaga_gralloc::formats::DrmFormat;
 use crate::rutabaga_gralloc::gralloc::{Gralloc, ImageAllocationInfo, ImageMemoryRequirements};
@@ -55,7 +55,7 @@ impl MinigbmDevice {
         // returned.  If the fd does not refer to a DRM device, gbm_create_device will reject it.
         let gbm = unsafe { gbm_create_device(fd.as_raw_descriptor()) };
         if gbm.is_null() {
-            return Err(RutabagaError::SysError(SysError::last()));
+            return Err(RutabagaError::BaseError(BaseError::last()));
         }
 
         // Safe because a valid minigbm device has a statically allocated string associated with
@@ -95,7 +95,7 @@ impl Gralloc for MinigbmDevice {
             )
         };
         if bo.is_null() {
-            return Err(RutabagaError::SysError(SysError::last()));
+            return Err(RutabagaError::BaseError(BaseError::last()));
         }
 
         let mut reqs: ImageMemoryRequirements = Default::default();
@@ -140,7 +140,7 @@ impl Gralloc for MinigbmDevice {
                 || gbm_buffer.height() != reqs.info.height
                 || gbm_buffer.format() != reqs.info.drm_format
             {
-                return Err(RutabagaError::SpecViolation);
+                return Err(RutabagaError::InvalidGrallocDimensions);
             }
 
             let dmabuf = gbm_buffer.export()?.into();
@@ -161,7 +161,7 @@ impl Gralloc for MinigbmDevice {
         };
 
         if bo.is_null() {
-            return Err(RutabagaError::SysError(SysError::last()));
+            return Err(RutabagaError::BaseError(BaseError::last()));
         }
 
         let gbm_buffer = MinigbmBuffer(bo, self.clone());

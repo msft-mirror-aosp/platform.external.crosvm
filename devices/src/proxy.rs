@@ -5,35 +5,30 @@
 //! Runs hardware devices in child processes.
 
 use std::ffi::CString;
-use std::fmt::{self, Display};
 use std::time::Duration;
 
 use base::{error, AsRawDescriptor, RawDescriptor, Tube, TubeError};
 use libc::{self, pid_t};
 use minijail::{self, Minijail};
+use remain::sorted;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::bus::ConfigWriteResult;
-use crate::{BusAccessInfo, BusDevice};
+use crate::pci::PciAddress;
+use crate::{BusAccessInfo, BusDevice, BusRange, BusType};
 
 /// Errors for proxy devices.
-#[derive(Debug)]
+#[sorted]
+#[derive(Error, Debug)]
 pub enum Error {
+    #[error("Failed to fork jail process: {0}")]
     ForkingJail(minijail::Error),
+    #[error("Failed to configure tube: {0}")]
     Tube(TubeError),
 }
+
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            ForkingJail(e) => write!(f, "Failed to fork jail process: {}", e),
-            Tube(e) => write!(f, "Failed to configure tube: {}.", e),
-        }
-    }
-}
 
 const SOCKET_TIMEOUT_MS: u64 = 2000;
 
@@ -56,6 +51,7 @@ enum Command {
         data: [u8; 4],
     },
     Shutdown,
+    GetRanges,
 }
 #[derive(Debug, Serialize, Deserialize)]
 enum CommandResult {
@@ -63,9 +59,13 @@ enum CommandResult {
     ReadResult([u8; 8]),
     ReadConfigResult(u32),
     WriteConfigResult {
-        mem_bus_new_state: Option<bool>,
-        io_bus_new_state: Option<bool>,
+        mmio_remove: Vec<BusRange>,
+        mmio_add: Vec<BusRange>,
+        io_remove: Vec<BusRange>,
+        io_add: Vec<BusRange>,
+        removed_pci_devices: Vec<PciAddress>,
     },
+    GetRangesResult(Vec<(BusRange, BusType)>),
 }
 
 fn child_proc<D: BusDevice>(tube: Tube, device: &mut D) {
@@ -106,13 +106,20 @@ fn child_proc<D: BusDevice>(tube: Tube, device: &mut D) {
                 let res =
                     device.config_register_write(reg_idx as usize, offset as u64, &data[0..len]);
                 tube.send(&CommandResult::WriteConfigResult {
-                    mem_bus_new_state: res.mem_bus_new_state,
-                    io_bus_new_state: res.io_bus_new_state,
+                    mmio_remove: res.mmio_remove,
+                    mmio_add: res.mmio_add,
+                    io_remove: res.io_remove,
+                    io_add: res.io_add,
+                    removed_pci_devices: res.removed_pci_devices,
                 })
             }
             Command::Shutdown => {
                 running = false;
                 tube.send(&CommandResult::Ok)
+            }
+            Command::GetRanges => {
+                let ranges = device.get_ranges();
+                tube.send(&CommandResult::GetRangesResult(ranges))
             }
         };
         if let Err(e) = res {
@@ -150,6 +157,11 @@ impl ProxyDevice {
         let (child_tube, parent_tube) = Tube::pair().map_err(Error::Tube)?;
 
         keep_rds.push(child_tube.as_raw_descriptor());
+
+        // Deduplicate the FDs since minijail expects this.
+        keep_rds.sort_unstable();
+        keep_rds.dedup();
+
         // Forking here is safe as long as the program is still single threaded.
         let pid = unsafe {
             match jail.fork(Some(&keep_rds)).map_err(Error::ForkingJail)? {
@@ -237,8 +249,11 @@ impl BusDevice for ProxyDevice {
         let reg_idx = reg_idx as u32;
         let offset = offset as u32;
         if let Some(CommandResult::WriteConfigResult {
-            mem_bus_new_state,
-            io_bus_new_state,
+            mmio_remove,
+            mmio_add,
+            io_remove,
+            io_add,
+            removed_pci_devices,
         }) = self.sync_send(&Command::WriteConfig {
             reg_idx,
             offset,
@@ -246,8 +261,11 @@ impl BusDevice for ProxyDevice {
             data: buffer,
         }) {
             ConfigWriteResult {
-                mem_bus_new_state,
-                io_bus_new_state,
+                mmio_remove,
+                mmio_add,
+                io_remove,
+                io_add,
+                removed_pci_devices,
             }
         } else {
             Default::default()
@@ -282,6 +300,14 @@ impl BusDevice for ProxyDevice {
             info,
             data: buffer,
         });
+    }
+
+    fn get_ranges(&self) -> Vec<(BusRange, BusType)> {
+        if let Some(CommandResult::GetRangesResult(ranges)) = self.sync_send(&Command::GetRanges) {
+            ranges
+        } else {
+            Default::default()
+        }
     }
 }
 

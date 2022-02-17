@@ -4,12 +4,13 @@
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Result};
-use std::path::PathBuf;
+use std::path::Path;
 
 use data_model::DataInit;
 
 /// SDT represents for System Description Table. The structure SDT is a
 /// generic format for creating various ACPI tables like DSDT/FADT/MADT.
+#[derive(Clone)]
 pub struct SDT {
     data: Vec<u8>,
 }
@@ -59,7 +60,7 @@ impl SDT {
     }
 
     /// Set up the ACPI table from file content. Verify file checksum.
-    pub fn from_file(path: &PathBuf) -> Result<Self> {
+    pub fn from_file(path: &Path) -> Result<Self> {
         let mut file = File::open(path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
@@ -82,7 +83,7 @@ impl SDT {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.data.as_slice()
+        self.data.as_slice()
     }
 
     pub fn append<T: DataInit>(&mut self, value: T) {
@@ -102,7 +103,7 @@ impl SDT {
             return;
         }
 
-        self.data[offset..offset + value_len].copy_from_slice(&value.as_slice());
+        self.data[offset..offset + value_len].copy_from_slice(value.as_slice());
         self.update_checksum();
     }
 
@@ -125,7 +126,7 @@ mod tests {
             .iter()
             .fold(0u8, |acc, x| acc.wrapping_add(*x));
         assert_eq!(sum, 0);
-        sdt.write(36, 0x12345678 as u32);
+        sdt.write(36, 0x12345678_u32);
         let sum: u8 = sdt
             .as_slice()
             .iter()
@@ -141,7 +142,7 @@ mod tests {
         // Write SDT to file.
         {
             let mut writer = temp_file.as_file();
-            writer.write_all(&expected_sdt.as_slice())?;
+            writer.write_all(expected_sdt.as_slice())?;
         }
 
         // Read it back and verify.

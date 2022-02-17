@@ -12,16 +12,17 @@ use futures::{channel::mpsc, pin_mut, StreamExt};
 use remain::sorted;
 use thiserror::Error as ThisError;
 
-use base::{self, error, info, warn, AsRawDescriptor, AsyncTube, Event, RawDescriptor, Tube};
+use balloon_control::{BalloonStats, BalloonTubeCommand, BalloonTubeResult};
+use base::{self, error, warn, AsRawDescriptor, AsyncTube, Event, RawDescriptor, Tube};
 use cros_async::{select6, EventAsync, Executor};
 use data_model::{DataInit, Le16, Le32, Le64};
-use vm_control::{BalloonControlCommand, BalloonControlResult, BalloonStats};
 use vm_memory::{GuestAddress, GuestMemory};
 
 use super::{
-    copy_config, descriptor_utils, DescriptorChain, Interrupt, Queue, Reader, SignalableInterrupt,
-    VirtioDevice, TYPE_BALLOON,
+    async_utils, copy_config, descriptor_utils, DescriptorChain, Interrupt, Queue, Reader,
+    SignalableInterrupt, VirtioDevice, TYPE_BALLOON,
 };
+use crate::{UnpinRequest, UnpinResponse};
 
 #[sorted]
 #[derive(ThisError, Debug)]
@@ -79,6 +80,8 @@ const VIRTIO_BALLOON_S_AVAIL: u16 = 6;
 const VIRTIO_BALLOON_S_CACHES: u16 = 7;
 const VIRTIO_BALLOON_S_HTLB_PGALLOC: u16 = 8;
 const VIRTIO_BALLOON_S_HTLB_PGFAIL: u16 = 9;
+const VIRTIO_BALLOON_S_NONSTANDARD_SHMEM: u16 = 65534;
+const VIRTIO_BALLOON_S_NONSTANDARD_UNEVICTABLE: u16 = 65535;
 
 // BalloonStat is used to deserialize stats from the stats_queue.
 #[derive(Copy, Clone)]
@@ -104,13 +107,27 @@ impl BalloonStat {
             VIRTIO_BALLOON_S_CACHES => stats.disk_caches = val,
             VIRTIO_BALLOON_S_HTLB_PGALLOC => stats.hugetlb_allocations = val,
             VIRTIO_BALLOON_S_HTLB_PGFAIL => stats.hugetlb_failures = val,
+            VIRTIO_BALLOON_S_NONSTANDARD_SHMEM => stats.shared_memory = val,
+            VIRTIO_BALLOON_S_NONSTANDARD_UNEVICTABLE => stats.unevictable_memory = val,
             _ => (),
         }
     }
 }
 
+fn invoke_desc_handler<F>(ranges: Vec<(u64, u64)>, desc_handler: &mut F)
+where
+    F: FnMut(GuestAddress, u64),
+{
+    for range in ranges {
+        desc_handler(GuestAddress(range.0), range.1);
+    }
+}
+
 // Processes one message's list of addresses.
+// Unpin requests for each inflate range will be sent via `inflate_tube`
+// if provided, and then `desc_handler` will be called for each inflate range.
 fn handle_address_chain<F>(
+    inflate_tube: &Option<Tube>,
     avail_desc: DescriptorChain,
     mem: &GuestMemory,
     desc_handler: &mut F,
@@ -125,6 +142,7 @@ where
     let mut range_start = 0;
     let mut range_size = 0;
     let mut reader = Reader::new(mem.clone(), avail_desc)?;
+    let mut inflate_ranges: Vec<(u64, u64)> = Vec::new();
     for res in reader.iter::<Le32>() {
         let pfn = match res {
             Ok(pfn) => pfn,
@@ -143,15 +161,44 @@ where
             // Discontinuity, so flush the previous range. Note range_size
             // will be 0 on the first iteration, so skip that.
             if range_size != 0 {
-                desc_handler(GuestAddress(range_start), range_size);
+                inflate_ranges.push((range_start, range_size));
             }
             range_start = guest_address;
             range_size = VIRTIO_BALLOON_PF_SIZE;
         }
     }
     if range_size != 0 {
-        desc_handler(GuestAddress(range_start), range_size);
+        inflate_ranges.push((range_start, range_size));
     }
+
+    if let Some(tube) = inflate_tube {
+        let unpin_ranges = inflate_ranges
+            .iter()
+            .map(|v| {
+                (
+                    v.0 >> VIRTIO_BALLOON_PFN_SHIFT,
+                    v.1 / VIRTIO_BALLOON_PF_SIZE,
+                )
+            })
+            .collect();
+        let req = UnpinRequest {
+            ranges: unpin_ranges,
+        };
+        if let Err(e) = tube.send(&req) {
+            error!("failed to send unpin request: {}", e);
+        } else {
+            match tube.recv() {
+                Ok(resp) => match resp {
+                    UnpinResponse::Success => invoke_desc_handler(inflate_ranges, desc_handler),
+                    UnpinResponse::Failed => error!("failed to handle unpin request"),
+                },
+                Err(e) => error!("failed to handle get unpin response: {}", e),
+            }
+        }
+    } else {
+        invoke_desc_handler(inflate_ranges, desc_handler);
+    }
+
     Ok(())
 }
 
@@ -160,6 +207,7 @@ async fn handle_queue<F>(
     mem: &GuestMemory,
     mut queue: Queue,
     mut queue_event: EventAsync,
+    inflate_tube: &Option<Tube>,
     interrupt: Rc<RefCell<Interrupt>>,
     mut desc_handler: F,
 ) where
@@ -174,11 +222,11 @@ async fn handle_queue<F>(
             Ok(d) => d,
         };
         let index = avail_desc.index;
-        if let Err(e) = handle_address_chain(avail_desc, mem, &mut desc_handler) {
+        if let Err(e) = handle_address_chain(inflate_tube, avail_desc, mem, &mut desc_handler) {
             error!("balloon: failed to process inflate addresses: {}", e);
         }
         queue.add_used(mem, index, 0);
-        interrupt.borrow_mut().signal_used_queue(queue.vector);
+        queue.trigger_interrupt(mem, &*interrupt.borrow());
     }
 }
 
@@ -190,12 +238,34 @@ async fn handle_stats_queue(
     mem: &GuestMemory,
     mut queue: Queue,
     mut queue_event: EventAsync,
-    mut stats_rx: mpsc::Receiver<()>,
+    mut stats_rx: mpsc::Receiver<u64>,
     command_tube: &Tube,
     config: Arc<BalloonConfig>,
     interrupt: Rc<RefCell<Interrupt>>,
 ) {
+    // Consume the first stats buffer sent from the guest at startup. It was not
+    // requested by anyone, and the stats are stale.
+    let mut index = match queue.next_async(mem, &mut queue_event).await {
+        Err(e) => {
+            error!("Failed to read descriptor {}", e);
+            return;
+        }
+        Ok(d) => d.index,
+    };
     loop {
+        // Wait for a request to read the stats.
+        let id = match stats_rx.next().await {
+            Some(id) => id,
+            None => {
+                error!("stats signal tube was closed");
+                break;
+            }
+        };
+
+        // Request a new stats_desc to the guest.
+        queue.add_used(mem, index, 0);
+        queue.trigger_interrupt(mem, &*interrupt.borrow());
+
         let stats_desc = match queue.next_async(mem, &mut queue_event).await {
             Err(e) => {
                 error!("Failed to read descriptor {}", e);
@@ -203,7 +273,7 @@ async fn handle_stats_queue(
             }
             Ok(d) => d,
         };
-        let index = stats_desc.index;
+        index = stats_desc.index;
         let mut reader = match Reader::new(mem.clone(), stats_desc) {
             Ok(r) => r,
             Err(e) => {
@@ -222,23 +292,14 @@ async fn handle_stats_queue(
             };
         }
         let actual_pages = config.actual_pages.load(Ordering::Relaxed) as u64;
-        let result = BalloonControlResult::Stats {
+        let result = BalloonTubeResult::Stats {
             balloon_actual: actual_pages << VIRTIO_BALLOON_PFN_SHIFT,
             stats,
+            id,
         };
         if let Err(e) = command_tube.send(&result) {
             error!("failed to send stats result: {}", e);
         }
-
-        // Wait for a request to read the stats again.
-        if stats_rx.next().await.is_none() {
-            error!("stats signal tube was closed");
-            break;
-        }
-
-        // Request a new stats_desc to the guest.
-        queue.add_used(&mem, index, 0);
-        interrupt.borrow_mut().signal_used_queue(queue.vector);
     }
 }
 
@@ -248,20 +309,19 @@ async fn handle_command_tube(
     command_tube: &AsyncTube,
     interrupt: Rc<RefCell<Interrupt>>,
     config: Arc<BalloonConfig>,
-    mut stats_tx: mpsc::Sender<()>,
+    mut stats_tx: mpsc::Sender<u64>,
 ) -> Result<()> {
     loop {
         match command_tube.next().await {
             Ok(command) => match command {
-                BalloonControlCommand::Adjust { num_bytes } => {
+                BalloonTubeCommand::Adjust { num_bytes } => {
                     let num_pages = (num_bytes >> VIRTIO_BALLOON_PFN_SHIFT) as usize;
-                    info!("balloon config changed to consume {} pages", num_pages);
 
                     config.num_pages.store(num_pages, Ordering::Relaxed);
-                    interrupt.borrow_mut().signal_config_changed();
+                    interrupt.borrow().signal_config_changed();
                 }
-                BalloonControlCommand::Stats => {
-                    if let Err(e) = stats_tx.try_send(()) {
+                BalloonTubeCommand::Stats { id } => {
+                    if let Err(e) = stats_tx.try_send(id) {
                         error!("failed to signal the stat handler: {}", e);
                     }
                 }
@@ -273,44 +333,18 @@ async fn handle_command_tube(
     }
 }
 
-// Async task that resamples the status of the interrupt when the guest sends a request by
-// signalling the resample event associated with the interrupt.
-async fn handle_irq_resample(ex: &Executor, interrupt: Rc<RefCell<Interrupt>>) {
-    let resample_evt = if let Some(resample_evt) = interrupt.borrow_mut().get_resample_evt() {
-        let resample_evt = resample_evt.try_clone().unwrap();
-        let resample_evt = EventAsync::new(resample_evt.0, ex).unwrap();
-        Some(resample_evt)
-    } else {
-        None
-    };
-    if let Some(resample_evt) = resample_evt {
-        while resample_evt.next_val().await.is_ok() {
-            interrupt.borrow_mut().do_interrupt_resample();
-        }
-    } else {
-        // no resample event, park the future.
-        let () = futures::future::pending().await;
-    }
-}
-
-// Async task that waits for a signal from the kill event given to the device at startup.  Once this event is
-// readable, exit. Exiting this future will cause the main loop to break and the worker thread to
-// exit.
-async fn wait_kill(kill_evt: EventAsync) {
-    let _ = kill_evt.next_val().await;
-}
-
 // The main worker thread. Initialized the asynchronous worker tasks and passes them to the executor
 // to be processed.
 fn run_worker(
     mut queue_evts: Vec<Event>,
     mut queues: Vec<Queue>,
     command_tube: Tube,
+    inflate_tube: Option<Tube>,
     interrupt: Interrupt,
     kill_evt: Event,
     mem: GuestMemory,
     config: Arc<BalloonConfig>,
-) -> Tube {
+) -> (Tube, Option<Tube>) {
     // Wrap the interrupt in a `RefCell` so it can be shared between async functions.
     let interrupt = Rc::new(RefCell::new(interrupt));
 
@@ -326,6 +360,7 @@ fn run_worker(
             &mem,
             queues.remove(0),
             inflate_event,
+            &inflate_tube,
             interrupt.clone(),
             |guest_address, len| {
                 if let Err(e) = mem.remove_range(guest_address, len) {
@@ -342,13 +377,16 @@ fn run_worker(
             &mem,
             queues.remove(0),
             deflate_event,
+            &None,
             interrupt.clone(),
             |_, _| {}, // Ignore these.
         );
         pin_mut!(deflate);
 
-        // The third queue is used for stats messages
-        let (stats_tx, stats_rx) = mpsc::channel::<()>(1);
+        // The third queue is used for stats messages. The message type is the
+        // id of the stats request, so we can detect if there are any stale
+        // stats results that were queued during an error condition.
+        let (stats_tx, stats_rx) = mpsc::channel::<u64>(1);
         let stats_event =
             EventAsync::new(queue_evts.remove(0).0, &ex).expect("failed to set up the stats event");
         let stats = handle_stats_queue(
@@ -367,12 +405,11 @@ fn run_worker(
         pin_mut!(command);
 
         // Process any requests to resample the irq value.
-        let resample = handle_irq_resample(&ex, interrupt.clone());
+        let resample = async_utils::handle_irq_resample(&ex, interrupt);
         pin_mut!(resample);
 
         // Exit if the kill event is triggered.
-        let kill_evt = EventAsync::new(kill_evt.0, &ex).expect("failed to set up the kill event");
-        let kill = wait_kill(kill_evt);
+        let kill = async_utils::await_and_exit(&ex, kill_evt);
         pin_mut!(kill);
 
         if let Err(e) = ex.run_until(select6(inflate, deflate, stats, command, resample, kill)) {
@@ -380,25 +417,38 @@ fn run_worker(
         }
     }
 
-    command_tube.into()
+    (command_tube.into(), inflate_tube)
 }
 
 /// Virtio device for memory balloon inflation/deflation.
 pub struct Balloon {
     command_tube: Option<Tube>,
+    inflate_tube: Option<Tube>,
     config: Arc<BalloonConfig>,
     features: u64,
     kill_evt: Option<Event>,
-    worker_thread: Option<thread::JoinHandle<Tube>>,
+    worker_thread: Option<thread::JoinHandle<(Tube, Option<Tube>)>>,
 }
 
 impl Balloon {
     /// Creates a new virtio balloon device.
-    pub fn new(base_features: u64, command_tube: Tube) -> Result<Balloon> {
+    /// To let Balloon able to successfully release the memory which are pinned
+    /// by CoIOMMU to host, the inflate_tube will be used to send the inflate
+    /// ranges to CoIOMMU with UnpinRequest/UnpinResponse messages, so that The
+    /// memory in the inflate range can be unpinned first.
+    pub fn new(
+        base_features: u64,
+        command_tube: Tube,
+        inflate_tube: Option<Tube>,
+        init_balloon_size: u64,
+    ) -> Result<Balloon> {
         Ok(Balloon {
             command_tube: Some(command_tube),
+            inflate_tube,
             config: Arc::new(BalloonConfig {
-                num_pages: AtomicUsize::new(0),
+                num_pages: AtomicUsize::new(
+                    (init_balloon_size >> VIRTIO_BALLOON_PFN_SHIFT) as usize,
+                ),
                 actual_pages: AtomicUsize::new(0),
             }),
             kill_evt: None,
@@ -435,7 +485,14 @@ impl Drop for Balloon {
 
 impl VirtioDevice for Balloon {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        vec![self.command_tube.as_ref().unwrap().as_raw_descriptor()]
+        let mut rds = Vec::new();
+        if let Some(command_tube) = &self.command_tube {
+            rds.push(command_tube.as_raw_descriptor());
+        }
+        if let Some(inflate_tube) = &self.inflate_tube {
+            rds.push(inflate_tube.as_raw_descriptor());
+        }
+        rds
     }
 
     fn device_type(&self) -> u32 {
@@ -488,6 +545,7 @@ impl VirtioDevice for Balloon {
 
         let config = self.config.clone();
         let command_tube = self.command_tube.take().unwrap();
+        let inflate_tube = self.inflate_tube.take();
         let worker_result = thread::Builder::new()
             .name("virtio_balloon".to_string())
             .spawn(move || {
@@ -495,6 +553,7 @@ impl VirtioDevice for Balloon {
                     queue_evts,
                     queues,
                     command_tube,
+                    inflate_tube,
                     interrupt,
                     kill_evt,
                     mem,
@@ -526,8 +585,9 @@ impl VirtioDevice for Balloon {
                     error!("{}: failed to get back resources", self.debug_label());
                     return false;
                 }
-                Ok(command_tube) => {
+                Ok((command_tube, inflate_tube)) => {
                     self.command_tube = Some(command_tube);
+                    self.inflate_tube = inflate_tube;
                     return true;
                 }
             }
@@ -547,7 +607,7 @@ mod tests {
         // Check that the memory addresses are parsed correctly by 'handle_address_chain' and passed
         // to the closure.
         let memory_start_addr = GuestAddress(0x0);
-        let memory = GuestMemory::new(&vec![(memory_start_addr, 0x10000)]).unwrap();
+        let memory = GuestMemory::new(&[(memory_start_addr, 0x10000)]).unwrap();
         memory
             .write_obj_at_addr(0x10u32, GuestAddress(0x100))
             .unwrap();
@@ -565,7 +625,7 @@ mod tests {
         .expect("create_descriptor_chain failed");
 
         let mut addrs = Vec::new();
-        let res = handle_address_chain(chain, &memory, &mut |guest_address, len| {
+        let res = handle_address_chain(&None, chain, &memory, &mut |guest_address, len| {
             addrs.push((guest_address, len));
         });
         assert!(res.is_ok());

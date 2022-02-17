@@ -5,9 +5,10 @@ authors = ["The Chromium OS Authors"]
 edition = "2018"
 
 [dependencies]
-assertions = { path = "../assertions" }
-data_model = { path = "../data_model" }
+assertions = { path = "../common/assertions" }
+data_model = { path = "../common/data_model" }
 libc = "*"
 remain = "*"
-base = { path = "../base" }
+thiserror = "*"
+base = { path = "../common/base" }
 usb_sys = { path = "../usb_sys" }

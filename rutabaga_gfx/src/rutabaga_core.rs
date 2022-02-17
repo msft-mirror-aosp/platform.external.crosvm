@@ -7,7 +7,7 @@
 use std::collections::BTreeMap as Map;
 use std::sync::Arc;
 
-use base::ExternalMapping;
+use base::{ExternalMapping, SafeDescriptor};
 use data_model::VolatileSlice;
 
 use crate::cross_domain::CrossDomain;
@@ -67,7 +67,7 @@ pub trait RutabagaComponent {
 
     /// Implementations must create a fence that represents the completion of prior work.  This is
     /// required for synchronization with the guest kernel.
-    fn create_fence(&mut self, _fence_data: RutabagaFenceData) -> RutabagaResult<()> {
+    fn create_fence(&mut self, _fence: RutabagaFence) -> RutabagaResult<()> {
         Err(RutabagaError::Unsupported)
     }
 
@@ -133,6 +133,7 @@ pub trait RutabagaComponent {
         _resource_id: u32,
         _resource_create_blob: ResourceCreateBlob,
         _iovec_opt: Option<Vec<RutabagaIovec>>,
+        _handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         Err(RutabagaError::Unsupported)
     }
@@ -155,6 +156,7 @@ pub trait RutabagaComponent {
         &self,
         _ctx_id: u32,
         _context_init: u32,
+        _fence_handler: RutabagaFenceHandler,
     ) -> RutabagaResult<Box<dyn RutabagaContext>> {
         Err(RutabagaError::Unsupported)
     }
@@ -166,7 +168,7 @@ pub trait RutabagaContext {
         &mut self,
         _resource_id: u32,
         _resource_create_blob: ResourceCreateBlob,
-        _handle: Option<RutabagaHandle>,
+        _handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         Err(RutabagaError::Unsupported)
     }
@@ -180,17 +182,20 @@ pub trait RutabagaContext {
     /// Implementations must stop using `resource` in this context's command stream.
     fn detach(&mut self, _resource: &RutabagaResource);
 
-    /// Implementations must create a fence on specified `fence_ctx_idx` in `fence_data`.  This
+    /// Implementations must create a fence on specified `ring_idx` in `fence`.  This
     /// allows for multiple syncrhonizations timelines per RutabagaContext.
-    fn context_create_fence(&mut self, _fence_data: RutabagaFenceData) -> RutabagaResult<()> {
+    fn context_create_fence(&mut self, _fence: RutabagaFence) -> RutabagaResult<()> {
         Err(RutabagaError::Unsupported)
     }
 
     /// Implementations must return an array of fences that have completed.  This will be used by
     /// the cross-domain context for asynchronous Tx/Rx.
-    fn context_poll(&mut self) -> Option<Vec<RutabagaFenceData>> {
+    fn context_poll(&mut self) -> Option<Vec<RutabagaFence>> {
         None
     }
+
+    /// Implementations must return the component type associated with the context.
+    fn component_type(&self) -> RutabagaComponentType;
 }
 
 #[derive(Copy, Clone)]
@@ -208,10 +213,12 @@ struct RutabagaCapsetInfo {
 /// thread-safe is more difficult.
 pub struct Rutabaga {
     resources: Map<u32, RutabagaResource>,
-    components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>>,
     contexts: Map<u32, Box<dyn RutabagaContext>>,
+    // Declare components after resources and contexts such that it is dropped last.
+    components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>>,
     default_component: RutabagaComponentType,
     capset_info: Vec<RutabagaCapsetInfo>,
+    fence_handler: RutabagaFenceHandler,
 }
 
 impl Rutabaga {
@@ -273,35 +280,35 @@ impl Rutabaga {
         }
     }
 
-    /// Creates a fence with the given `fence_data`.
-    /// If the flags include RUTABAGA_FLAG_PARAM_FENCE_CTX_IDX, then the fence is created on a
+    /// Creates a fence with the given `fence`.
+    /// If the flags include RUTABAGA_FLAG_INFO_RING_IDX, then the fence is created on a
     /// specific timeline on the specific context.
-    pub fn create_fence(&mut self, fence_data: RutabagaFenceData) -> RutabagaResult<()> {
-        if fence_data.flags & RUTABAGA_FLAG_INFO_FENCE_CTX_IDX != 0 {
+    pub fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        if fence.flags & RUTABAGA_FLAG_INFO_RING_IDX != 0 {
             let ctx = self
                 .contexts
-                .get_mut(&fence_data.ctx_id)
+                .get_mut(&fence.ctx_id)
                 .ok_or(RutabagaError::InvalidContextId)?;
 
-            ctx.context_create_fence(fence_data)?;
+            ctx.context_create_fence(fence)?;
         } else {
             let component = self
                 .components
                 .get_mut(&self.default_component)
                 .ok_or(RutabagaError::InvalidComponent)?;
 
-            component.create_fence(fence_data)?;
+            component.create_fence(fence)?;
         }
 
         Ok(())
     }
 
-    /// Polls all rutabaga components and contexts, and returns a vector of RutabagaFenceData
+    /// Polls all rutabaga components and contexts, and returns a vector of RutabagaFence
     /// describing which fences have completed.
-    pub fn poll(&mut self) -> Vec<RutabagaFenceData> {
-        let mut completed_fences: Vec<RutabagaFenceData> = Vec::new();
+    pub fn poll(&mut self) -> Vec<RutabagaFence> {
+        let mut completed_fences: Vec<RutabagaFence> = Vec::new();
         // Poll the default component -- this the global timeline which does not take into account
-        // `ctx_id` or `fence_ctx_idx`.  This path exists for OpenGL legacy reasons and 2D mode.
+        // `ctx_id` or `ring_idx`.  This path exists for OpenGL legacy reasons and 2D mode.
         let component = self
             .components
             .get_mut(&self.default_component)
@@ -309,11 +316,11 @@ impl Rutabaga {
             .unwrap();
 
         let global_fence_id = component.poll();
-        completed_fences.push(RutabagaFenceData {
+        completed_fences.push(RutabagaFence {
             flags: RUTABAGA_FLAG_FENCE,
             fence_id: global_fence_id as u64,
             ctx_id: 0,
-            fence_ctx_idx: 0,
+            ring_idx: 0,
         });
 
         for ctx in self.contexts.values_mut() {
@@ -457,28 +464,33 @@ impl Rutabaga {
             return Err(RutabagaError::InvalidResourceId);
         }
 
+        let component = self
+            .components
+            .get_mut(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+
+        let mut context = None;
         // For the cross-domain context, we'll need to create the blob resource via a home-grown
-        // rutabaga context rather than one from an external C/C++ component.  Use `ctx_id` to check
-        // if it happens to be a cross-domain context.
+        // rutabaga context rather than one from an external C/C++ component.  Use `ctx_id` and
+        // the component type if it happens to be a cross-domain context.
         if ctx_id > 0 {
             let ctx = self
                 .contexts
                 .get_mut(&ctx_id)
                 .ok_or(RutabagaError::InvalidContextId)?;
 
-            if let Ok(resource) = ctx.context_create_blob(resource_id, resource_create_blob, handle)
-            {
-                self.resources.insert(resource_id, resource);
-                return Ok(());
+            if ctx.component_type() == RutabagaComponentType::CrossDomain {
+                context = Some(ctx);
             }
         }
 
-        let component = self
-            .components
-            .get_mut(&self.default_component)
-            .ok_or(RutabagaError::InvalidComponent)?;
+        let resource = match context {
+            Some(ctx) => ctx.context_create_blob(resource_id, resource_create_blob, handle)?,
+            None => {
+                component.create_blob(ctx_id, resource_id, resource_create_blob, iovecs, handle)?
+            }
+        };
 
-        let resource = component.create_blob(ctx_id, resource_id, resource_create_blob, iovecs)?;
         self.resources.insert(resource_id, resource);
         Ok(())
     }
@@ -505,7 +517,9 @@ impl Rutabaga {
             .get(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        resource.map_info.ok_or(RutabagaError::SpecViolation)
+        resource
+            .map_info
+            .ok_or(RutabagaError::SpecViolation("no map info available"))
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device
@@ -516,7 +530,7 @@ impl Rutabaga {
             .get(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        resource.vulkan_info.ok_or(RutabagaError::Unsupported)
+        resource.vulkan_info.ok_or(RutabagaError::InvalidVulkanInfo)
     }
 
     /// Returns the 3D info associated with the resource, if any.
@@ -526,7 +540,9 @@ impl Rutabaga {
             .get(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        resource.info_3d.ok_or(RutabagaError::Unsupported)
+        resource
+            .info_3d
+            .ok_or(RutabagaError::SpecViolation("no 3d info available"))
     }
 
     /// Exports a blob resource.  See virtio-gpu spec for blob flag use flags.
@@ -550,10 +566,11 @@ impl Rutabaga {
             }
             (Some(handle), false) => {
                 // Exactly one strong reference in this case.
-                let hnd = Arc::try_unwrap(handle).map_err(|_| RutabagaError::SpecViolation)?;
+                let hnd =
+                    Arc::try_unwrap(handle).map_err(|_| RutabagaError::InvalidRutabagaHandle)?;
                 Ok(hnd)
             }
-            _ => Err(RutabagaError::Unsupported),
+            _ => Err(RutabagaError::InvalidRutabagaHandle),
         }
     }
 
@@ -586,7 +603,7 @@ impl Rutabaga {
             return Err(RutabagaError::InvalidContextId);
         }
 
-        let ctx = component.create_context(ctx_id, context_init)?;
+        let ctx = component.create_context(ctx_id, context_init, self.fence_handler.clone())?;
         self.contexts.insert(ctx_id, ctx);
         Ok(())
     }
@@ -606,12 +623,12 @@ impl Rutabaga {
             .get_mut(&ctx_id)
             .ok_or(RutabagaError::InvalidContextId)?;
 
-        let mut resource = self
+        let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        ctx.attach(&mut resource);
+        ctx.attach(resource);
         Ok(())
     }
 
@@ -627,7 +644,7 @@ impl Rutabaga {
             .get_mut(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        ctx.detach(&resource);
+        ctx.detach(resource);
         Ok(())
     }
 
@@ -706,14 +723,23 @@ impl RutabagaBuilder {
     /// This should be only called once per every virtual machine instance.  Rutabaga tries to
     /// intialize all 3D components which have been built. In 2D mode, only the 2D component is
     /// initialized.
-    pub fn build(self) -> RutabagaResult<Rutabaga> {
+    pub fn build(
+        self,
+        fence_handler: RutabagaFenceHandler,
+        render_server_fd: Option<SafeDescriptor>,
+    ) -> RutabagaResult<Rutabaga> {
         let mut rutabaga_components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>> =
             Default::default();
 
         let mut rutabaga_capsets: Vec<RutabagaCapsetInfo> = Default::default();
 
+        #[cfg(not(feature = "virgl_renderer_next"))]
+        if render_server_fd.is_some() {
+            return Err(RutabagaError::InvalidRutabagaBuild);
+        }
+
         if self.default_component == RutabagaComponentType::Rutabaga2D {
-            let rutabaga_2d = Rutabaga2D::init()?;
+            let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
             rutabaga_components.insert(RutabagaComponentType::Rutabaga2D, rutabaga_2d);
         } else {
             #[cfg(feature = "virgl_renderer")]
@@ -722,7 +748,11 @@ impl RutabagaBuilder {
                     .virglrenderer_flags
                     .ok_or(RutabagaError::InvalidRutabagaBuild)?;
 
-                let virgl = VirglRenderer::init(virglrenderer_flags)?;
+                let virgl = VirglRenderer::init(
+                    virglrenderer_flags,
+                    fence_handler.clone(),
+                    render_server_fd,
+                )?;
                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
 
                 rutabaga_capsets.push(RutabagaCapsetInfo {
@@ -752,7 +782,12 @@ impl RutabagaBuilder {
                     .gfxstream_flags
                     .ok_or(RutabagaError::InvalidRutabagaBuild)?;
 
-                let gfxstream = Gfxstream::init(display_width, display_height, gfxstream_flags)?;
+                let gfxstream = Gfxstream::init(
+                    display_width,
+                    display_height,
+                    gfxstream_flags,
+                    fence_handler.clone(),
+                )?;
                 rutabaga_components.insert(RutabagaComponentType::Gfxstream, gfxstream);
 
                 rutabaga_capsets.push(RutabagaCapsetInfo {
@@ -771,11 +806,12 @@ impl RutabagaBuilder {
         }
 
         Ok(Rutabaga {
-            components: rutabaga_components,
             resources: Default::default(),
             contexts: Default::default(),
+            components: rutabaga_components,
             default_component: self.default_component,
             capset_info: rutabaga_capsets,
+            fence_handler,
         })
     }
 }

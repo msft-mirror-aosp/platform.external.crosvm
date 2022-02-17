@@ -3,11 +3,11 @@
 // found in the LICENSE file.
 
 #[cfg(target_arch = "x86_64")]
-use gdbstub::arch::x86::reg::X86_64CoreRegs as CoreRegs;
+use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 use vm_memory::GuestAddress;
 
 /// Messages that can be sent to a vCPU to set/get its state from the debugger.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum VcpuDebug {
     ReadMem(GuestAddress, usize),
     ReadRegs,
@@ -18,6 +18,7 @@ pub enum VcpuDebug {
 }
 
 /// Messages that can be sent from a vCPU to update the state to the debugger.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum VcpuDebugStatus {
     RegValues(CoreRegs),

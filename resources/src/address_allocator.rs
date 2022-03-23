@@ -17,7 +17,7 @@ use crate::{Alloc, Error, Result};
 /// ```
 /// // Anon is used for brevity. Don't manually instantiate Anon allocs!
 /// # use resources::{Alloc, AddressAllocator};
-///   AddressAllocator::new(0x1000, 0x10000, Some(0x100), None).map(|mut pool| {
+///   AddressAllocator::new(0x1000, 0x10000, Some(0x100)).map(|mut pool| {
 ///       assert_eq!(pool.allocate(0x110, Alloc::Anon(0), "caps".to_string()), Ok(0x1000));
 ///       assert_eq!(pool.allocate(0x100, Alloc::Anon(1), "cache".to_string()), Ok(0x1200));
 ///       assert_eq!(pool.allocate(0x100, Alloc::Anon(2), "etc".to_string()), Ok(0x1300));
@@ -26,10 +26,7 @@ use crate::{Alloc, Error, Result};
 /// ```
 #[derive(Debug, Eq, PartialEq)]
 pub struct AddressAllocator {
-    pool_base: u64,
-    pool_size: u64,
-    min_align: u64,
-    preferred_align: u64,
+    alignment: u64,
     allocs: HashMap<Alloc, (u64, u64, String)>,
     regions: BTreeSet<(u64, u64)>,
 }
@@ -41,17 +38,8 @@ impl AddressAllocator {
     ///
     /// * `pool_base` - The starting address of the range to manage.
     /// * `pool_size` - The size of the address range in bytes.
-    /// * `min_align` - The minimum size of an address region to align to, defaults to four.
-    /// * `preferred_align` - The preferred alignment of an address region, used if possible.
-    ///
-    /// If an allocation cannot be satisfied with the preferred alignment, the minimum alignment
-    /// will be used instead.
-    pub fn new(
-        pool_base: u64,
-        pool_size: u64,
-        min_align: Option<u64>,
-        preferred_align: Option<u64>,
-    ) -> Result<Self> {
+    /// * `align_size` - The minimum size of an address region to align to, defaults to four.
+    pub fn new(pool_base: u64, pool_size: u64, align_size: Option<u64>) -> Result<Self> {
         if pool_size == 0 {
             return Err(Error::PoolSizeZero);
         }
@@ -61,51 +49,30 @@ impl AddressAllocator {
                 base: pool_base,
                 size: pool_size,
             })?;
-        let min_align = min_align.unwrap_or(4);
-        if !min_align.is_power_of_two() || min_align == 0 {
+        let alignment = align_size.unwrap_or(4);
+        if !alignment.is_power_of_two() || alignment == 0 {
             return Err(Error::BadAlignment);
         }
-
-        let preferred_align = preferred_align.unwrap_or(min_align);
-        if !preferred_align.is_power_of_two() || preferred_align < min_align {
-            return Err(Error::BadAlignment);
-        }
-
         let mut regions = BTreeSet::new();
         regions.insert((pool_base, pool_end));
         Ok(AddressAllocator {
-            pool_base,
-            pool_size,
-            min_align,
-            preferred_align,
+            alignment,
             allocs: HashMap::new(),
             regions,
         })
     }
 
-    /// Gets the starting address of the allocator.
-    ///
-    /// This returns the original `pool_base` value provided to `AddressAllocator::new()`.
-    pub fn pool_base(&self) -> u64 {
-        self.pool_base
-    }
-
-    /// Gets the size of the allocator's address range in bytes.
-    ///
-    /// This returns the original `pool_size` value provided to `AddressAllocator::new()`.
-    pub fn pool_size(&self) -> u64 {
-        self.pool_size
-    }
-
-    fn internal_allocate_with_align(
+    /// Allocates a range of addresses from the managed region with an optional tag
+    /// and minimal alignment. Returns allocated_address. (allocated_address, size, tag)
+    /// can be retrieved through the `get` method.
+    pub fn allocate_with_align(
         &mut self,
         size: u64,
         alloc: Alloc,
         tag: String,
         alignment: u64,
-        reverse: bool,
     ) -> Result<u64> {
-        let alignment = cmp::max(self.min_align, alignment);
+        let alignment = cmp::max(self.alignment, alignment);
 
         if self.allocs.contains_key(&alloc) {
             return Err(Error::ExistingAlloc(alloc));
@@ -117,42 +84,24 @@ impl AddressAllocator {
             return Err(Error::BadAlignment);
         }
 
-        let region = if !reverse {
-            // finds first region matching alignment and size.
-            self.regions
-                .iter()
-                .find(|range| {
-                    match range.0 % alignment {
-                        0 => range.0.checked_add(size - 1),
-                        r => range.0.checked_add(size - 1 + alignment - r),
-                    }
-                    .map_or(false, |end| end <= range.1)
-                })
-                .cloned()
-        } else {
-            // finds last region matching alignment and size.
-            self.regions
-                .iter()
-                .rev()
-                .find(|range| {
-                    range
-                        .1
-                        .checked_sub(size - 1)
-                        .map_or(false, |start| start & !(alignment - 1) >= range.0)
-                })
-                .cloned()
-        };
-
-        match region {
+        // finds first region matching alignment and size.
+        match self
+            .regions
+            .iter()
+            .find(|range| {
+                match range.0 % alignment {
+                    0 => range.0.checked_add(size - 1),
+                    r => range.0.checked_add(size - 1 + alignment - r),
+                }
+                .map_or(false, |end| end <= range.1)
+            })
+            .cloned()
+        {
             Some(slot) => {
                 self.regions.remove(&slot);
-                let start = if !reverse {
-                    match slot.0 % alignment {
-                        0 => slot.0,
-                        r => slot.0 + alignment - r,
-                    }
-                } else {
-                    (slot.1 - (size - 1)) & !(alignment - 1)
+                let start = match slot.0 % alignment {
+                    0 => slot.0,
+                    r => slot.0 + alignment - r,
                 };
                 let end = start + size - 1;
                 if slot.0 < start {
@@ -169,39 +118,8 @@ impl AddressAllocator {
         }
     }
 
-    /// Allocates a range of addresses from the reverse managed region with an optional tag
-    /// and minimal alignment. Returns allocated_address. (allocated_address, size, tag)
-    /// can be retrieved through the `get` method.
-    pub fn reverse_allocate_with_align(
-        &mut self,
-        size: u64,
-        alloc: Alloc,
-        tag: String,
-        alignment: u64,
-    ) -> Result<u64> {
-        self.internal_allocate_with_align(size, alloc, tag, alignment, true)
-    }
-
-    /// Allocates a range of addresses from the managed region with an optional tag
-    /// and minimal alignment. Returns allocated_address. (allocated_address, size, tag)
-    /// can be retrieved through the `get` method.
-    pub fn allocate_with_align(
-        &mut self,
-        size: u64,
-        alloc: Alloc,
-        tag: String,
-        alignment: u64,
-    ) -> Result<u64> {
-        self.internal_allocate_with_align(size, alloc, tag, alignment, false)
-    }
-
     pub fn allocate(&mut self, size: u64, alloc: Alloc, tag: String) -> Result<u64> {
-        if let Ok(pref_alloc) =
-            self.allocate_with_align(size, alloc, tag.clone(), self.preferred_align)
-        {
-            return Ok(pref_alloc);
-        }
-        self.allocate_with_align(size, alloc, tag, self.min_align)
+        self.allocate_with_align(size, alloc, tag, self.alignment)
     }
 
     /// Allocates a range of addresses from the managed region with an optional tag
@@ -244,23 +162,6 @@ impl AddressAllocator {
         self.allocs
             .remove(&alloc)
             .map_or_else(|| Err(Error::BadAlloc(alloc)), |v| self.insert_at(v.0, v.1))
-    }
-
-    /// Release a allocation contains the value.
-    pub fn release_containing(&mut self, value: u64) -> Result<()> {
-        let mut alloc = None;
-        for (key, val) in self.allocs.iter() {
-            if value >= val.0 && value < val.0 + val.1 {
-                alloc = Some(*key);
-                break;
-            }
-        }
-
-        if let Some(key) = alloc {
-            return self.release(key);
-        }
-
-        Err(Error::OutOfSpace)
     }
 
     /// Returns allocation associated with `alloc`, or None if no such allocation exists.
@@ -428,27 +329,27 @@ mod tests {
 
     #[test]
     fn new_fails_overflow() {
-        assert!(AddressAllocator::new(u64::max_value(), 0x100, None, None).is_err());
+        assert!(AddressAllocator::new(u64::max_value(), 0x100, None).is_err());
     }
 
     #[test]
     fn new_fails_size_zero() {
-        assert!(AddressAllocator::new(0x1000, 0, None, None).is_err());
+        assert!(AddressAllocator::new(0x1000, 0, None).is_err());
     }
 
     #[test]
     fn new_fails_alignment_zero() {
-        assert!(AddressAllocator::new(0x1000, 0x10000, Some(0), None).is_err());
+        assert!(AddressAllocator::new(0x1000, 0x10000, Some(0)).is_err());
     }
 
     #[test]
     fn new_fails_alignment_non_power_of_two() {
-        assert!(AddressAllocator::new(0x1000, 0x10000, Some(200), None).is_err());
+        assert!(AddressAllocator::new(0x1000, 0x10000, Some(200)).is_err());
     }
 
     #[test]
     fn allocate_fails_exising_alloc() {
-        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100)).unwrap();
         assert_eq!(
             pool.allocate(0x800, Alloc::Anon(0), String::from("bar0")),
             Ok(0x1000)
@@ -461,7 +362,7 @@ mod tests {
 
     #[test]
     fn allocate_fails_not_enough_space() {
-        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100)).unwrap();
         assert_eq!(
             pool.allocate(0x800, Alloc::Anon(0), String::from("bar0")),
             Ok(0x1000)
@@ -478,7 +379,7 @@ mod tests {
 
     #[test]
     fn allocate_with_special_alignment() {
-        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100)).unwrap();
         assert_eq!(
             pool.allocate(0x10, Alloc::Anon(0), String::from("bar0")),
             Ok(0x1000)
@@ -495,7 +396,7 @@ mod tests {
 
     #[test]
     fn allocate_and_split_allocate_at() {
-        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x1000, Some(0x100)).unwrap();
         assert_eq!(
             pool.allocate_at(0x1200, 0x800, Alloc::Anon(0), String::from("bar0")),
             Ok(())
@@ -516,7 +417,7 @@ mod tests {
 
     #[test]
     fn allocate_alignment() {
-        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x100), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x100)).unwrap();
         assert_eq!(
             pool.allocate(0x110, Alloc::Anon(0), String::from("bar0")),
             Ok(0x1000)
@@ -529,7 +430,7 @@ mod tests {
 
     #[test]
     fn allocate_retrieve_alloc() {
-        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x100), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x100)).unwrap();
         assert_eq!(
             pool.allocate(0x110, Alloc::Anon(0), String::from("bar0")),
             Ok(0x1000)
@@ -542,7 +443,7 @@ mod tests {
 
     #[test]
     fn allocate_with_alignment_allocator_alignment() {
-        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x100), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x100)).unwrap();
         assert_eq!(
             pool.allocate_with_align(0x110, Alloc::Anon(0), String::from("bar0"), 0x1),
             Ok(0x1000)
@@ -555,7 +456,7 @@ mod tests {
 
     #[test]
     fn allocate_with_alignment_custom_alignment() {
-        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x4), None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x10000, Some(0x4)).unwrap();
         assert_eq!(
             pool.allocate_with_align(0x110, Alloc::Anon(0), String::from("bar0"), 0x100),
             Ok(0x1000)
@@ -568,7 +469,7 @@ mod tests {
 
     #[test]
     fn allocate_with_alignment_no_allocator_alignment() {
-        let mut pool = AddressAllocator::new(0x1000, 0x10000, None, None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x10000, None).unwrap();
         assert_eq!(
             pool.allocate_with_align(0x110, Alloc::Anon(0), String::from("bar0"), 0x100),
             Ok(0x1000)
@@ -581,7 +482,7 @@ mod tests {
 
     #[test]
     fn allocate_with_alignment_alignment_non_power_of_two() {
-        let mut pool = AddressAllocator::new(0x1000, 0x10000, None, None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x10000, None).unwrap();
         assert!(pool
             .allocate_with_align(0x110, Alloc::Anon(0), String::from("bar0"), 200)
             .is_err());
@@ -589,7 +490,7 @@ mod tests {
 
     #[test]
     fn allocate_with_release() {
-        let mut pool = AddressAllocator::new(0x1000, 0x1000, None, None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x1000, None).unwrap();
         assert_eq!(
             pool.allocate_with_align(0x100, Alloc::Anon(0), String::from("bar0"), 0x100),
             Ok(0x1000)
@@ -603,7 +504,7 @@ mod tests {
 
     #[test]
     fn coalescing_and_overlap() {
-        let mut pool = AddressAllocator::new(0x1000, 0x1000, None, None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x1000, None).unwrap();
         assert!(pool.insert_at(0x3000, 0x1000).is_ok());
         assert!(pool.insert_at(0x1fff, 0x20).is_err());
         assert!(pool.insert_at(0x2ff1, 0x10).is_err());
@@ -617,7 +518,7 @@ mod tests {
 
     #[test]
     fn coalescing_single_addresses() {
-        let mut pool = AddressAllocator::new(0x1000, 0x1000, None, None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x1000, None).unwrap();
         assert!(pool.insert_at(0x2001, 1).is_ok());
         assert!(pool.insert_at(0x2003, 1).is_ok());
         assert!(pool.insert_at(0x2000, 1).is_ok());
@@ -630,7 +531,7 @@ mod tests {
 
     #[test]
     fn allocate_and_verify_pci_offset() {
-        let mut pool = AddressAllocator::new(0x1000, 0x10000, None, None).unwrap();
+        let mut pool = AddressAllocator::new(0x1000, 0x10000, None).unwrap();
         let pci_bar0 = Alloc::PciBar {
             bus: 1,
             dev: 2,

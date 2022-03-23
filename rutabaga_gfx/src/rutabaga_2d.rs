@@ -4,7 +4,7 @@
 
 //! rutabaga_2d: Handles 2D virtio-gpu hypercalls.
 
-use std::cmp::{max, min, Ordering};
+use std::cmp::{max, min};
 
 use data_model::*;
 
@@ -84,19 +84,15 @@ pub fn transfer_2d<'a, S: Iterator<Item = VolatileSlice<'a>>>(
 
             let offset_within_src = src_copyable_start_offset.saturating_sub(src_start_offset);
 
-            match src_line_end_offset.cmp(&src_end_offset) {
-                Ordering::Greater => {
-                    next_src = true;
-                    next_line = false;
-                }
-                Ordering::Equal => {
-                    next_src = true;
-                    next_line = true;
-                }
-                Ordering::Less => {
-                    next_src = false;
-                    next_line = true;
-                }
+            if src_line_end_offset > src_end_offset {
+                next_src = true;
+                next_line = false;
+            } else if src_line_end_offset == src_end_offset {
+                next_src = true;
+                next_line = true;
+            } else {
+                next_src = false;
+                next_line = true;
             }
 
             let src_subslice = src.get_slice(offset_within_src as usize, copyable_size as usize)?;
@@ -111,12 +107,14 @@ pub fn transfer_2d<'a, S: Iterator<Item = VolatileSlice<'a>>>(
             let dst_subslice = dst.get_slice(dst_start_offset as usize, copyable_size as usize)?;
 
             src_subslice.copy_to_volatile_slice(dst_subslice);
-        } else if src_line_start_offset >= src_start_offset {
-            next_src = true;
-            next_line = false;
         } else {
-            next_src = false;
-            next_line = true;
+            if src_line_start_offset >= src_start_offset {
+                next_src = true;
+                next_line = false;
+            } else {
+                next_src = false;
+                next_line = true;
+            }
         };
 
         if next_src {
@@ -134,22 +132,19 @@ pub fn transfer_2d<'a, S: Iterator<Item = VolatileSlice<'a>>>(
 
 pub struct Rutabaga2D {
     latest_created_fence_id: u32,
-    fence_handler: RutabagaFenceHandler,
 }
 
 impl Rutabaga2D {
-    pub fn init(fence_handler: RutabagaFenceHandler) -> RutabagaResult<Box<dyn RutabagaComponent>> {
+    pub fn init() -> RutabagaResult<Box<dyn RutabagaComponent>> {
         Ok(Box::new(Rutabaga2D {
             latest_created_fence_id: 0,
-            fence_handler,
         }))
     }
 }
 
 impl RutabagaComponent for Rutabaga2D {
-    fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
-        self.latest_created_fence_id = fence.fence_id as u32;
-        self.fence_handler.call(fence);
+    fn create_fence(&mut self, fence_data: RutabagaFenceData) -> RutabagaResult<()> {
+        self.latest_created_fence_id = fence_data.fence_id as u32;
         Ok(())
     }
 
@@ -196,15 +191,12 @@ impl RutabagaComponent for Rutabaga2D {
             return Ok(());
         }
 
-        let mut info_2d = resource
-            .info_2d
-            .take()
-            .ok_or(RutabagaError::Invalid2DInfo)?;
+        let mut info_2d = resource.info_2d.take().ok_or(RutabagaError::Unsupported)?;
 
         let iovecs = resource
             .backing_iovecs
             .take()
-            .ok_or(RutabagaError::InvalidIovec)?;
+            .ok_or(RutabagaError::Unsupported)?;
 
         // All offical virtio_gpu formats are 4 bytes per pixel.
         let resource_bpp = 4;
@@ -248,10 +240,7 @@ impl RutabagaComponent for Rutabaga2D {
         transfer: Transfer3D,
         buf: Option<VolatileSlice>,
     ) -> RutabagaResult<()> {
-        let mut info_2d = resource
-            .info_2d
-            .take()
-            .ok_or(RutabagaError::Invalid2DInfo)?;
+        let mut info_2d = resource.info_2d.take().ok_or(RutabagaError::Unsupported)?;
 
         // All offical virtio_gpu formats are 4 bytes per pixel.
         let resource_bpp = 4;
@@ -259,9 +248,7 @@ impl RutabagaComponent for Rutabaga2D {
         let src_offset = 0;
         let dst_offset = 0;
 
-        let dst_slice = buf.ok_or(RutabagaError::SpecViolation(
-            "need a destination slice for transfer read",
-        ))?;
+        let dst_slice = buf.ok_or(RutabagaError::Unsupported)?;
 
         transfer_2d(
             info_2d.width,

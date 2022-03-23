@@ -6,13 +6,10 @@ edition = "2018"
 include = ["src/**/*", "Cargo.toml"]
 
 [dependencies]
-cros_async = { path = "../common/cros_async" }
-data_model = { path = "../common/data_model" }
+cros_async = { path = "../cros_async" } # provided by ebuild
+data_model = { path = "../data_model" } # provided by ebuild
 libc = "*"
-base = { path = "../common/base" }
+base = { path = "../base" } # provided by ebuild
 bitflags = "1"
-remain = "*"
-serde = { version = "1", features = [ "derive" ] }
-thiserror = "*"
 
-
+[workspace]

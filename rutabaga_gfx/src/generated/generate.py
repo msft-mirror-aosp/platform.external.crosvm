@@ -26,18 +26,16 @@ END_COLOR = '\033[0m'
 
 verbose = False
 
-def generate_module(module_name, allowlist, blocklist, header, clang_args,
-                    lib_name, derive_default):
+def generate_module(module_name, whitelist, header, clang_args, lib_name,
+                    derive_default):
   args = [
     'bindgen',
     '--no-layout-tests',
-    '--allowlist-function', allowlist,
-    '--allowlist-var', allowlist,
-    '--allowlist-type', allowlist,
-    '--blocklist-function', blocklist,
-    '--blocklist-item', blocklist,
-    '--blocklist-type', blocklist,
+    '--whitelist-function', whitelist,
+    '--whitelist-var', whitelist,
+    '--whitelist-type', whitelist,
     '--no-prepend-enum-name',
+    '--no-rustfmt-bindings',
     '-o', module_name + '_bindings.rs',
   ];
 
@@ -89,6 +87,7 @@ def get_parser():
                       default='/',
                       help='sysroot directory (default=%(default)s)')
   parser.add_argument('--virglrenderer',
+                      default='git://git.freedesktop.org/git/virglrenderer',
                       help='virglrenderer src dir/repo (default=%(default)s)')
   parser.add_argument('--virgl_branch',
                       default='master',
@@ -106,30 +105,23 @@ def main(argv):
   if opts.verbose:
     verbose = True
 
-  if opts.virglrenderer:
-    if '://' in opts.virglrenderer:
-      virgl_src_dir_temp = tempfile.TemporaryDirectory(prefix='virglrenderer-src')
-      virgl_src_dir = virgl_src_dir_temp.name
-      if not download_virgl(opts.virglrenderer, virgl_src_dir, opts.virgl_branch):
-        print('failed to clone \'{}\' to \'{}\''.format(virgl_src_dir,
-                                                        opts.virgl_branch))
-        sys.exit(1)
-    else:
-      virgl_src_dir = opts.virglrenderer
+  virgl_src_dir = opts.virglrenderer
+  virgl_src_dir_temp = None
+  if '://' in opts.virglrenderer:
+    virgl_src_dir_temp = tempfile.TemporaryDirectory(prefix='virglrenderer-src')
+    virgl_src_dir = virgl_src_dir_temp.name
+    if not download_virgl(opts.virglrenderer, virgl_src_dir, opts.virgl_branch):
+      print('failed to clone \'{}\' to \'{}\''.format(virgl_src_dir,
+                                                      opts.virgl_branch))
+      sys.exit(1)
 
-    header = os.path.join(virgl_src_dir, 'src/virglrenderer.h')
-  else:
-    header = os.path.join(opts.sysroot, 'usr/include/virgl/virglrenderer.h')
-
-  clang_args = ['-I', os.path.join(opts.sysroot, 'usr/include'),
-                '-D', 'VIRGL_RENDERER_UNSTABLE_APIS']
+  clang_args = ['-I', os.path.join(opts.sysroot, 'usr/include')]
 
   modules = (
     (
       'virgl_renderer',
-      '(virgl|VIRGL)_.+', # allowlist
-      '.*(va_list|debug_callback).*', # blocklist
-      header,
+      '(virgl|VIRGL)_.+',
+      os.path.join(opts.sysroot, 'usr/include/virgl/virglrenderer.h'),
       clang_args,
       'virglrenderer',
       True,
@@ -161,7 +153,6 @@ def main(argv):
     print('#![allow(non_camel_case_types)]', file=f)
     print('#![allow(non_snake_case)]', file=f)
     print('#![allow(non_upper_case_globals)]', file=f)
-    print('pub mod virgl_debug_callback_bindings;', file=f)
     for module in modules:
       print('pub mod', module[0] + '_bindings;', file=f)
 

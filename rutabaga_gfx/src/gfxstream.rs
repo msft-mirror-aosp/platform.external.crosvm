@@ -4,22 +4,17 @@
 
 //! gfxstream: Handles 3D virtio-gpu hypercalls using gfxstream.
 //!
-//! External code found at <https://android.googlesource.com/device/generic/vulkan-cereal/>.
+//! External code found at https://android.googlesource.com/device/generic/vulkan-cereal/.
 
 #![cfg(feature = "gfxstream")]
 
 use std::cell::RefCell;
-use std::convert::TryInto;
 use std::mem::{size_of, transmute};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use std::rc::Rc;
-use std::sync::Arc;
 
-use base::{
-    ExternalMapping, ExternalMappingError, ExternalMappingResult, FromRawDescriptor,
-    IntoRawDescriptor, SafeDescriptor,
-};
+use base::{ExternalMapping, ExternalMappingError, ExternalMappingResult};
 
 use crate::generated::virgl_renderer_bindings::{
     iovec, virgl_box, virgl_renderer_resource_create_args,
@@ -39,16 +34,6 @@ pub struct GfxstreamRendererCallbacks {
     pub write_fence: unsafe extern "C" fn(cookie: *mut c_void, fence: u32),
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub struct stream_renderer_handle {
-    pub os_handle: i64,
-    pub handle_type: u32,
-}
-
-#[allow(non_camel_case_types)]
-type stream_renderer_create_blob = ResourceCreateBlob;
-
 #[link(name = "gfxstream_backend")]
 extern "C" {
 
@@ -61,7 +46,6 @@ extern "C" {
         renderer_cookie: *mut c_void,
         renderer_flags: i32,
         renderer_callbacks: *mut GfxstreamRendererCallbacks,
-        gfxstream_callbacks: *mut c_void,
     );
 
     // virtio-gpu-3d ioctl functions (begin)
@@ -121,29 +105,18 @@ extern "C" {
     fn pipe_virgl_renderer_ctx_attach_resource(ctx_id: c_int, res_handle: c_int);
     fn pipe_virgl_renderer_ctx_detach_resource(ctx_id: c_int, res_handle: c_int);
 
-    fn stream_renderer_create_blob(
-        ctx_id: u32,
-        res_handle: u32,
-        create_blob: *const stream_renderer_create_blob,
-        iovecs: *const iovec,
-        num_iovs: u32,
-        handle: *const stream_renderer_handle,
-    ) -> c_int;
-
-    fn stream_renderer_export_blob(res_handle: u32, handle: *mut stream_renderer_handle) -> c_int;
+    fn stream_renderer_resource_create_v2(res_handle: u32, hostmemId: u64);
     fn stream_renderer_resource_map(
         res_handle: u32,
         map: *mut *mut c_void,
         out_size: *mut u64,
     ) -> c_int;
     fn stream_renderer_resource_unmap(res_handle: u32) -> c_int;
-    fn stream_renderer_resource_map_info(res_handle: u32, map_info: *mut u32) -> c_int;
 }
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct Gfxstream {
     fence_state: Rc<RefCell<FenceState>>,
-    fence_handler: RutabagaFenceHandler,
 }
 
 struct GfxstreamContext {
@@ -189,10 +162,6 @@ impl RutabagaContext for GfxstreamContext {
             );
         }
     }
-
-    fn component_type(&self) -> RutabagaComponentType {
-        RutabagaComponentType::Gfxstream
-    }
 }
 
 impl Drop for GfxstreamContext {
@@ -231,16 +200,11 @@ impl Gfxstream {
         display_width: u32,
         display_height: u32,
         gfxstream_flags: GfxstreamFlags,
-        fence_handler: RutabagaFenceHandler,
     ) -> RutabagaResult<Box<dyn RutabagaComponent>> {
-        let fence_state = Rc::new(RefCell::new(FenceState {
-            latest_fence: 0,
-            handler: None,
-        }));
+        let fence_state = Rc::new(RefCell::new(FenceState { latest_fence: 0 }));
 
         let cookie: *mut VirglCookie = Box::into_raw(Box::new(VirglCookie {
             fence_state: Rc::clone(&fence_state),
-            render_server_fd: None,
         }));
 
         unsafe {
@@ -251,38 +215,15 @@ impl Gfxstream {
                 cookie as *mut c_void,
                 gfxstream_flags.into(),
                 transmute(GFXSTREAM_RENDERER_CALLBACKS),
-                null_mut(),
             );
         }
 
-        Ok(Box::new(Gfxstream {
-            fence_state,
-            fence_handler,
-        }))
+        Ok(Box::new(Gfxstream { fence_state }))
     }
 
-    fn map_info(&self, resource_id: u32) -> RutabagaResult<u32> {
-        let mut map_info = 0;
-        let ret = unsafe { stream_renderer_resource_map_info(resource_id, &mut map_info) };
-        ret_to_res(ret)?;
-
-        Ok(map_info)
-    }
-
-    fn export_blob(&self, resource_id: u32) -> RutabagaResult<Arc<RutabagaHandle>> {
-        let mut stream_handle: stream_renderer_handle = Default::default();
-        let ret = unsafe { stream_renderer_export_blob(resource_id as u32, &mut stream_handle) };
-        ret_to_res(ret)?;
-
-        // Safe because the handle was just returned by a successful gfxstream call so it must be
-        // valid and owned by us.
-        let raw_descriptor = stream_handle.os_handle.try_into()?;
-        let handle = unsafe { SafeDescriptor::from_raw_descriptor(raw_descriptor) };
-
-        Ok(Arc::new(RutabagaHandle {
-            os_handle: handle,
-            handle_type: stream_handle.handle_type,
-        }))
+    #[allow(clippy::unnecessary_wraps)]
+    fn map_info(&self, _resource_id: u32) -> RutabagaResult<u32> {
+        Ok(RUTABAGA_MAP_CACHE_WC)
     }
 }
 
@@ -295,11 +236,10 @@ impl RutabagaComponent for Gfxstream {
         Vec::new()
     }
 
-    fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
-        let ret = unsafe { pipe_virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) };
-        // This can be moved to the cookie once gfxstream directly calls the
-        // write_fence callback in pipe_virgl_renderer_create_fence
-        self.fence_handler.call(fence);
+    fn create_fence(&mut self, fence_data: RutabagaFenceData) -> RutabagaResult<()> {
+        let ret = unsafe {
+            pipe_virgl_renderer_create_fence(fence_data.fence_id as i32, fence_data.ctx_id)
+        };
         ret_to_res(ret)
     }
 
@@ -468,43 +408,17 @@ impl RutabagaComponent for Gfxstream {
 
     fn create_blob(
         &mut self,
-        ctx_id: u32,
+        _ctx_id: u32,
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
-        mut iovec_opt: Option<Vec<RutabagaIovec>>,
-        handle_opt: Option<RutabagaHandle>,
+        _iovec_opt: Option<Vec<RutabagaIovec>>,
     ) -> RutabagaResult<RutabagaResource> {
-        let mut iovec_ptr = null_mut();
-        let mut num_iovecs = 0;
-        if let Some(ref mut iovecs) = iovec_opt {
-            iovec_ptr = iovecs.as_mut_ptr();
-            num_iovecs = iovecs.len() as u32;
+        unsafe {
+            stream_renderer_resource_create_v2(resource_id, resource_create_blob.blob_id);
         }
-
-        let mut handle_ptr = null();
-        let mut stream_handle: stream_renderer_handle = Default::default();
-        if let Some(handle) = handle_opt {
-            stream_handle.handle_type = handle.handle_type;
-            stream_handle.os_handle = handle.os_handle.into_raw_descriptor() as i64;
-            handle_ptr = &stream_handle;
-        }
-
-        let ret = unsafe {
-            stream_renderer_create_blob(
-                ctx_id,
-                resource_id,
-                &resource_create_blob as *const stream_renderer_create_blob,
-                iovec_ptr as *const iovec,
-                num_iovecs,
-                handle_ptr as *const stream_renderer_handle,
-            )
-        };
-
-        ret_to_res(ret)?;
-
         Ok(RutabagaResource {
             resource_id,
-            handle: self.export_blob(resource_id).ok(),
+            handle: None,
             blob: true,
             blob_mem: resource_create_blob.blob_mem,
             blob_flags: resource_create_blob.blob_flags,
@@ -512,7 +426,7 @@ impl RutabagaComponent for Gfxstream {
             info_2d: None,
             info_3d: None,
             vulkan_info: None,
-            backing_iovecs: iovec_opt,
+            backing_iovecs: None,
         })
     }
 
@@ -528,7 +442,6 @@ impl RutabagaComponent for Gfxstream {
         &self,
         ctx_id: u32,
         _context_init: u32,
-        _fence_handler: RutabagaFenceHandler,
     ) -> RutabagaResult<Box<dyn RutabagaContext>> {
         const CONTEXT_NAME: &[u8] = b"gpu_renderer";
         // Safe because virglrenderer is initialized by now and the context name is statically

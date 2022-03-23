@@ -8,19 +8,26 @@ use base::{
     error, warn, AsRawDescriptor, Descriptor, Event, PollToken, RawDescriptor, Tube, WaitContext,
 };
 use power_monitor::{BatteryStatus, CreatePowerMonitorFn};
-use remain::sorted;
+use std::fmt::{self, Display};
 use std::sync::Arc;
 use std::thread;
 use sync::Mutex;
-use thiserror::Error;
 use vm_control::{BatControlCommand, BatControlResult};
 
 /// Errors for battery devices.
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum BatteryError {
-    #[error("Non 32-bit mmio address space")]
     Non32BitMmioAddress,
+}
+
+impl Display for BatteryError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::BatteryError::*;
+
+        match self {
+            Non32BitMmioAddress => write!(f, "Non 32-bit mmio address space"),
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, BatteryError>;

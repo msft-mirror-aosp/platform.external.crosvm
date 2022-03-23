@@ -5,11 +5,10 @@
 @include /usr/share/policy/crosvm/common_device.policy
 
 statx: 1
+readlinkat: 1
 getdents64: 1
 name_to_handle_at: 1
 faccessat: 1
-faccessat2: 1
-newfstatat: 1
 gettid: 1
 clock_gettime: 1
 timerfd_create: 1
@@ -18,6 +17,7 @@ openat: 1
 setsockopt: 1
 bind: 1
 socket: arg0 == AF_NETLINK
+uname: 1
 # The following ioctls are:
 # 0x4004550d == USBDEVFS_REAPURBNDELAY32
 # 0x550b     == USBDEVFS_DISCARDURB

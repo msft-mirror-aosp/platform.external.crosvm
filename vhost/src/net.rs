@@ -7,10 +7,11 @@ use std::marker::PhantomData;
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::{File, OpenOptions},
-    path::Path,
+    path::PathBuf,
 };
 
 use base::{ioctl_with_ref, AsRawDescriptor, RawDescriptor};
+use vm_memory::GuestMemory;
 
 use super::{ioctl_result, Error, Result, Vhost};
 
@@ -22,12 +23,13 @@ pub struct Net<T> {
     // descriptor must be dropped first, which will stop and tear down the
     // vhost-net worker before GuestMemory can potentially be unmapped.
     descriptor: File,
+    mem: GuestMemory,
     phantom: PhantomData<T>,
 }
 
 pub trait NetT<T: TapT>: Vhost + AsRawDescriptor + Send + Sized {
     /// Create a new NetT instance
-    fn new(vhost_net_device_path: &Path) -> Result<Self>;
+    fn new(vhost_net_device_path: &PathBuf, mem: &GuestMemory) -> Result<Self>;
 
     /// Set the tap file descriptor that will serve as the VHOST_NET backend.
     /// This will start the vhost worker for the given queue.
@@ -46,7 +48,7 @@ where
     ///
     /// # Arguments
     /// * `mem` - Guest memory mapping.
-    fn new(vhost_net_device_path: &Path) -> Result<Net<T>> {
+    fn new(vhost_net_device_path: &PathBuf, mem: &GuestMemory) -> Result<Net<T>> {
         Ok(Net::<T> {
             descriptor: OpenOptions::new()
                 .read(true)
@@ -54,6 +56,7 @@ where
                 .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
                 .open(vhost_net_device_path)
                 .map_err(Error::VhostOpen)?,
+            mem: mem.clone(),
             phantom: PhantomData,
         })
     }
@@ -80,7 +83,11 @@ where
     }
 }
 
-impl<T> Vhost for Net<T> {}
+impl<T> Vhost for Net<T> {
+    fn mem(&self) -> &GuestMemory {
+        &self.mem
+    }
+}
 
 impl<T> AsRawDescriptor for Net<T> {
     fn as_raw_descriptor(&self) -> RawDescriptor {
@@ -97,6 +104,7 @@ pub mod fakes {
 
     pub struct FakeNet<T> {
         descriptor: File,
+        mem: GuestMemory,
         phantom: PhantomData<T>,
     }
 
@@ -110,7 +118,7 @@ pub mod fakes {
     where
         T: TapT,
     {
-        fn new(_vhost_net_device_path: &Path) -> Result<FakeNet<T>> {
+        fn new(_vhost_net_device_path: &PathBuf, mem: &GuestMemory) -> Result<FakeNet<T>> {
             Ok(FakeNet::<T> {
                 descriptor: OpenOptions::new()
                     .read(true)
@@ -118,6 +126,7 @@ pub mod fakes {
                     .create(true)
                     .open(TMP_FILE)
                     .unwrap(),
+                mem: mem.clone(),
                 phantom: PhantomData,
             })
         }
@@ -127,7 +136,11 @@ pub mod fakes {
         }
     }
 
-    impl<T> Vhost for FakeNet<T> {}
+    impl<T> Vhost for FakeNet<T> {
+        fn mem(&self) -> &GuestMemory {
+            &self.mem
+        }
+    }
 
     impl<T> AsRawDescriptor for FakeNet<T> {
         fn as_raw_descriptor(&self) -> RawDescriptor {

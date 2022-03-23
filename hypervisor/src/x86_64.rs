@@ -229,15 +229,12 @@ pub struct IoapicRedirectionTableEntry {
     dest_id: BitField8,
 }
 
-/// Number of pins on the standard KVM/IOAPIC.
+/// Number of pins on the IOAPIC.
 pub const NUM_IOAPIC_PINS: usize = 24;
-
-/// Maximum number of pins on the IOAPIC.
-pub const MAX_IOAPIC_PINS: usize = 120;
 
 /// Represents the state of the IOAPIC.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IoapicState {
     /// base_address is the memory base address for this IOAPIC. It cannot be changed.
     pub base_address: u64,
@@ -248,13 +245,7 @@ pub struct IoapicState {
     /// current_interrupt_level_bitmap represents a bitmap of the state of all of the irq lines
     pub current_interrupt_level_bitmap: u32,
     /// redirect_table contains the irq settings for each irq line
-    pub redirect_table: [IoapicRedirectionTableEntry; 120],
-}
-
-impl Default for IoapicState {
-    fn default() -> IoapicState {
-        unsafe { std::mem::zeroed() }
-    }
+    pub redirect_table: [IoapicRedirectionTableEntry; 24],
 }
 
 #[repr(C)]

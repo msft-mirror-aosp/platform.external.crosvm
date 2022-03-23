@@ -4,12 +4,12 @@
 
 //! Manages system resources that can be allocated to VMs and their devices.
 
-use remain::sorted;
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 pub use crate::address_allocator::AddressAllocator;
-pub use crate::system_allocator::{MemRegion, MmioType, SystemAllocator, SystemAllocatorConfig};
+pub use crate::system_allocator::{MmioType, SystemAllocator};
 
 mod address_allocator;
 mod system_allocator;
@@ -29,41 +29,46 @@ pub enum Alloc {
     PmemDevice(usize),
     /// pstore region.
     Pstore,
-    /// A PCI bridge window with associated bus, dev, function.
-    PciBridgeWindow { bus: u8, dev: u8, func: u8 },
-    /// A PCI bridge prefetch window with associated bus, dev, function.
-    PciBridgePrefetchWindow { bus: u8, dev: u8, func: u8 },
-    /// File-backed memory mapping.
-    FileBacked(u64),
 }
 
-#[sorted]
-#[derive(Error, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Error {
-    #[error("Allocation cannot have size of 0")]
     AllocSizeZero,
-    #[error("Pool alignment must be a power of 2")]
     BadAlignment,
-    #[error("Alloc does not exist: {0:?}")]
-    BadAlloc(Alloc),
-    #[error("Alloc already exists: {0:?}")]
     ExistingAlloc(Alloc),
-    #[error("Invalid Alloc: {0:?}")]
     InvalidAlloc(Alloc),
-    #[error("Platform MMIO address range not specified")]
-    MissingPlatformMMIOAddresses,
-    #[error("No IO address range specified")]
+    MissingHighMMIOAddresses,
+    MissingLowMMIOAddresses,
     NoIoAllocator,
-    #[error("Out of bounds")]
-    OutOfBounds,
-    #[error("Out of space")]
     OutOfSpace,
-    #[error("base={base} + size={size} overflows")]
+    OutOfBounds,
     PoolOverflow { base: u64, size: u64 },
-    #[error("Pool cannot have size of 0")]
     PoolSizeZero,
-    #[error("Overlapping region base={base} size={size}")]
     RegionOverlap { base: u64, size: u64 },
+    BadAlloc(Alloc),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        use self::Error::*;
+        match self {
+            AllocSizeZero => write!(f, "Allocation cannot have size of 0"),
+            BadAlignment => write!(f, "Pool alignment must be a power of 2"),
+            ExistingAlloc(tag) => write!(f, "Alloc already exists: {:?}", tag),
+            InvalidAlloc(tag) => write!(f, "Invalid Alloc: {:?}", tag),
+            MissingHighMMIOAddresses => write!(f, "High MMIO address range not specified"),
+            MissingLowMMIOAddresses => write!(f, "Low MMIO address range not specified"),
+            NoIoAllocator => write!(f, "No IO address range specified"),
+            OutOfSpace => write!(f, "Out of space"),
+            OutOfBounds => write!(f, "Out of bounds"),
+            PoolOverflow { base, size } => write!(f, "base={} + size={} overflows", base, size),
+            PoolSizeZero => write!(f, "Pool cannot have size of 0"),
+            RegionOverlap { base, size } => {
+                write!(f, "Overlapping region base={} size={}", base, size)
+            }
+            BadAlloc(tag) => write!(f, "Alloc does not exists: {:?}", tag),
+        }
+    }
+}

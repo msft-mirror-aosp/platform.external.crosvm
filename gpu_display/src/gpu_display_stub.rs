@@ -2,13 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{
-    DisplayT, GpuDisplayError, GpuDisplayFramebuffer, GpuDisplayResult, GpuDisplaySurface,
-    SurfaceType,
-};
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
+
+use crate::{DisplayT, EventDevice, GpuDisplayError, GpuDisplayFramebuffer};
 
 use base::{AsRawDescriptor, Event, RawDescriptor};
 use data_model::VolatileSlice;
+
+type SurfaceId = NonZeroU32;
 
 #[allow(dead_code, unused_variables)]
 struct Buffer {
@@ -36,13 +38,21 @@ impl Buffer {
     }
 }
 
-struct StubSurface {
+struct Surface {
     width: u32,
     height: u32,
     buffer: Option<Buffer>,
 }
 
-impl StubSurface {
+impl Surface {
+    fn create(width: u32, height: u32) -> Surface {
+        Surface {
+            width,
+            height,
+            buffer: None,
+        }
+    }
+
     /// Gets the buffer at buffer_index, allocating it if necessary.
     fn lazily_allocate_buffer(&mut self) -> Option<&mut Buffer> {
         if self.buffer.is_none() {
@@ -60,9 +70,8 @@ impl StubSurface {
 
         self.buffer.as_mut()
     }
-}
 
-impl GpuDisplaySurface for StubSurface {
+    /// Gets the next framebuffer, allocating if necessary.
     fn framebuffer(&mut self) -> Option<GpuDisplayFramebuffer> {
         let framebuffer = self.lazily_allocate_buffer()?;
         let framebuffer_stride = framebuffer.stride() as u32;
@@ -73,43 +82,145 @@ impl GpuDisplaySurface for StubSurface {
             framebuffer_bytes_per_pixel,
         ))
     }
+
+    fn flip(&mut self) {}
 }
 
-impl Drop for StubSurface {
+impl Drop for Surface {
     fn drop(&mut self) {}
+}
+
+struct SurfacesHelper {
+    next_surface_id: SurfaceId,
+    surfaces: BTreeMap<SurfaceId, Surface>,
+}
+
+impl SurfacesHelper {
+    fn new() -> SurfacesHelper {
+        SurfacesHelper {
+            next_surface_id: SurfaceId::new(1).unwrap(),
+            surfaces: Default::default(),
+        }
+    }
+
+    fn create_surface(&mut self, width: u32, height: u32) -> u32 {
+        let new_surface = Surface::create(width, height);
+        let new_surface_id = self.next_surface_id;
+
+        self.surfaces.insert(new_surface_id, new_surface);
+        self.next_surface_id = SurfaceId::new(self.next_surface_id.get() + 1).unwrap();
+
+        new_surface_id.get()
+    }
+
+    fn get_surface(&mut self, surface_id: u32) -> Option<&mut Surface> {
+        SurfaceId::new(surface_id).and_then(move |id| self.surfaces.get_mut(&id))
+    }
+
+    fn destroy_surface(&mut self, surface_id: u32) {
+        SurfaceId::new(surface_id).and_then(|id| self.surfaces.remove(&id));
+    }
+
+    fn flip_surface(&mut self, surface_id: u32) {
+        if let Some(surface) = self.get_surface(surface_id) {
+            surface.flip();
+        }
+    }
 }
 
 pub struct DisplayStub {
     /// This event is never triggered and is used solely to fulfill AsRawDescriptor.
     event: Event,
+    surfaces: SurfacesHelper,
 }
 
 impl DisplayStub {
-    pub fn new() -> GpuDisplayResult<DisplayStub> {
+    pub fn new() -> Result<DisplayStub, GpuDisplayError> {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
 
-        Ok(DisplayStub { event })
+        Ok(DisplayStub {
+            event,
+            surfaces: SurfacesHelper::new(),
+        })
     }
 }
 
 impl DisplayT for DisplayStub {
+    fn dispatch_events(&mut self) {}
+
     fn create_surface(
         &mut self,
         parent_surface_id: Option<u32>,
-        _surface_id: u32,
         width: u32,
         height: u32,
-        _surf_type: SurfaceType,
-    ) -> GpuDisplayResult<Box<dyn GpuDisplaySurface>> {
+    ) -> Result<u32, GpuDisplayError> {
         if parent_surface_id.is_some() {
             return Err(GpuDisplayError::Unsupported);
         }
+        Ok(self.surfaces.create_surface(width, height))
+    }
 
-        Ok(Box::new(StubSurface {
-            width,
-            height,
-            buffer: None,
-        }))
+    fn release_surface(&mut self, surface_id: u32) {
+        self.surfaces.destroy_surface(surface_id);
+    }
+
+    fn framebuffer(&mut self, surface_id: u32) -> Option<GpuDisplayFramebuffer> {
+        self.surfaces
+            .get_surface(surface_id)
+            .and_then(|s| s.framebuffer())
+    }
+
+    fn next_buffer_in_use(&self, _surface_id: u32) -> bool {
+        false
+    }
+
+    fn flip(&mut self, surface_id: u32) {
+        self.surfaces.flip_surface(surface_id);
+    }
+
+    fn close_requested(&self, _surface_id: u32) -> bool {
+        false
+    }
+
+    fn import_dmabuf(
+        &mut self,
+        _fd: RawDescriptor,
+        _offset: u32,
+        _stride: u32,
+        _modifiers: u64,
+        _width: u32,
+        _height: u32,
+        _fourcc: u32,
+    ) -> Result<u32, GpuDisplayError> {
+        Err(GpuDisplayError::Unsupported)
+    }
+
+    fn release_import(&mut self, _import_id: u32) {
+        // unsupported
+    }
+
+    fn commit(&mut self, _surface_id: u32) {
+        // unsupported
+    }
+
+    fn flip_to(&mut self, _surface_id: u32, _import_id: u32) {
+        // unsupported
+    }
+
+    fn set_position(&mut self, _surface_id: u32, _x: u32, _y: u32) {
+        // unsupported
+    }
+
+    fn import_event_device(&mut self, _event_device: EventDevice) -> Result<u32, GpuDisplayError> {
+        Err(GpuDisplayError::Unsupported)
+    }
+
+    fn release_event_device(&mut self, _event_device_id: u32) {
+        // unsupported
+    }
+
+    fn attach_event_device(&mut self, _surface_id: u32, _event_device_id: u32) {
+        // unsupported
     }
 }
 

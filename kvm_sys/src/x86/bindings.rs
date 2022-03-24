@@ -11,6 +11,8 @@
  * $ bindgen --with-derive-default -o bindings.rs include/linux/kvm.h -- -Iinclude
  */
 
+#![allow(warnings)]
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct __BindgenBitfieldUnit<Storage, Align>
@@ -397,7 +399,8 @@ pub const KVM_VM_MIPS_AUTO: u32 = 0;
 pub const KVM_VM_MIPS_VZ: u32 = 1;
 pub const KVM_VM_MIPS_TE: u32 = 2;
 pub const KVM_S390_SIE_PAGE_OFFSET: u32 = 1;
-pub const KVM_VM_TYPE_ARM_IPA_SIZE_MASK: u32 = 255;
+pub const KVM_VM_TYPE_ARM_IPA_SIZE_MASK: u32 = 0xff;
+pub const KVM_VM_TYPE_ARM_PROTECTED: u32 = 0x80000000;
 pub const KVM_CAP_IRQCHIP: u32 = 0;
 pub const KVM_CAP_HLT: u32 = 1;
 pub const KVM_CAP_MMU_SHADOW_CACHE_CONTROL: u32 = 2;
@@ -568,9 +571,11 @@ pub const KVM_CAP_ARM_PTRAUTH_GENERIC: u32 = 172;
 pub const KVM_CAP_PMU_EVENT_FILTER: u32 = 173;
 pub const KVM_CAP_ARM_IRQ_LINE_LAYOUT_2: u32 = 174;
 pub const KVM_CAP_HYPERV_DIRECT_TLBFLUSH: u32 = 175;
+// TODO(tjeznach): Remove this when reporting KVM_IOAPIC_NUM_PINS is no longer required.
+pub const KVM_CAP_IOAPIC_NUM_PINS: u32 = 8191;
 // TODO(qwandor): Update this once the pKVM patches are merged upstream with a stable capability ID.
 pub const KVM_CAP_ARM_PROTECTED_VM: u32 = 0xffbadab1;
-pub const KVM_CAP_ARM_PROTECTED_VM_FLAGS_ENABLE: u32 = 0;
+pub const KVM_CAP_ARM_PROTECTED_VM_FLAGS_SET_FW_IPA: u32 = 0;
 pub const KVM_CAP_ARM_PROTECTED_VM_FLAGS_INFO: u32 = 1;
 pub const KVM_IRQ_ROUTING_IRQCHIP: u32 = 1;
 pub const KVM_IRQ_ROUTING_MSI: u32 = 2;

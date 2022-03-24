@@ -6,10 +6,12 @@ use std::convert::{TryFrom, TryInto};
 use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base::{error, Event, PollToken, SafeDescriptor, Tube, WaitContext};
 use fuse::filesystem::{FileSystem, ZeroCopyReader, ZeroCopyWriter};
+use sync::Mutex;
+use sys_util::syscall;
 use vm_control::{FsMappingRequest, VmResponse};
 use vm_memory::GuestMemory;
 
@@ -19,6 +21,8 @@ use crate::virtio::{Interrupt, Queue, Reader, SignalableInterrupt, Writer};
 impl fuse::Reader for Reader {}
 
 impl fuse::Writer for Writer {
+    type ClosureWriter = Self;
+
     fn write_at<F>(&mut self, offset: usize, f: F) -> io::Result<usize>
     where
         F: Fn(&mut Self) -> io::Result<usize>,
@@ -55,10 +59,7 @@ impl Mapper {
     }
 
     fn process_request(&self, request: &FsMappingRequest) -> io::Result<()> {
-        let tube = self.tube.lock().map_err(|e| {
-            error!("failed to lock tube: {}", e);
-            io::Error::from_raw_os_error(libc::EINVAL)
-        })?;
+        let tube = self.tube.lock();
 
         tube.send(request).map_err(|e| {
             error!("failed to send request {:?}: {}", request, e);
@@ -133,6 +134,30 @@ pub struct Worker<F: FileSystem + Sync> {
     slot: u32,
 }
 
+pub fn process_fs_queue<I: SignalableInterrupt, F: FileSystem + Sync>(
+    mem: &GuestMemory,
+    interrupt: &I,
+    queue: &mut Queue,
+    server: &Arc<fuse::Server<F>>,
+    tube: &Arc<Mutex<Tube>>,
+    slot: u32,
+) -> Result<()> {
+    let mapper = Mapper::new(Arc::clone(tube), slot);
+    while let Some(avail_desc) = queue.pop(mem) {
+        let reader =
+            Reader::new(mem.clone(), avail_desc.clone()).map_err(Error::InvalidDescriptorChain)?;
+        let writer =
+            Writer::new(mem.clone(), avail_desc.clone()).map_err(Error::InvalidDescriptorChain)?;
+
+        let total = server.handle_message(reader, writer, &mapper)?;
+
+        queue.add_used(mem, avail_desc.index, total as u32);
+        queue.trigger_interrupt(mem, &*interrupt);
+    }
+
+    Ok(())
+}
+
 impl<F: FileSystem + Sync> Worker<F> {
     pub fn new(
         mem: GuestMemory,
@@ -152,31 +177,6 @@ impl<F: FileSystem + Sync> Worker<F> {
         }
     }
 
-    fn process_queue(&mut self) -> Result<()> {
-        let mut needs_interrupt = false;
-
-        let mapper = Mapper::new(Arc::clone(&self.tube), self.slot);
-        while let Some(avail_desc) = self.queue.pop(&self.mem) {
-            let reader = Reader::new(self.mem.clone(), avail_desc.clone())
-                .map_err(Error::InvalidDescriptorChain)?;
-            let writer = Writer::new(self.mem.clone(), avail_desc.clone())
-                .map_err(Error::InvalidDescriptorChain)?;
-
-            let total = self.server.handle_message(reader, writer, &mapper)?;
-
-            self.queue
-                .add_used(&self.mem, avail_desc.index, total as u32);
-
-            needs_interrupt = true;
-        }
-
-        if needs_interrupt {
-            self.irq.signal_used_queue(self.queue.vector);
-        }
-
-        Ok(())
-    }
-
     pub fn run(
         &mut self,
         queue_evt: Event,
@@ -189,18 +189,19 @@ impl<F: FileSystem + Sync> Worker<F> {
         const SECBIT_NO_SETUID_FIXUP: i32 = 1 << 2;
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let mut securebits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS) };
-        if securebits < 0 {
-            return Err(Error::GetSecurebits(io::Error::last_os_error()));
-        }
+        let mut securebits = syscall!(unsafe { libc::prctl(libc::PR_GET_SECUREBITS) })
+            .map_err(Error::GetSecurebits)?;
 
         securebits |= SECBIT_NO_SETUID_FIXUP;
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let ret = unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits) };
-        if ret < 0 {
-            return Err(Error::SetSecurebits(io::Error::last_os_error()));
-        }
+        syscall!(unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits) })
+            .map_err(Error::SetSecurebits)?;
+
+        // To avoid extra locking, unshare filesystem attributes from parent. This includes the
+        // current working directory and umask.
+        // Safe because this doesn't modify any memory and we check the return value.
+        syscall!(unsafe { libc::unshare(libc::CLONE_FS) }).map_err(Error::UnshareFromParent)?;
 
         #[derive(PollToken)]
         enum Token {
@@ -230,7 +231,14 @@ impl<F: FileSystem + Sync> Worker<F> {
                 match event.token {
                     Token::QueueReady => {
                         queue_evt.read().map_err(Error::ReadQueueEvent)?;
-                        if let Err(e) = self.process_queue() {
+                        if let Err(e) = process_fs_queue(
+                            &self.mem,
+                            &*self.irq,
+                            &mut self.queue,
+                            &self.server,
+                            &self.tube,
+                            self.slot,
+                        ) {
                             error!("virtio-fs transport error: {}", e);
                             return Err(e);
                         }

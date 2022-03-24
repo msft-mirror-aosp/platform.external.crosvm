@@ -20,32 +20,30 @@ use base::{
     ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val, volatile_impl, AsRawDescriptor,
     FromRawDescriptor, IoctlNr, RawDescriptor,
 };
+use cros_async::IntoAsync;
+use remain::sorted;
+use thiserror::Error as ThisError;
 
-#[derive(Debug)]
+#[sorted]
+#[derive(ThisError, Debug)]
 pub enum Error {
+    /// Unable to clone tap interface.
+    #[error("failed to clone tap interface: {0}")]
+    CloneTap(SysError),
     /// Failed to create a socket.
+    #[error("failed to create a socket: {0}")]
     CreateSocket(SysError),
-    /// Couldn't open /dev/net/tun.
-    OpenTun(SysError),
     /// Unable to create tap interface.
+    #[error("failed to create tap interface: {0}")]
     CreateTap(SysError),
     /// ioctl failed.
+    #[error("ioctl failed: {0}")]
     IoctlError(SysError),
+    /// Couldn't open /dev/net/tun.
+    #[error("failed to open /dev/net/tun: {0}")]
+    OpenTun(SysError),
 }
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            CreateSocket(e) => write!(f, "failed to create a socket: {}", e),
-            OpenTun(e) => write!(f, "failed to open /dev/net/tun: {}", e),
-            CreateTap(e) => write!(f, "failed to create tap interface: {}", e),
-            IoctlError(e) => write!(f, "ioctl failed: {}", e),
-        }
-    }
-}
 
 impl Error {
     pub fn sys_error(&self) -> SysError {
@@ -53,6 +51,7 @@ impl Error {
             Error::CreateSocket(e) => e,
             Error::OpenTun(e) => e,
             Error::CreateTap(e) => e,
+            Error::CloneTap(e) => e,
             Error::IoctlError(e) => e,
         }
     }
@@ -93,23 +92,15 @@ fn create_socket() -> Result<net::UdpSocket> {
     Ok(unsafe { net::UdpSocket::from_raw_fd(sock) })
 }
 
-#[derive(Debug)]
+#[sorted]
+#[derive(ThisError, Debug)]
 pub enum MacAddressError {
     /// Invalid number of octets.
+    #[error("invalid number of octets: {0}")]
     InvalidNumOctets(usize),
     /// Failed to parse octet.
+    #[error("failed to parse octet: {0}")]
     ParseOctet(ParseIntError),
-}
-
-impl Display for MacAddressError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::MacAddressError::*;
-
-        match self {
-            InvalidNumOctets(n) => write!(f, "invalid number of octets: {}", n),
-            ParseOctet(e) => write!(f, "failed to parse octet: {}", e),
-        }
-    }
 }
 
 /// An Ethernet mac address. This struct is compatible with the C `struct sockaddr`.
@@ -192,7 +183,7 @@ impl Tap {
         })
     }
 
-    fn create_tap_with_ifreq(ifreq: &mut net_sys::ifreq) -> Result<Tap> {
+    pub fn create_tap_with_ifreq(ifreq: &mut net_sys::ifreq) -> Result<Tap> {
         // Open calls are safe because we give a constant nul-terminated
         // string and verify the result.
         let fd = unsafe {
@@ -227,14 +218,39 @@ impl Tap {
             if_flags: unsafe { ifreq.ifr_ifru.ifru_flags },
         })
     }
+
+    pub fn try_clone(&self) -> Result<Tap> {
+        self.tap_file
+            .try_clone()
+            .map(|tap_file| Tap {
+                tap_file,
+                if_name: self.if_name,
+                if_flags: self.if_flags,
+            })
+            .map_err(SysError::from)
+            .map_err(Error::CloneTap)
+    }
 }
 
 pub trait TapT: FileReadWriteVolatile + Read + Write + AsRawDescriptor + Send + Sized {
-    /// Create a new tap interface. Set the `vnet_hdr` flag to true to allow offloading on this tap,
+    /// Create a new tap interface named `name`, or open it if it already exists with the same
+    /// parameters.
+    ///
+    /// Set the `vnet_hdr` flag to true to allow offloading on this tap, which will add an extra 12
+    /// byte virtio net header to incoming frames. Offloading cannot be used if `vnet_hdr` is false.
+    /// Set 'multi_vq' to true, if tap have multi virt queue pairs
+    fn new_with_name(name: &[u8], vnet_hdr: bool, multi_vq: bool) -> Result<Self>;
+
+    /// Create a new tap interface.
+    ///
+    /// Set the `vnet_hdr` flag to true to allow offloading on this tap,
     /// which will add an extra 12 byte virtio net header to incoming frames. Offloading cannot
     /// be used if `vnet_hdr` is false.
-    /// set 'multi_vq' to ture, if tap have multi virt queue pairs
-    fn new(vnet_hdr: bool, multi_vq: bool) -> Result<Self>;
+    /// Set 'multi_vq' to true, if tap have multi virt queue pairs
+    fn new(vnet_hdr: bool, multi_vq: bool) -> Result<Self> {
+        const TUNTAP_DEV_FORMAT: &[u8] = b"vmtap%d";
+        Self::new_with_name(TUNTAP_DEV_FORMAT, vnet_hdr, multi_vq)
+    }
 
     /// Change the origin tap into multiqueue taps, this means create other taps based on the
     /// origin tap.
@@ -251,6 +267,12 @@ pub trait TapT: FileReadWriteVolatile + Read + Write + AsRawDescriptor + Send + 
 
     /// Set the netmask for the subnet that the tap interface will exist on.
     fn set_netmask(&self, netmask: net::Ipv4Addr) -> Result<()>;
+
+    /// Get the MTU for the tap interface.
+    fn mtu(&self) -> Result<u16>;
+
+    /// Set the MTU for the tap interface.
+    fn set_mtu(&self, mtu: u16) -> Result<()>;
 
     /// Get the mac address for the tap interface.
     fn mac_address(&self) -> Result<MacAddress>;
@@ -274,17 +296,18 @@ pub trait TapT: FileReadWriteVolatile + Read + Write + AsRawDescriptor + Send + 
 }
 
 impl TapT for Tap {
-    fn new(vnet_hdr: bool, multi_vq: bool) -> Result<Tap> {
-        const TUNTAP_DEV_FORMAT: &[u8; 8usize] = b"vmtap%d\0";
-
+    fn new_with_name(name: &[u8], vnet_hdr: bool, multi_vq: bool) -> Result<Tap> {
         // This is pretty messy because of the unions used by ifreq. Since we
         // don't call as_mut on the same union field more than once, this block
         // is safe.
         let mut ifreq: net_sys::ifreq = Default::default();
         unsafe {
             let ifrn_name = ifreq.ifr_ifrn.ifrn_name.as_mut();
-            let name_slice = &mut ifrn_name[..TUNTAP_DEV_FORMAT.len()];
-            for (dst, src) in name_slice.iter_mut().zip(TUNTAP_DEV_FORMAT.iter()) {
+            for (dst, src) in ifrn_name
+                .iter_mut()
+                // Add a zero terminator to the source string.
+                .zip(name.iter().chain(std::iter::once(&0)))
+            {
                 *dst = *src as c_char;
             }
             ifreq.ifr_ifru.ifru_flags = (net_sys::IFF_TAP
@@ -388,6 +411,38 @@ impl TapT for Tap {
         // ioctl is safe. Called with a valid sock fd, and we check the return.
         let ret =
             unsafe { ioctl_with_ref(&sock, net_sys::sockios::SIOCSIFNETMASK as IoctlNr, &ifreq) };
+        if ret < 0 {
+            return Err(Error::IoctlError(SysError::last()));
+        }
+
+        Ok(())
+    }
+
+    fn mtu(&self) -> Result<u16> {
+        let sock = create_socket()?;
+        let mut ifreq = self.get_ifreq();
+
+        // ioctl is safe. Called with a valid sock fd, and we check the return.
+        let ret = unsafe {
+            ioctl_with_mut_ref(&sock, net_sys::sockios::SIOCGIFMTU as IoctlNr, &mut ifreq)
+        };
+        if ret < 0 {
+            return Err(Error::IoctlError(SysError::last()));
+        }
+
+        // We only access one field of the ifru union, hence this is safe.
+        let mtu = unsafe { ifreq.ifr_ifru.ifru_mtu } as u16;
+        Ok(mtu)
+    }
+
+    fn set_mtu(&self, mtu: u16) -> Result<()> {
+        let sock = create_socket()?;
+
+        let mut ifreq = self.get_ifreq();
+        ifreq.ifr_ifru.ifru_mtu = i32::from(mtu);
+
+        // ioctl is safe. Called with a valid sock fd, and we check the return.
+        let ret = unsafe { ioctl_with_ref(&sock, net_sys::sockios::SIOCSIFMTU as IoctlNr, &ifreq) };
         if ret < 0 {
             return Err(Error::IoctlError(SysError::last()));
         }
@@ -507,7 +562,7 @@ impl Read for Tap {
 
 impl Write for Tap {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.tap_file.write(&buf)
+        self.tap_file.write(buf)
     }
 
     fn flush(&mut self) -> IoResult<()> {
@@ -527,6 +582,8 @@ impl AsRawDescriptor for Tap {
     }
 }
 
+impl IntoAsync for Tap {}
+
 volatile_impl!(Tap);
 
 pub mod fakes {
@@ -541,7 +598,7 @@ pub mod fakes {
     }
 
     impl TapT for FakeTap {
-        fn new(_: bool, _: bool) -> Result<FakeTap> {
+        fn new_with_name(_: &[u8], _: bool, _: bool) -> Result<FakeTap> {
             Ok(FakeTap {
                 tap_file: OpenOptions::new()
                     .read(true)
@@ -569,6 +626,14 @@ pub mod fakes {
         }
 
         fn set_netmask(&self, _: net::Ipv4Addr) -> Result<()> {
+            Ok(())
+        }
+
+        fn mtu(&self) -> Result<u16> {
+            Ok(1500)
+        }
+
+        fn set_mtu(&self, _: u16) -> Result<()> {
             Ok(())
         }
 

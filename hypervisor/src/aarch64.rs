@@ -19,9 +19,11 @@ pub trait VmAArch64: Vm {
     /// Gets the `Hypervisor` that created this VM.
     fn get_hypervisor(&self) -> &dyn Hypervisor;
 
-    /// Enables protected mode for the VM, creating a memslot for the firmware as needed.
-    /// Only works on VMs that support `VmCap::Protected`.
-    fn enable_protected_vm(&mut self, fw_addr: GuestAddress, fw_max_size: u64) -> Result<()>;
+    /// Load pVM firmware for the VM, creating a memslot for it as needed.
+    ///
+    /// Only works on protected VMs (i.e. those  that support `VmCap::Protected`).
+    fn load_protected_vm_firmware(&mut self, fw_addr: GuestAddress, fw_max_size: u64)
+        -> Result<()>;
 
     /// Create a Vcpu with the specified Vcpu ID.
     fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuAArch64>>;
@@ -37,6 +39,13 @@ pub trait VcpuAArch64: Vcpu {
     /// Initializes the ARM Performance Monitor Unit v3 on this VCPU, with overflow interrupt number
     /// `irq`.
     fn init_pmu(&self, irq: u64) -> Result<()>;
+
+    /// Checks if ARM ParaVirtualized Time is supported on this VCPU
+    fn has_pvtime_support(&self) -> bool;
+
+    /// Initializes the ARM ParaVirtualized Time on this VCPU, with base address of the stolen time
+    /// structure as `pvtime_ipa`.
+    fn init_pvtime(&self, pvtime_ipa: u64) -> Result<()>;
 
     /// Sets the value of a register on this VCPU.  `reg_id` is the register ID, as specified in the
     /// KVM API documentation for KVM_SET_ONE_REG.

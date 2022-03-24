@@ -42,6 +42,7 @@ pub use ioapic::*;
 
 pub type IrqEventIndex = usize;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 struct IrqEvent {
     event: Event,
     gsi: u32,
@@ -127,8 +128,8 @@ pub trait IrqChip: Send {
     fn finalize_devices(
         &mut self,
         resources: &mut SystemAllocator,
-        io_bus: &mut Bus,
-        mmio_bus: &mut Bus,
+        io_bus: &Bus,
+        mmio_bus: &Bus,
     ) -> Result<()>;
 
     /// Process any irqs events that were delayed because of any locking issues.

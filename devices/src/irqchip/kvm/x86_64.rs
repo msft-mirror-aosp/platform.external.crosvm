@@ -13,7 +13,7 @@ use base::FakeClock as Clock;
 use hypervisor::kvm::{KvmVcpu, KvmVm};
 use hypervisor::{
     HypervisorCap, IoapicState, IrqRoute, IrqSource, IrqSourceChip, LapicState, MPState, PicSelect,
-    PicState, PitState, Vcpu, VcpuX86_64, Vm, VmX86_64, NUM_IOAPIC_PINS,
+    PicState, PitState, Vcpu, VcpuX86_64, Vm, VmX86_64,
 };
 use kvm_sys::*;
 use resources::SystemAllocator;
@@ -63,11 +63,12 @@ impl KvmKernelIrqChip {
     pub fn new(vm: KvmVm, num_vcpus: usize) -> Result<KvmKernelIrqChip> {
         vm.create_irq_chip()?;
         vm.create_pit()?;
+        let ioapic_pins = vm.get_ioapic_num_pins()?;
 
         Ok(KvmKernelIrqChip {
             vm,
             vcpus: Arc::new(Mutex::new((0..num_vcpus).map(|_| None).collect())),
-            routes: Arc::new(Mutex::new(kvm_default_irq_routing_table(NUM_IOAPIC_PINS))),
+            routes: Arc::new(Mutex::new(kvm_default_irq_routing_table(ioapic_pins))),
         })
     }
     /// Attempt to create a shallow clone of this x86_64 KvmKernelIrqChip instance.
@@ -81,6 +82,18 @@ impl KvmKernelIrqChip {
 }
 
 impl IrqChipX86_64 for KvmKernelIrqChip {
+    fn try_box_clone(&self) -> Result<Box<dyn IrqChipX86_64>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+
+    fn as_irq_chip(&self) -> &dyn IrqChip {
+        self
+    }
+
+    fn as_irq_chip_mut(&mut self) -> &mut dyn IrqChip {
+        self
+    }
+
     /// Get the current state of the PIC
     fn get_pic_state(&self, select: PicSelect) -> Result<PicState> {
         Ok(PicState::from(&self.vm.get_pic_state(select)?))
@@ -180,7 +193,7 @@ impl KvmSplitIrqChip {
         irq_tube: Tube,
         ioapic_pins: Option<usize>,
     ) -> Result<Self> {
-        let ioapic_pins = ioapic_pins.unwrap_or(hypervisor::NUM_IOAPIC_PINS);
+        let ioapic_pins = ioapic_pins.unwrap_or(vm.get_ioapic_num_pins()?);
         vm.enable_split_irqchip(ioapic_pins)?;
         let pit_evt = Event::new()?;
         let pit = Arc::new(Mutex::new(
@@ -430,19 +443,15 @@ impl IrqChip for KvmSplitIrqChip {
                 match chip {
                     IrqSourceChip::PicPrimary | IrqSourceChip::PicSecondary => {
                         let mut pic = self.pic.lock();
-                        if evt.resample_event.is_some() {
-                            pic.service_irq(pin as u8, true);
-                        } else {
-                            pic.service_irq(pin as u8, true);
+                        pic.service_irq(pin as u8, true);
+                        if evt.resample_event.is_none() {
                             pic.service_irq(pin as u8, false);
                         }
                     }
                     IrqSourceChip::Ioapic => {
                         if let Ok(mut ioapic) = self.ioapic.try_lock() {
-                            if evt.resample_event.is_some() {
-                                ioapic.service_irq(pin as usize, true);
-                            } else {
-                                ioapic.service_irq(pin as usize, true);
+                            ioapic.service_irq(pin as usize, true);
+                            if evt.resample_event.is_none() {
                                 ioapic.service_irq(pin as usize, false);
                             }
                         } else {
@@ -540,8 +549,8 @@ impl IrqChip for KvmSplitIrqChip {
     fn finalize_devices(
         &mut self,
         resources: &mut SystemAllocator,
-        io_bus: &mut Bus,
-        mmio_bus: &mut Bus,
+        io_bus: &Bus,
+        mmio_bus: &Bus,
     ) -> Result<()> {
         // Insert pit into io_bus
         io_bus.insert(self.pit.clone(), 0x040, 0x8).unwrap();
@@ -568,15 +577,13 @@ impl IrqChip for KvmSplitIrqChip {
         let mut pic_resample_events: Vec<Vec<Event>> =
             (0..self.ioapic_pins).map(|_| Vec::new()).collect();
 
-        for evt in self.irq_events.lock().iter() {
-            if let Some(evt) = evt {
-                if (evt.gsi as usize) >= self.ioapic_pins {
-                    continue;
-                }
-                if let Some(resample_evt) = &evt.resample_event {
-                    ioapic_resample_events[evt.gsi as usize].push(resample_evt.try_clone()?);
-                    pic_resample_events[evt.gsi as usize].push(resample_evt.try_clone()?);
-                }
+        for evt in self.irq_events.lock().iter().flatten() {
+            if (evt.gsi as usize) >= self.ioapic_pins {
+                continue;
+            }
+            if let Some(resample_evt) = &evt.resample_event {
+                ioapic_resample_events[evt.gsi as usize].push(resample_evt.try_clone()?);
+                pic_resample_events[evt.gsi as usize].push(resample_evt.try_clone()?);
             }
         }
 
@@ -611,10 +618,8 @@ impl IrqChip for KvmSplitIrqChip {
             .retain(|&event_index| {
                 if let Some(evt) = &self.irq_events.lock()[event_index] {
                     if let Ok(mut ioapic) = self.ioapic.try_lock() {
-                        if evt.resample_event.is_some() {
-                            ioapic.service_irq(evt.gsi as usize, true);
-                        } else {
-                            ioapic.service_irq(evt.gsi as usize, true);
+                        ioapic.service_irq(evt.gsi as usize, true);
+                        if evt.resample_event.is_none() {
                             ioapic.service_irq(evt.gsi as usize, false);
                         }
 
@@ -635,13 +640,25 @@ impl IrqChip for KvmSplitIrqChip {
             IrqChipCap::TscDeadlineTimer => self
                 .vm
                 .get_hypervisor()
-                .check_capability(&HypervisorCap::TscDeadlineTimer),
+                .check_capability(HypervisorCap::TscDeadlineTimer),
             IrqChipCap::X2Apic => true,
         }
     }
 }
 
 impl IrqChipX86_64 for KvmSplitIrqChip {
+    fn try_box_clone(&self) -> Result<Box<dyn IrqChipX86_64>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+
+    fn as_irq_chip(&self) -> &dyn IrqChip {
+        self
+    }
+
+    fn as_irq_chip_mut(&mut self) -> &mut dyn IrqChip {
+        self
+    }
+
     /// Get the current state of the PIC
     fn get_pic_state(&self, select: PicSelect) -> Result<PicState> {
         Ok(self.pic.lock().get_pic_state(select))
@@ -703,19 +720,21 @@ mod tests {
 
     use super::*;
     use base::EventReadResult;
-    use hypervisor::kvm::Kvm;
+    use hypervisor::{
+        kvm::Kvm, IoapicRedirectionTableEntry, PitRWMode, ProtectionType, TriggerMode, Vm, VmX86_64,
+    };
+    use resources::{MemRegion, SystemAllocator, SystemAllocatorConfig};
     use vm_memory::GuestMemory;
 
-    use hypervisor::{IoapicRedirectionTableEntry, PitRWMode, TriggerMode, Vm, VmX86_64};
-
-    use super::super::super::tests::*;
+    use crate::irqchip::tests::*;
     use crate::IrqChip;
 
     /// Helper function for setting up a KvmKernelIrqChip
     fn get_kernel_chip() -> KvmKernelIrqChip {
         let kvm = Kvm::new().expect("failed to instantiate Kvm");
         let mem = GuestMemory::new(&[]).unwrap();
-        let vm = KvmVm::new(&kvm, mem).expect("failed tso instantiate vm");
+        let vm =
+            KvmVm::new(&kvm, mem, ProtectionType::Unprotected).expect("failed tso instantiate vm");
 
         let mut chip = KvmKernelIrqChip::new(vm.try_clone().expect("failed to clone vm"), 1)
             .expect("failed to instantiate KvmKernelIrqChip");
@@ -731,7 +750,8 @@ mod tests {
     fn get_split_chip() -> KvmSplitIrqChip {
         let kvm = Kvm::new().expect("failed to instantiate Kvm");
         let mem = GuestMemory::new(&[]).unwrap();
-        let vm = KvmVm::new(&kvm, mem).expect("failed tso instantiate vm");
+        let vm =
+            KvmVm::new(&kvm, mem, ProtectionType::Unprotected).expect("failed tso instantiate vm");
 
         let (_, device_tube) = Tube::pair().expect("failed to create irq tube");
 
@@ -882,14 +902,25 @@ mod tests {
     fn finalize_devices() {
         let mut chip = get_split_chip();
 
-        let mut mmio_bus = Bus::new();
-        let mut io_bus = Bus::new();
-        let mut resources = SystemAllocator::builder()
-            .add_io_addresses(0xc000, 0x10000)
-            .add_low_mmio_addresses(0, 2048)
-            .add_high_mmio_addresses(2048, 4096)
-            .create_allocator(5)
-            .expect("failed to create SystemAllocator");
+        let mmio_bus = Bus::new();
+        let io_bus = Bus::new();
+        let mut resources = SystemAllocator::new(SystemAllocatorConfig {
+            io: Some(MemRegion {
+                base: 0xc000,
+                size: 0x1_0000,
+            }),
+            low_mmio: MemRegion {
+                base: 0,
+                size: 2048,
+            },
+            high_mmio: MemRegion {
+                base: 2048,
+                size: 4096,
+            },
+            platform_mmio: None,
+            first_irq: 5,
+        })
+        .expect("failed to create SystemAllocator");
 
         // setup an event and a resample event for irq line 1
         let evt = Event::new().expect("failed to create event");
@@ -901,7 +932,7 @@ mod tests {
             .expect("register_irq_event should not return None");
 
         // Once we finalize devices, the pic/pit/ioapic should be attached to io and mmio busses
-        chip.finalize_devices(&mut resources, &mut io_bus, &mut mmio_bus)
+        chip.finalize_devices(&mut resources, &io_bus, &mmio_bus)
             .expect("failed to finalize devices");
 
         // Should not be able to allocate an irq < 24 now
@@ -1000,14 +1031,25 @@ mod tests {
     fn broadcast_eoi() {
         let mut chip = get_split_chip();
 
-        let mut mmio_bus = Bus::new();
-        let mut io_bus = Bus::new();
-        let mut resources = SystemAllocator::builder()
-            .add_io_addresses(0xc000, 0x10000)
-            .add_low_mmio_addresses(0, 2048)
-            .add_high_mmio_addresses(2048, 4096)
-            .create_allocator(5)
-            .expect("failed to create SystemAllocator");
+        let mmio_bus = Bus::new();
+        let io_bus = Bus::new();
+        let mut resources = SystemAllocator::new(SystemAllocatorConfig {
+            io: Some(MemRegion {
+                base: 0xc000,
+                size: 0x1_0000,
+            }),
+            low_mmio: MemRegion {
+                base: 0,
+                size: 2048,
+            },
+            high_mmio: MemRegion {
+                base: 2048,
+                size: 4096,
+            },
+            platform_mmio: None,
+            first_irq: 5,
+        })
+        .expect("failed to create SystemAllocator");
 
         // setup an event and a resample event for irq line 1
         let evt = Event::new().expect("failed to create event");
@@ -1017,7 +1059,7 @@ mod tests {
             .expect("failed to register_irq_event");
 
         // Once we finalize devices, the pic/pit/ioapic should be attached to io and mmio busses
-        chip.finalize_devices(&mut resources, &mut io_bus, &mut mmio_bus)
+        chip.finalize_devices(&mut resources, &io_bus, &mmio_bus)
             .expect("failed to finalize devices");
 
         // setup a ioapic redirection table entry 1 with a vector of 123

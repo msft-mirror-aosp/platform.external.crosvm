@@ -5,17 +5,21 @@
 use std::collections::hash_map::{Entry, HashMap, VacantEntry};
 use std::env::set_var;
 use std::fs::File;
-use std::io::{IoSlice, Write};
+use std::io::{IoSlice, IoSliceMut, Write};
 use std::mem::transmute;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::process::Command;
+use std::result;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
 use net_util::Error as NetError;
 
-use libc::{pid_t, waitpid, EINVAL, ENODATA, ENOTTY, WEXITSTATUS, WIFEXITED, WNOHANG, WTERMSIG};
+use libc::{
+    pid_t, waitpid, EINVAL, ENODATA, ENOTTY, STDERR_FILENO, WEXITSTATUS, WIFEXITED, WNOHANG,
+    WTERMSIG,
+};
 
 use protobuf::Message;
 
@@ -142,23 +146,18 @@ impl Process {
         cmd: &Path,
         args: &[&str],
         jail: Option<Minijail>,
+        stderr: File,
     ) -> Result<Process> {
         let (request_socket, child_socket) =
-            new_seqpacket_pair().map_err(Error::CreateMainSocket)?;
+            new_seqpacket_pair().context("error creating main request socket")?;
 
         let mut vcpu_pipes: Vec<VcpuPipe> = Vec::with_capacity(cpu_count as usize);
         for _ in 0..cpu_count {
-            vcpu_pipes.push(new_pipe_pair().map_err(Error::CreateVcpuSocket)?);
+            vcpu_pipes.push(new_pipe_pair().context("error creating vcpu request socket")?);
         }
-        let mut per_vcpu_states: Vec<Arc<Mutex<PerVcpuState>>> =
-            Vec::with_capacity(cpu_count as usize);
-        // TODO(zachr): replace with `resize_default` when that stabilizes. Using a plain `resize`
-        // is incorrect because each element in the `Vec` will contain a shared reference to the
-        // same `PerVcpuState` instance. This happens because `resize` fills new slots using clones
-        // of the instance given to `resize`.
-        for _ in 0..cpu_count {
-            per_vcpu_states.push(Default::default());
-        }
+
+        let mut per_vcpu_states: Vec<Arc<Mutex<PerVcpuState>>> = Vec::new();
+        per_vcpu_states.resize_with(cpu_count as usize, Default::default);
 
         let plugin_pid = match jail {
             Some(jail) => {
@@ -166,8 +165,18 @@ impl Process {
                     "CROSVM_SOCKET",
                     child_socket.as_raw_descriptor().to_string(),
                 );
-                jail.run(cmd, &[0, 1, 2, child_socket.as_raw_descriptor()], args)
-                    .map_err(Error::PluginRunJail)?
+                jail.run_remap(
+                    cmd,
+                    &[
+                        (stderr.as_raw_descriptor(), STDERR_FILENO),
+                        (
+                            child_socket.as_raw_descriptor(),
+                            child_socket.as_raw_descriptor(),
+                        ),
+                    ],
+                    args,
+                )
+                .context("failed to run plugin jail")?
             }
             None => Command::new(cmd)
                 .args(args)
@@ -175,8 +184,9 @@ impl Process {
                     "CROSVM_SOCKET",
                     child_socket.as_raw_descriptor().to_string(),
                 )
+                .stderr(stderr)
                 .spawn()
-                .map_err(Error::PluginSpawn)?
+                .context("failed to spawn plugin")?
                 .id() as pid_t,
         };
 
@@ -187,7 +197,7 @@ impl Process {
             objects: Default::default(),
             shared_vcpu_state: Default::default(),
             per_vcpu_states,
-            kill_evt: Event::new().map_err(Error::CreateEvent)?,
+            kill_evt: Event::new().context("failed to create plugin kill event")?,
             vcpu_pipes,
             request_buffer: vec![0; MAX_DATAGRAM_SIZE],
             response_buffer: Vec::new(),
@@ -204,11 +214,11 @@ impl Process {
         let vcpu_pipe_read = self.vcpu_pipes[cpu_id as usize]
             .crosvm_read
             .try_clone()
-            .map_err(Error::CloneVcpuPipe)?;
+            .context("failed to clone vcpu read pipe")?;
         let vcpu_pipe_write = self.vcpu_pipes[cpu_id as usize]
             .crosvm_write
             .try_clone()
-            .map_err(Error::CloneVcpuPipe)?;
+            .context("failed to clone vcpu write pipe")?;
         Ok(PluginVcpu::new(
             self.shared_vcpu_state.clone(),
             self.per_vcpu_states[cpu_id as usize].clone(),
@@ -512,17 +522,17 @@ impl Process {
         vm: &mut Vm,
         vcpu_handles: &[JoinHandle<()>],
         taps: &[Tap],
-    ) -> Result<()> {
+    ) -> result::Result<(), CommError> {
         let (msg_size, request_file) = self.request_sockets[index]
-            .recv_with_fd(&mut self.request_buffer)
-            .map_err(Error::PluginSocketRecv)?;
+            .recv_with_fd(IoSliceMut::new(&mut self.request_buffer))
+            .map_err(CommError::PluginSocketRecv)?;
 
         if msg_size == 0 {
-            return Err(Error::PluginSocketHup);
+            return Err(CommError::PluginSocketHup);
         }
 
-        let request = protobuf::parse_from_bytes::<MainRequest>(&self.request_buffer[..msg_size])
-            .map_err(Error::DecodeRequest)?;
+        let request: MainRequest = Message::parse_from_bytes(&self.request_buffer[..msg_size])
+            .map_err(CommError::DecodeRequest)?;
 
         /// Use this to make it easier to stuff various kinds of File-like objects into the
         /// `boxed_fds` list.
@@ -736,11 +746,11 @@ impl Process {
         self.response_buffer.clear();
         response
             .write_to_vec(&mut self.response_buffer)
-            .map_err(Error::EncodeResponse)?;
+            .map_err(CommError::EncodeResponse)?;
         assert_ne!(self.response_buffer.len(), 0);
         self.request_sockets[index]
             .send_with_fds(&[IoSlice::new(&self.response_buffer[..])], &response_fds)
-            .map_err(Error::PluginSocketSend)?;
+            .map_err(CommError::PluginSocketSend)?;
 
         Ok(())
     }

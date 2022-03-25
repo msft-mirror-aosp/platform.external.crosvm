@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 
@@ -33,18 +34,16 @@ use crate::AARCH64_SERIAL_2_4_IRQ;
 use crate::AARCH64_SERIAL_SIZE;
 use crate::AARCH64_SERIAL_SPEED;
 
-// These are related to guest virtio devices.
-use crate::AARCH64_MMIO_BASE;
-use crate::AARCH64_MMIO_SIZE;
-use crate::AARCH64_PCI_CFG_BASE;
-use crate::AARCH64_PCI_CFG_SIZE;
-
 use crate::AARCH64_PMU_IRQ;
 
 // This is an arbitrary number to specify the node for the GIC.
 // If we had a more complex interrupt architecture, then we'd need an enum for
 // these.
 const PHANDLE_GIC: u32 = 1;
+const PHANDLE_RESTRICTED_DMA_POOL: u32 = 2;
+
+// CPUs are assigned phandles starting with this number.
+const PHANDLE_CPU0: u32 = 0x100;
 
 // These are specified by the Linux GIC bindings
 const GIC_FDT_IRQ_NUM_CELLS: u32 = 3;
@@ -67,7 +66,33 @@ fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemory) -> Result<()
     Ok(())
 }
 
-fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
+fn create_resv_memory_node(fdt: &mut FdtWriter, resv_size: Option<u64>) -> Result<Option<u32>> {
+    if let Some(resv_size) = resv_size {
+        let resv_memory_node = fdt.begin_node("reserved-memory")?;
+        fdt.property_u32("#address-cells", 0x2)?;
+        fdt.property_u32("#size-cells", 0x2)?;
+        fdt.property_null("ranges")?;
+
+        let restricted_dma_pool = fdt.begin_node("restricted_dma_reserved")?;
+        fdt.property_u32("phandle", PHANDLE_RESTRICTED_DMA_POOL)?;
+        fdt.property_string("compatible", "restricted-dma-pool")?;
+        fdt.property_u64("size", resv_size)?;
+        fdt.property_u64("alignment", base::pagesize() as u64)?;
+        fdt.end_node(restricted_dma_pool)?;
+
+        fdt.end_node(resv_memory_node)?;
+        Ok(Some(PHANDLE_RESTRICTED_DMA_POOL))
+    } else {
+        Ok(None)
+    }
+}
+
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    num_cpus: u32,
+    cpu_clusters: Vec<Vec<usize>>,
+    cpu_capacity: BTreeMap<usize, u32>,
+) -> Result<()> {
     let cpus_node = fdt.begin_node("cpus")?;
     fdt.property_u32("#address-cells", 0x1)?;
     fdt.property_u32("#size-cells", 0x0)?;
@@ -81,8 +106,29 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
             fdt.property_string("enable-method", "psci")?;
         }
         fdt.property_u32("reg", cpu_id)?;
+        fdt.property_u32("phandle", PHANDLE_CPU0 + cpu_id)?;
+
+        if let Some(capacity) = cpu_capacity.get(&(cpu_id as usize)) {
+            fdt.property_u32("capacity-dmips-mhz", *capacity)?;
+        }
+
         fdt.end_node(cpu_node)?;
     }
+
+    if !cpu_clusters.is_empty() {
+        let cpu_map_node = fdt.begin_node("cpu-map")?;
+        for (cluster_idx, cpus) in cpu_clusters.iter().enumerate() {
+            let cluster_node = fdt.begin_node(&format!("cluster{}", cluster_idx))?;
+            for (core_idx, cpu_id) in cpus.iter().enumerate() {
+                let core_node = fdt.begin_node(&format!("core{}", core_idx))?;
+                fdt.property_u32("cpu", PHANDLE_CPU0 + *cpu_id as u32)?;
+                fdt.end_node(core_node)?;
+            }
+            fdt.end_node(cluster_node)?;
+        }
+        fdt.end_node(cpu_map_node)?;
+    }
+
     fdt.end_node(cpus_node)?;
     Ok(())
 }
@@ -229,42 +275,85 @@ fn create_chosen_node(
     Ok(())
 }
 
+/// PCI host controller address range.
+///
+/// This represents a single entry in the "ranges" property for a PCI host controller.
+///
+/// See [PCI Bus Binding to Open Firmware](https://www.openfirmware.info/data/docs/bus.pci.pdf)
+/// and https://www.kernel.org/doc/Documentation/devicetree/bindings/pci/host-generic-pci.txt
+/// for more information.
+#[derive(Copy, Clone)]
+pub struct PciRange {
+    pub space: PciAddressSpace,
+    pub bus_address: u64,
+    pub cpu_physical_address: u64,
+    pub size: u64,
+    pub prefetchable: bool,
+}
+
+/// PCI address space.
+#[derive(Copy, Clone)]
+#[allow(dead_code)]
+pub enum PciAddressSpace {
+    /// PCI configuration space
+    Configuration = 0b00,
+    /// I/O space
+    Io = 0b01,
+    /// 32-bit memory space
+    Memory = 0b10,
+    /// 64-bit memory space
+    Memory64 = 0b11,
+}
+
+/// Location of memory-mapped PCI configuration space.
+#[derive(Copy, Clone)]
+pub struct PciConfigRegion {
+    /// Physical address of the base of the memory-mapped PCI configuration region.
+    pub base: u64,
+    /// Size of the PCI configuration region in bytes.
+    pub size: u64,
+}
+
 fn create_pci_nodes(
     fdt: &mut FdtWriter,
     pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
-    pci_device_base: u64,
-    pci_device_size: u64,
+    cfg: PciConfigRegion,
+    ranges: &[PciRange],
+    dma_pool_phandle: Option<u32>,
 ) -> Result<()> {
     // Add devicetree nodes describing a PCI generic host controller.
     // See Documentation/devicetree/bindings/pci/host-generic-pci.txt in the kernel
     // and "PCI Bus Binding to IEEE Std 1275-1994".
-    let ranges = [
-        // mmio addresses
-        0x3000000,                        // (ss = 11: 64-bit memory space)
-        (AARCH64_MMIO_BASE >> 32) as u32, // PCI address
-        AARCH64_MMIO_BASE as u32,
-        (AARCH64_MMIO_BASE >> 32) as u32, // CPU address
-        AARCH64_MMIO_BASE as u32,
-        (AARCH64_MMIO_SIZE >> 32) as u32, // size
-        AARCH64_MMIO_SIZE as u32,
-        // device addresses
-        0x3000000,                      // (ss = 11: 64-bit memory space)
-        (pci_device_base >> 32) as u32, // PCI address
-        pci_device_base as u32,
-        (pci_device_base >> 32) as u32, // CPU address
-        pci_device_base as u32,
-        (pci_device_size >> 32) as u32, // size
-        pci_device_size as u32,
-    ];
+    let ranges: Vec<u32> = ranges
+        .iter()
+        .map(|r| {
+            let ss = r.space as u32;
+            let p = r.prefetchable as u32;
+            [
+                // BUS_ADDRESS(3) encoded as defined in OF PCI Bus Binding
+                (ss << 24) | (p << 30),
+                (r.bus_address >> 32) as u32,
+                r.bus_address as u32,
+                // CPU_PHYSICAL(2)
+                (r.cpu_physical_address >> 32) as u32,
+                r.cpu_physical_address as u32,
+                // SIZE(2)
+                (r.size >> 32) as u32,
+                r.size as u32,
+            ]
+        })
+        .flatten()
+        .collect();
+
     let bus_range = [0, 0]; // Only bus 0
-    let reg = [AARCH64_PCI_CFG_BASE, AARCH64_PCI_CFG_SIZE];
+    let reg = [cfg.base, cfg.size];
 
     let mut interrupts: Vec<u32> = Vec::new();
     let mut masks: Vec<u32> = Vec::new();
 
     for (address, irq_num, irq_pin) in pci_irqs.iter() {
         // PCI_DEVICE(3)
-        interrupts.push(address.to_config_address(0));
+        interrupts.push(address.to_config_address(0, 8));
         interrupts.push(0);
         interrupts.push(0);
 
@@ -302,6 +391,9 @@ fn create_pci_nodes(
     fdt.property_array_u32("interrupt-map", &interrupts)?;
     fdt.property_array_u32("interrupt-map-mask", &masks)?;
     fdt.property_null("dma-coherent")?;
+    if let Some(dma_pool_phandle) = dma_pool_phandle {
+        fdt.property_u32("memory-region", dma_pool_phandle)?;
+    }
     fdt.end_node(pci_node)?;
 
     Ok(())
@@ -343,10 +435,10 @@ fn create_rtc_node(fdt: &mut FdtWriter) -> Result<()> {
 /// * `fdt_max_size` - The amount of space reserved for the device tree
 /// * `guest_mem` - The guest memory object
 /// * `pci_irqs` - List of PCI device address to PCI interrupt number and pin mappings
+/// * `pci_cfg` - Location of the memory-mapped PCI configuration space.
+/// * `pci_ranges` - Memory ranges accessible via the PCI host controller.
 /// * `num_cpus` - Number of virtual CPUs the guest will have
 /// * `fdt_load_offset` - The offset into physical memory for the device tree
-/// * `pci_device_base` - The offset into physical memory for PCI device memory
-/// * `pci_device_size` - The size of PCI device memory
 /// * `cmdline` - The kernel commandline
 /// * `initrd` - An optional tuple of initrd guest physical address and size
 /// * `android_fstab` - An optional file holding Android fstab entries
@@ -356,16 +448,19 @@ pub fn create_fdt(
     fdt_max_size: usize,
     guest_mem: &GuestMemory,
     pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
+    pci_cfg: PciConfigRegion,
+    pci_ranges: &[PciRange],
     num_cpus: u32,
+    cpu_clusters: Vec<Vec<usize>>,
+    cpu_capacity: BTreeMap<usize, u32>,
     fdt_load_offset: u64,
-    pci_device_base: u64,
-    pci_device_size: u64,
     cmdline: &str,
     initrd: Option<(GuestAddress, usize)>,
     android_fstab: Option<File>,
     is_gicv3: bool,
     use_pmu: bool,
     psci_version: PsciVersion,
+    swiotlb: Option<u64>,
 ) -> Result<()> {
     let mut fdt = FdtWriter::new(&[]);
 
@@ -380,7 +475,8 @@ pub fn create_fdt(
     }
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_memory_node(&mut fdt, guest_mem)?;
-    create_cpu_nodes(&mut fdt, num_cpus)?;
+    let dma_pool_phandle = create_resv_memory_node(&mut fdt, swiotlb)?;
+    create_cpu_nodes(&mut fdt, num_cpus, cpu_clusters, cpu_capacity)?;
     create_gic_node(&mut fdt, is_gicv3, num_cpus as u64)?;
     create_timer_node(&mut fdt, num_cpus)?;
     if use_pmu {
@@ -388,7 +484,7 @@ pub fn create_fdt(
     }
     create_serial_nodes(&mut fdt)?;
     create_psci_node(&mut fdt, &psci_version)?;
-    create_pci_nodes(&mut fdt, pci_irqs, pci_device_base, pci_device_size)?;
+    create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges, dma_pool_phandle)?;
     create_rtc_node(&mut fdt)?;
     // End giant node
     fdt.end_node(root_node)?;

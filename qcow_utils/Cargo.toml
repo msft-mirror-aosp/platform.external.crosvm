@@ -8,12 +8,7 @@ edition = "2018"
 path = "src/qcow_utils.rs"
 crate-type = ["cdylib"]
 
-[[bin]]
-name = "qcow_img"
-path = "src/qcow_img.rs"
-
 [dependencies]
-getopts = "*"
 libc = "*"
 disk = { path = "../disk" }
-base = { path = "../base" }
+base = { path = "../common/base" }

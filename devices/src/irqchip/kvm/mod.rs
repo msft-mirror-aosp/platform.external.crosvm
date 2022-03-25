@@ -156,8 +156,8 @@ impl IrqChip for KvmKernelIrqChip {
     fn finalize_devices(
         &mut self,
         _resources: &mut SystemAllocator,
-        _io_bus: &mut Bus,
-        _mmio_bus: &mut Bus,
+        _io_bus: &Bus,
+        _mmio_bus: &Bus,
     ) -> Result<()> {
         Ok(())
     }
@@ -172,7 +172,7 @@ impl IrqChip for KvmKernelIrqChip {
             IrqChipCap::TscDeadlineTimer => self
                 .vm
                 .get_hypervisor()
-                .check_capability(&HypervisorCap::TscDeadlineTimer),
+                .check_capability(HypervisorCap::TscDeadlineTimer),
             IrqChipCap::X2Apic => true,
         }
     }
@@ -180,9 +180,8 @@ impl IrqChip for KvmKernelIrqChip {
 
 #[cfg(test)]
 mod tests {
-
     use hypervisor::kvm::{Kvm, KvmVm};
-    use hypervisor::{MPState, Vm};
+    use hypervisor::{MPState, ProtectionType, Vm};
     use vm_memory::GuestMemory;
 
     use crate::irqchip::{IrqChip, KvmKernelIrqChip};
@@ -196,7 +195,8 @@ mod tests {
     fn create_kvm_kernel_irqchip() {
         let kvm = Kvm::new().expect("failed to instantiate Kvm");
         let mem = GuestMemory::new(&[]).unwrap();
-        let vm = KvmVm::new(&kvm, mem).expect("failed to instantiate vm");
+        let vm =
+            KvmVm::new(&kvm, mem, ProtectionType::Unprotected).expect("failed to instantiate vm");
 
         let mut chip = KvmKernelIrqChip::new(vm.try_clone().expect("failed to clone vm"), 1)
             .expect("failed to instantiate KvmKernelIrqChip");
@@ -210,7 +210,8 @@ mod tests {
     fn mp_state() {
         let kvm = Kvm::new().expect("failed to instantiate Kvm");
         let mem = GuestMemory::new(&[]).unwrap();
-        let vm = KvmVm::new(&kvm, mem).expect("failed to instantiate vm");
+        let vm =
+            KvmVm::new(&kvm, mem, ProtectionType::Unprotected).expect("failed to instantiate vm");
 
         let mut chip = KvmKernelIrqChip::new(vm.try_clone().expect("failed to clone vm"), 1)
             .expect("failed to instantiate KvmKernelIrqChip");

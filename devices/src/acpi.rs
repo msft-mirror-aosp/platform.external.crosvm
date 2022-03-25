@@ -37,7 +37,7 @@ pub const ACPIPM_RESOURCE_LEN: u8 = 8;
 pub const ACPIPM_RESOURCE_EVENTBLK_LEN: u8 = 4;
 pub const ACPIPM_RESOURCE_CONTROLBLK_LEN: u8 = 2;
 
-/// ACPI PM register value definations
+/// ACPI PM register value definitions
 const PM1_STATUS: u16 = 0;
 const PM1_ENABLE: u16 = 2;
 const PM1_CONTROL: u16 = 4;
@@ -103,10 +103,8 @@ impl BusDevice for ACPIPMResource {
                         if let Err(e) = self.exit_evt.write(1) {
                             error!("ACPIPM: failed to trigger exit event: {}", e);
                         }
-                    } else {
-                        if let Err(e) = self.suspend_evt.write(1) {
-                            error!("ACPIPM: failed to trigger suspend event: {}", e);
-                        }
+                    } else if let Err(e) = self.suspend_evt.write(1) {
+                        error!("ACPIPM: failed to trigger suspend event: {}", e);
                     }
                 }
                 self.pm1_control = val & !BITMASK_PM1CNT_SLEEP_ENABLE;

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #![allow(non_camel_case_types)]
 
 //! This module implements the dynamically loaded client library API used by a crosvm plugin,
@@ -17,7 +18,7 @@
 
 use std::env;
 use std::fs::File;
-use std::io::{IoSlice, Read, Write};
+use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::mem::{size_of, swap};
 use std::os::raw::{c_int, c_void};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
@@ -31,7 +32,7 @@ use std::sync::Arc;
 
 use libc::{E2BIG, EINVAL, ENOENT, ENOTCONN, EPROTO};
 
-use protobuf::{parse_from_bytes, Message, ProtobufEnum, RepeatedField};
+use protobuf::{Message, ProtobufEnum, RepeatedField};
 
 use base::ScmSocket;
 
@@ -300,7 +301,10 @@ impl crosvm {
         let mut datagram_fds = [0; MAX_DATAGRAM_FD];
         let (msg_size, fd_count) = self
             .socket
-            .recv_with_fds(&mut self.response_buffer, &mut datagram_fds)
+            .recv_with_fds(
+                IoSliceMut::new(&mut self.response_buffer),
+                &mut datagram_fds,
+            )
             .map_err(|e| -e.errno())?;
         // Safe because the first fd_count fds from recv_with_fds are owned by us and valid.
         let datagram_files = datagram_fds[..fd_count]
@@ -308,8 +312,8 @@ impl crosvm {
             .map(|&fd| unsafe { File::from_raw_fd(fd) })
             .collect();
 
-        let response: MainResponse =
-            parse_from_bytes(&self.response_buffer[..msg_size]).map_err(proto_error_to_int)?;
+        let response: MainResponse = Message::parse_from_bytes(&self.response_buffer[..msg_size])
+            .map_err(proto_error_to_int)?;
         if response.errno != 0 {
             return Err(response.errno);
         }
@@ -1070,7 +1074,7 @@ impl crosvm_vcpu {
         if bytes == 0 || total_size > self.response_length {
             return Err(EINVAL);
         }
-        let response: VcpuResponse = parse_from_bytes(
+        let response: VcpuResponse = Message::parse_from_bytes(
             &self.response_buffer[self.response_base + bytes..self.response_base + total_size],
         )
         .map_err(proto_error_to_int)?;

@@ -1,3 +1,5 @@
+cargo-features = ["named-profiles"]
+
 [package]
 name = "crosvm"
 version = "0.1.0"
@@ -20,6 +22,16 @@ required-features = [ "direct" ]
 [profile.release]
 panic = 'abort'
 overflow-checks = true
+
+# Reproduces the options used when building crosvm for Chrome OS.
+[profile.chromeos]
+inherits = "release"
+opt-level = "s"
+
+# Enables LTO to further reduce the size of the binary.
+[profile.lto]
+inherits = "chromeos"
+lto = true
 
 # We currently need to exclude some crates from the workspace to allow
 # these crates to be independently built by portage. These crates will
@@ -54,7 +66,6 @@ members = [
     "qcow_utils",
     "resources",
     "rutabaga_gfx",
-    "rutabaga_gfx/ffi",
     "tpm2",
     "tpm2-sys",
     "usb_sys",

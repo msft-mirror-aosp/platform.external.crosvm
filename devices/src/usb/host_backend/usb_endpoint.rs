@@ -4,6 +4,7 @@
 
 use std::cmp;
 use std::sync::Arc;
+use sync::Mutex;
 
 use super::error::*;
 use super::utils::{submit_transfer, update_transfer_state};
@@ -13,17 +14,18 @@ use crate::usb::xhci::xhci_transfer::{
 };
 use crate::utils::AsyncJobQueue;
 use crate::utils::FailHandle;
-use base::error;
-use sync::Mutex;
-use usb_util::{
-    Device, EndpointDirection, EndpointType, Transfer, TransferStatus, ENDPOINT_DIRECTION_OFFSET,
+use sys_util::error;
+use usb_util::device_handle::DeviceHandle;
+use usb_util::types::{EndpointDirection, EndpointType, ENDPOINT_DIRECTION_OFFSET};
+use usb_util::usb_transfer::{
+    bulk_transfer, interrupt_transfer, BulkTransferBuffer, TransferStatus, UsbTransfer,
 };
 
 /// Isochronous, Bulk or Interrupt endpoint.
 pub struct UsbEndpoint {
     fail_handle: Arc<dyn FailHandle>,
     job_queue: Arc<AsyncJobQueue>,
-    device: Arc<Mutex<Device>>,
+    device_handle: Arc<Mutex<DeviceHandle>>,
     endpoint_number: u8,
     direction: EndpointDirection,
     ty: EndpointType,
@@ -34,7 +36,7 @@ impl UsbEndpoint {
     pub fn new(
         fail_handle: Arc<dyn FailHandle>,
         job_queue: Arc<AsyncJobQueue>,
-        device: Arc<Mutex<Device>>,
+        device_handle: Arc<Mutex<DeviceHandle>>,
         endpoint_number: u8,
         direction: EndpointDirection,
         ty: EndpointType,
@@ -43,7 +45,7 @@ impl UsbEndpoint {
         UsbEndpoint {
             fail_handle,
             job_queue,
-            device,
+            device_handle,
             endpoint_number,
             direction,
             ty,
@@ -99,23 +101,13 @@ impl UsbEndpoint {
         Ok(())
     }
 
-    fn get_transfer_buffer(&self, buffer: &ScatterGatherBuffer) -> Result<Vec<u8>> {
-        let mut v = vec![0u8; buffer.len().map_err(Error::BufferLen)?];
-        if self.direction == EndpointDirection::HostToDevice {
-            // Read data from ScatterGatherBuffer to a continuous memory.
-            buffer.read(v.as_mut_slice()).map_err(Error::ReadBuffer)?;
-        }
-        Ok(v)
-    }
-
     fn handle_bulk_transfer(
         &self,
         xhci_transfer: XhciTransfer,
         buffer: ScatterGatherBuffer,
     ) -> Result<()> {
-        let transfer_buffer = self.get_transfer_buffer(&buffer)?;
         let usb_transfer =
-            Transfer::new_bulk(self.ep_addr(), transfer_buffer).map_err(Error::CreateTransfer)?;
+            bulk_transfer(self.ep_addr(), 0, buffer.len().map_err(Error::BufferLen)?);
         self.do_handle_transfer(xhci_transfer, usb_transfer, buffer)
     }
 
@@ -124,28 +116,32 @@ impl UsbEndpoint {
         xhci_transfer: XhciTransfer,
         buffer: ScatterGatherBuffer,
     ) -> Result<()> {
-        let transfer_buffer = self.get_transfer_buffer(&buffer)?;
-        let usb_transfer = Transfer::new_interrupt(self.ep_addr(), transfer_buffer)
-            .map_err(Error::CreateTransfer)?;
+        let usb_transfer =
+            interrupt_transfer(self.ep_addr(), 0, buffer.len().map_err(Error::BufferLen)?);
         self.do_handle_transfer(xhci_transfer, usb_transfer, buffer)
     }
 
     fn do_handle_transfer(
         &self,
         xhci_transfer: XhciTransfer,
-        mut usb_transfer: Transfer,
+        mut usb_transfer: UsbTransfer<BulkTransferBuffer>,
         buffer: ScatterGatherBuffer,
     ) -> Result<()> {
         let xhci_transfer = Arc::new(xhci_transfer);
         let tmp_transfer = xhci_transfer.clone();
         match self.direction {
             EndpointDirection::HostToDevice => {
+                // Read data from ScatterGatherBuffer to a continuous memory.
+                buffer
+                    .read(usb_transfer.buffer_mut().as_mut_slice())
+                    .map_err(Error::ReadBuffer)?;
                 usb_debug!(
-                    "out transfer ep_addr {:#x}, buffer len {:?}",
+                    "out transfer ep_addr {:#x}, buffer len {:?}, data {:#x?}",
                     self.ep_addr(),
                     buffer.len(),
+                    usb_transfer.buffer_mut().as_mut_slice()
                 );
-                let callback = move |t: Transfer| {
+                let callback = move |t: UsbTransfer<BulkTransferBuffer>| {
                     usb_debug!("out transfer callback");
                     update_transfer_state(&xhci_transfer, &t)?;
                     let state = xhci_transfer.state().lock();
@@ -172,18 +168,20 @@ impl UsbEndpoint {
                     }
                 };
                 let fail_handle = self.fail_handle.clone();
-                usb_transfer.set_callback(move |t: Transfer| match callback(t) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("bulk transfer callback failed: {:?}", e);
-                        fail_handle.fail();
-                    }
-                });
+                usb_transfer.set_callback(
+                    move |t: UsbTransfer<BulkTransferBuffer>| match callback(t) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("bulk transfer callback failed: {:?}", e);
+                            fail_handle.fail();
+                        }
+                    },
+                );
                 submit_transfer(
                     self.fail_handle.clone(),
                     &self.job_queue,
                     tmp_transfer,
-                    &mut self.device.lock(),
+                    &self.device_handle,
                     usb_transfer,
                 )?;
             }
@@ -194,8 +192,12 @@ impl UsbEndpoint {
                     buffer.len()
                 );
                 let _addr = self.ep_addr();
-                let callback = move |t: Transfer| {
-                    usb_debug!("ep {:#x} in transfer data {:?}", _addr, t.buffer.as_slice());
+                let callback = move |t: UsbTransfer<BulkTransferBuffer>| {
+                    usb_debug!(
+                        "ep {:#x} in transfer data {:?}",
+                        _addr,
+                        t.buffer().as_slice()
+                    );
                     update_transfer_state(&xhci_transfer, &t)?;
                     let state = xhci_transfer.state().lock();
                     match *state {
@@ -210,7 +212,7 @@ impl UsbEndpoint {
                             let status = t.status();
                             let actual_length = t.actual_length() as usize;
                             let copied_length = buffer
-                                .write(t.buffer.as_slice())
+                                .write(t.buffer().as_slice())
                                 .map_err(Error::WriteBuffer)?;
                             let actual_length = cmp::min(actual_length, copied_length);
                             drop(state);
@@ -228,19 +230,21 @@ impl UsbEndpoint {
                 };
                 let fail_handle = self.fail_handle.clone();
 
-                usb_transfer.set_callback(move |t: Transfer| match callback(t) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("bulk transfer callback {:?}", e);
-                        fail_handle.fail();
-                    }
-                });
+                usb_transfer.set_callback(
+                    move |t: UsbTransfer<BulkTransferBuffer>| match callback(t) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("bulk transfer callback {:?}", e);
+                            fail_handle.fail();
+                        }
+                    },
+                );
 
                 submit_transfer(
                     self.fail_handle.clone(),
                     &self.job_queue,
                     tmp_transfer,
-                    &mut self.device.lock(),
+                    &self.device_handle,
                     usb_transfer,
                 )?;
             }

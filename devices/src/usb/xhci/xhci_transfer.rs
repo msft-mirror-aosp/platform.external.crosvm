@@ -10,15 +10,15 @@ use super::xhci_abi::{
     TrbCompletionCode, TrbType,
 };
 use super::xhci_regs::MAX_INTERRUPTER;
-use base::{error, Error as SysError, Event};
 use bit_field::Error as BitFieldError;
 use std::cmp::min;
 use std::fmt::{self, Display};
 use std::mem;
 use std::sync::{Arc, Weak};
 use sync::Mutex;
-use usb_util::{TransferStatus, UsbRequestSetup};
-use vm_memory::GuestMemory;
+use sys_util::{error, Error as SysError, EventFd, GuestMemory};
+use usb_util::types::UsbRequestSetup;
+use usb_util::usb_transfer::TransferStatus;
 
 #[derive(Debug)]
 pub enum Error {
@@ -67,7 +67,7 @@ pub enum XhciTransferState {
     /// When transfer is submitted, it will contain a transfer callback, which should be invoked
     /// when the transfer is cancelled.
     Submitted {
-        cancel_callback: Box<dyn FnOnce() + Send>,
+        cancel_callback: Box<dyn FnMut() + Send>,
     },
     Cancelling,
     Cancelled,
@@ -78,7 +78,9 @@ impl XhciTransferState {
     /// Try to cancel this transfer, if it's possible.
     pub fn try_cancel(&mut self) {
         match mem::replace(self, XhciTransferState::Created) {
-            XhciTransferState::Submitted { cancel_callback } => {
+            XhciTransferState::Submitted {
+                mut cancel_callback,
+            } => {
                 *self = XhciTransferState::Cancelling;
                 cancel_callback();
             }
@@ -167,7 +169,7 @@ impl XhciTransferManager {
         slot_id: u8,
         endpoint_id: u8,
         transfer_trbs: TransferDescriptor,
-        completion_event: Event,
+        completion_event: EventFd,
     ) -> XhciTransfer {
         assert!(!transfer_trbs.is_empty());
         let transfer_dir = {
@@ -236,7 +238,7 @@ pub struct XhciTransfer {
     endpoint_id: u8,
     transfer_dir: TransferDirection,
     transfer_trbs: TransferDescriptor,
-    transfer_completion_event: Event,
+    transfer_completion_event: EventFd,
 }
 
 impl Drop for XhciTransfer {
@@ -288,13 +290,8 @@ impl XhciTransfer {
                 usb_debug!("device disconnected, detaching from port");
                 // If the device is gone, we don't need to send transfer completion event, cause we
                 // are going to destroy everything related to this device anyway.
-                return match self.port.detach() {
-                    Ok(()) => Ok(()),
-                    // It's acceptable for the port to be already disconnected
-                    // as asynchronous transfer completions are processed.
-                    Err(HubError::AlreadyDetached(_e)) => Ok(()),
-                    Err(e) => Err(Error::DetachPort(e)),
-                };
+                self.port.detach().map_err(Error::DetachPort)?;
+                return Ok(());
             }
             TransferStatus::Cancelled => {
                 // TODO(jkwang) According to the spec, we should send a stopped event here. But

@@ -5,18 +5,17 @@
 use std::env;
 use std::fmt::{self, Display};
 use std::fs;
-use std::io::{self, Read, Write};
 use std::ops::BitOrAssign;
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 
-use base::{error, Event, PollToken, RawDescriptor, WaitContext};
-use vm_memory::GuestMemory;
+use sys_util::{error, EventFd, GuestMemory, GuestMemoryError, PollContext, PollToken};
+use tpm2;
 
-use super::{
-    DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt, VirtioDevice,
-    Writer, TYPE_TPM,
-};
+use super::{DescriptorChain, Queue, VirtioDevice, INTERRUPT_STATUS_USED_RING, TYPE_TPM};
 
 // A single queue of size 2. The guest kernel driver will enqueue a single
 // descriptor chain containing one command buffer and one response buffer at a
@@ -30,11 +29,13 @@ const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
 const TPM_BUFSIZE: usize = 4096;
 
 struct Worker {
-    interrupt: Interrupt,
     queue: Queue,
     mem: GuestMemory,
-    queue_evt: Event,
-    kill_evt: Event,
+    interrupt_status: Arc<AtomicUsize>,
+    queue_evt: EventFd,
+    kill_evt: EventFd,
+    interrupt_evt: EventFd,
+    interrupt_resample_evt: EventFd,
     device: Device,
 }
 
@@ -42,20 +43,41 @@ struct Device {
     simulator: tpm2::Simulator,
 }
 
+// Checks that the input descriptor chain holds a read-only descriptor followed
+// by a write-only descriptor, as required of the guest's virtio tpm driver.
+//
+// Returns those descriptors as a tuple: `(read_desc, write_desc)`.
+fn two_input_descriptors(desc: DescriptorChain) -> Result<(DescriptorChain, DescriptorChain)> {
+    let read_desc = desc;
+    if !read_desc.is_read_only() {
+        return Err(Error::ExpectedReadOnly);
+    }
+
+    let write_desc = match read_desc.next_descriptor() {
+        Some(desc) => desc,
+        None => return Err(Error::ExpectedSecondBuffer),
+    };
+
+    if !write_desc.is_write_only() {
+        return Err(Error::ExpectedWriteOnly);
+    }
+
+    Ok((read_desc, write_desc))
+}
+
 impl Device {
     fn perform_work(&mut self, mem: &GuestMemory, desc: DescriptorChain) -> Result<u32> {
-        let mut reader = Reader::new(mem.clone(), desc.clone()).map_err(Error::Descriptor)?;
-        let mut writer = Writer::new(mem.clone(), desc).map_err(Error::Descriptor)?;
+        let (read_desc, write_desc) = two_input_descriptors(desc)?;
 
-        let available_bytes = reader.available_bytes();
-        if available_bytes > TPM_BUFSIZE {
+        if read_desc.len > TPM_BUFSIZE as u32 {
             return Err(Error::CommandTooLong {
-                size: available_bytes,
+                size: read_desc.len as usize,
             });
         }
 
-        let mut command = vec![0u8; available_bytes];
-        reader.read_exact(&mut command).map_err(Error::Read)?;
+        let mut command = vec![0u8; read_desc.len as usize];
+        mem.read_exact_at_addr(&mut command, read_desc.addr)
+            .map_err(Error::Read)?;
 
         let response = self.simulator.execute_command(&command);
 
@@ -65,17 +87,17 @@ impl Device {
             });
         }
 
-        let writer_len = writer.available_bytes();
-        if response.len() > writer_len {
+        if response.len() > write_desc.len as usize {
             return Err(Error::BufferTooSmall {
-                size: writer_len,
+                size: write_desc.len as usize,
                 required: response.len(),
             });
         }
 
-        writer.write_all(&response).map_err(Error::Write)?;
+        mem.write_all_at_addr(&response, write_desc.addr)
+            .map_err(Error::Write)?;
 
-        Ok(writer.bytes_written() as u32)
+        Ok(response.len() as u32)
     }
 }
 
@@ -100,6 +122,12 @@ impl Worker {
         NeedsInterrupt::Yes
     }
 
+    fn signal_used_queue(&self) {
+        self.interrupt_status
+            .fetch_or(INTERRUPT_STATUS_USED_RING as usize, Ordering::SeqCst);
+        let _ = self.interrupt_evt.write(1);
+    }
+
     fn run(mut self) {
         #[derive(PollToken, Debug)]
         enum Token {
@@ -111,25 +139,23 @@ impl Worker {
             Kill,
         }
 
-        let wait_ctx = match WaitContext::build_with(&[
-            (&self.queue_evt, Token::QueueAvailable),
-            (&self.kill_evt, Token::Kill),
-        ])
-        .and_then(|wc| {
-            if let Some(resample_evt) = self.interrupt.get_resample_evt() {
-                wc.add(resample_evt, Token::InterruptResample)?;
-            }
-            Ok(wc)
-        }) {
+        let poll_ctx = match PollContext::new()
+            .and_then(|pc| pc.add(&self.queue_evt, Token::QueueAvailable).and(Ok(pc)))
+            .and_then(|pc| {
+                pc.add(&self.interrupt_resample_evt, Token::InterruptResample)
+                    .and(Ok(pc))
+            })
+            .and_then(|pc| pc.add(&self.kill_evt, Token::Kill).and(Ok(pc)))
+        {
             Ok(pc) => pc,
             Err(e) => {
-                error!("vtpm failed creating WaitContext: {}", e);
+                error!("vtpm failed creating PollContext: {}", e);
                 return;
             }
         };
 
-        'wait: loop {
-            let events = match wait_ctx.wait() {
+        'poll: loop {
+            let events = match poll_ctx.wait() {
                 Ok(v) => v,
                 Err(e) => {
                     error!("vtpm failed polling for events: {}", e);
@@ -138,23 +164,26 @@ impl Worker {
             };
 
             let mut needs_interrupt = NeedsInterrupt::No;
-            for event in events.iter().filter(|e| e.is_readable) {
-                match event.token {
+            for event in events.iter_readable() {
+                match event.token() {
                     Token::QueueAvailable => {
                         if let Err(e) = self.queue_evt.read() {
-                            error!("vtpm failed reading queue Event: {}", e);
-                            break 'wait;
+                            error!("vtpm failed reading queue EventFd: {}", e);
+                            break 'poll;
                         }
                         needs_interrupt |= self.process_queue();
                     }
                     Token::InterruptResample => {
-                        self.interrupt.interrupt_resample();
+                        let _ = self.interrupt_resample_evt.read();
+                        if self.interrupt_status.load(Ordering::SeqCst) != 0 {
+                            let _ = self.interrupt_evt.write(1);
+                        }
                     }
-                    Token::Kill => break 'wait,
+                    Token::Kill => break 'poll,
                 }
             }
             if needs_interrupt == NeedsInterrupt::Yes {
-                self.interrupt.signal_used_queue(self.queue.vector);
+                self.signal_used_queue();
             }
         }
     }
@@ -163,8 +192,7 @@ impl Worker {
 /// Virtio vTPM device.
 pub struct Tpm {
     storage: PathBuf,
-    kill_evt: Option<Event>,
-    worker_thread: Option<thread::JoinHandle<()>>,
+    kill_evt: Option<EventFd>,
 }
 
 impl Tpm {
@@ -172,7 +200,6 @@ impl Tpm {
         Tpm {
             storage,
             kill_evt: None,
-            worker_thread: None,
         }
     }
 }
@@ -182,15 +209,11 @@ impl Drop for Tpm {
         if let Some(kill_evt) = self.kill_evt.take() {
             let _ = kill_evt.write(1);
         }
-
-        if let Some(worker_thread) = self.worker_thread.take() {
-            let _ = worker_thread.join();
-        }
     }
 }
 
 impl VirtioDevice for Tpm {
-    fn keep_rds(&self) -> Vec<RawDescriptor> {
+    fn keep_fds(&self) -> Vec<RawFd> {
         Vec::new()
     }
 
@@ -205,9 +228,11 @@ impl VirtioDevice for Tpm {
     fn activate(
         &mut self,
         mem: GuestMemory,
-        interrupt: Interrupt,
+        interrupt_evt: EventFd,
+        interrupt_resample_evt: EventFd,
+        interrupt_status: Arc<AtomicUsize>,
         mut queues: Vec<Queue>,
-        mut queue_evts: Vec<Event>,
+        mut queue_evts: Vec<EventFd>,
     ) {
         if queues.len() != 1 || queue_evts.len() != 1 {
             return;
@@ -225,20 +250,22 @@ impl VirtioDevice for Tpm {
         }
         let simulator = tpm2::Simulator::singleton_in_current_directory();
 
-        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
+        let (self_kill_evt, kill_evt) = match EventFd::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(err) => {
-                error!("vtpm failed to create kill Event pair: {}", err);
+                error!("vtpm failed to create kill EventFd pair: {}", err);
                 return;
             }
         };
         self.kill_evt = Some(self_kill_evt);
 
         let worker = Worker {
-            interrupt,
             queue,
             mem,
+            interrupt_status,
             queue_evt,
+            interrupt_evt,
+            interrupt_resample_evt,
             kill_evt,
             device: Device { simulator },
         };
@@ -247,13 +274,9 @@ impl VirtioDevice for Tpm {
             .name("virtio_tpm".to_string())
             .spawn(|| worker.run());
 
-        match worker_result {
-            Err(e) => {
-                error!("vtpm failed to spawn virtio_tpm worker: {}", e);
-            }
-            Ok(join_handle) => {
-                self.worker_thread = Some(join_handle);
-            }
+        if let Err(e) = worker_result {
+            error!("vtpm failed to spawn virtio_tpm worker: {}", e);
+            return;
         }
     }
 }
@@ -275,12 +298,14 @@ impl BitOrAssign for NeedsInterrupt {
 type Result<T> = std::result::Result<T, Error>;
 
 enum Error {
+    ExpectedReadOnly,
+    ExpectedSecondBuffer,
+    ExpectedWriteOnly,
     CommandTooLong { size: usize },
-    Descriptor(DescriptorError),
-    Read(io::Error),
+    Read(GuestMemoryError),
     ResponseTooLong { size: usize },
     BufferTooSmall { size: usize, required: usize },
-    Write(io::Error),
+    Write(GuestMemoryError),
 }
 
 impl Display for Error {
@@ -288,12 +313,14 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
+            ExpectedReadOnly => write!(f, "vtpm expected first descriptor to be read-only"),
+            ExpectedSecondBuffer => write!(f, "vtpm expected a second descriptor"),
+            ExpectedWriteOnly => write!(f, "vtpm expected second descriptor to be write-only"),
             CommandTooLong { size } => write!(
                 f,
                 "vtpm command is too long: {} > {} bytes",
                 size, TPM_BUFSIZE
             ),
-            Descriptor(e) => write!(f, "virtio descriptor error: {}", e),
             Read(e) => write!(f, "vtpm failed to read from guest memory: {}", e),
             ResponseTooLong { size } => write!(
                 f,

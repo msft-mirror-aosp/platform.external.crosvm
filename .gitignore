@@ -1,10 +1,6 @@
 target/
-**/__pycache__
 **/*.rs.bk
 **/*.sw[po]
 **/*.orig
 **/Cargo.lock
 !/Cargo.lock
-lcov.info
-.idea
-.vscode

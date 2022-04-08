@@ -9,15 +9,14 @@ use std::fmt::{self, Display};
 use std::sync::{Arc, MutexGuard};
 use sync::Mutex;
 
-use base::{error, Error as SysError, Event, WatchingEvents};
-use vm_memory::{GuestAddress, GuestMemory};
+use sys_util::{error, Error as SysError, EventFd, GuestAddress, GuestMemory, WatchingEvents};
 
 use super::ring_buffer::RingBuffer;
 
 #[derive(Debug)]
 pub enum Error {
     AddEvent(utils::Error),
-    CreateEvent(SysError),
+    CreateEventFd(SysError),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -28,7 +27,7 @@ impl Display for Error {
 
         match self {
             AddEvent(e) => write!(f, "failed to add event to event loop: {}", e),
-            CreateEvent(e) => write!(f, "failed to create event: {}", e),
+            CreateEventFd(e) => write!(f, "failed to create event fd: {}", e),
         }
     }
 }
@@ -51,7 +50,7 @@ pub trait TransferDescriptorHandler {
     fn handle_transfer_descriptor(
         &self,
         descriptor: TransferDescriptor,
-        complete_event: Event,
+        complete_event: EventFd,
     ) -> std::result::Result<(), ()>;
     /// Stop is called when trying to stop ring buffer controller. Returns true when stop must be
     /// performed asynchronously. This happens because the handler is handling some descriptor
@@ -77,7 +76,7 @@ pub struct RingBufferController<T: 'static + TransferDescriptorHandler> {
     ring_buffer: Mutex<RingBuffer>,
     handler: Mutex<T>,
     event_loop: Arc<EventLoop>,
-    event: Event,
+    event: EventFd,
 }
 
 impl<T: 'static + TransferDescriptorHandler> Display for RingBufferController<T> {
@@ -97,12 +96,12 @@ where
         event_loop: Arc<EventLoop>,
         handler: T,
     ) -> Result<Arc<RingBufferController<T>>> {
-        let evt = Event::new().map_err(Error::CreateEvent)?;
+        let evt = EventFd::new().map_err(Error::CreateEventFd)?;
         let controller = Arc::new(RingBufferController {
             name: name.clone(),
             state: Mutex::new(RingBufferState::Stopped),
             stop_callback: Mutex::new(Vec::new()),
-            ring_buffer: Mutex::new(RingBuffer::new(name, mem)),
+            ring_buffer: Mutex::new(RingBuffer::new(name.clone(), mem)),
             handler: Mutex::new(handler),
             event_loop: event_loop.clone(),
             event: evt,
@@ -189,7 +188,7 @@ where
         match self.event.read() {
             Ok(_) => {}
             Err(e) => {
-                error!("cannot read from event: {}", e);
+                error!("cannot read from event fd: {}", e);
                 return Err(());
             }
         }
@@ -226,7 +225,7 @@ where
         let event = match self.event.try_clone() {
             Ok(evt) => evt,
             Err(e) => {
-                error!("cannot clone event: {}", e);
+                error!("cannot clone event fd: {}", e);
                 return Err(());
             }
         };
@@ -250,7 +249,7 @@ mod tests {
         fn handle_transfer_descriptor(
             &self,
             descriptor: TransferDescriptor,
-            complete_event: Event,
+            complete_event: EventFd,
         ) -> std::result::Result<(), ()> {
             for atrb in descriptor {
                 assert_eq!(atrb.trb.get_trb_type().unwrap(), TrbType::Normal);

@@ -8,7 +8,6 @@ dup2: 1
 execve: 1
 exit_group: 1
 futex: 1
-kill: 1
 lseek: 1
 mprotect: 1
 munmap: 1
@@ -23,7 +22,6 @@ write: 1
 eventfd2: 1
 poll: 1
 getpid: 1
-getppid: 1
 # Allow PR_SET_NAME only.
 prctl: arg0 == 15
 access: 1

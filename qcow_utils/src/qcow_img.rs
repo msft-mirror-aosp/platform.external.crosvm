@@ -7,8 +7,8 @@ use std::io::{Read, Write};
 
 use getopts::Options;
 
-use base::WriteZeroes;
-use disk::QcowFile;
+use qcow::QcowFile;
+use sys_util::WriteZeroes;
 
 fn show_usage(program_name: &str) {
     println!("Usage: {} [subcommand] <subcommand args>", program_name);
@@ -264,7 +264,7 @@ fn dd(file_path: &str, source_path: &str, count: Option<usize>) -> std::result::
         let nread = src_file.read(&mut buf[..this_count]).map_err(|_| ())?;
         // If this block is all zeros, then use write_zeros so the output file is sparse.
         if buf.iter().all(|b| *b == 0) {
-            qcow_file.write_zeroes_all(CHUNK_SIZE).map_err(|_| ())?;
+            qcow_file.write_zeroes(CHUNK_SIZE).map_err(|_| ())?;
         } else {
             qcow_file.write(&buf).map_err(|_| ())?;
         }
@@ -304,12 +304,12 @@ fn convert(src_path: &str, dst_path: &str) -> std::result::Result<(), ()> {
     };
 
     let dst_type = if dst_path.ends_with("qcow2") {
-        disk::ImageType::Qcow2
+        qcow::ImageType::Qcow2
     } else {
-        disk::ImageType::Raw
+        qcow::ImageType::Raw
     };
 
-    match disk::convert(src_file, dst_file, dst_type) {
+    match qcow::convert(src_file, dst_file, dst_type) {
         Ok(_) => {
             println!("Converted {} to {}", src_path, dst_path);
             Ok(())

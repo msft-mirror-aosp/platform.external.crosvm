@@ -2,11 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use base::{Event, RawDescriptor};
-use vm_memory::GuestMemory;
+use std::os::unix::io::RawFd;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+
+use sys_util::{EventFd, GuestMemory};
 
 use super::*;
-use crate::pci::{MsixStatus, PciAddress, PciBarConfiguration, PciCapability};
+use crate::pci::{PciBarConfiguration, PciCapability};
 
 /// Trait for virtio devices to be driven by a virtio transport.
 ///
@@ -26,7 +29,7 @@ pub trait VirtioDevice: Send {
 
     /// A vector of device-specific file descriptors that must be kept open
     /// after jailing. Must be called before the process is jailed.
-    fn keep_rds(&self) -> Vec<RawDescriptor>;
+    fn keep_fds(&self) -> Vec<RawFd>;
 
     /// The virtio device type.
     fn device_type(&self) -> u32;
@@ -34,9 +37,9 @@ pub trait VirtioDevice: Send {
     /// The maximum size of each queue that this device supports.
     fn queue_max_sizes(&self) -> &[u16];
 
-    /// The set of feature bits that this device supports in addition to the base features.
+    /// The set of feature bits that this device supports.
     fn features(&self) -> u64 {
-        0
+        1 << VIRTIO_F_VERSION_1
     }
 
     /// Acknowledges that this set of features should be enabled.
@@ -60,21 +63,21 @@ pub trait VirtioDevice: Send {
     fn activate(
         &mut self,
         mem: GuestMemory,
-        interrupt: Interrupt,
+        interrupt_evt: EventFd,
+        interrupt_resample_evt: EventFd,
+        status: Arc<AtomicUsize>,
         queues: Vec<Queue>,
-        queue_evts: Vec<Event>,
+        queue_evts: Vec<EventFd>,
     );
 
-    /// Optionally deactivates this device. If the reset method is
-    /// not able to reset the virtio device, or the virtio device model doesn't
-    /// implement the reset method, a false value is returned to indicate
-    /// the reset is not successful. Otherwise a true value should be returned.
-    fn reset(&mut self) -> bool {
-        false
+    /// Optionally deactivates this device and returns ownership of the guest memory map, interrupt
+    /// event, and queue events.
+    fn reset(&mut self) -> Option<(EventFd, Vec<EventFd>)> {
+        None
     }
 
     /// Returns any additional BAR configuration required by the device.
-    fn get_device_bars(&mut self, _address: PciAddress) -> Vec<PciBarConfiguration> {
+    fn get_device_bars(&self) -> Vec<PciBarConfiguration> {
         Vec::new()
     }
 
@@ -82,9 +85,4 @@ pub trait VirtioDevice: Send {
     fn get_device_caps(&self) -> Vec<Box<dyn PciCapability>> {
         Vec::new()
     }
-
-    /// Invoked when the device is sandboxed.
-    fn on_device_sandboxed(&mut self) {}
-
-    fn control_notify(&self, _behavior: MsixStatus) {}
 }

@@ -75,14 +75,14 @@ fn bitfield_tuple_struct_impl(ast: &DeriveInput, fields: &FieldsUnnamed) -> Resu
 
     let ident = &ast.ident;
 
-    if width > 64 {
+    if width.value() > 64 {
         return Err(Error::new(
             Span::call_site(),
             "max width of bitfield field is 64",
         ));
     }
 
-    let bits = width as u8;
+    let bits = width.value() as u8;
 
     if fields.unnamed.len() != 1 {
         return Err(Error::new(
@@ -91,7 +91,7 @@ fn bitfield_tuple_struct_impl(ast: &DeriveInput, fields: &FieldsUnnamed) -> Resu
         ));
     }
 
-    let field_type = match &fields.unnamed.first().unwrap().ty {
+    let field_type = match &fields.unnamed.first().unwrap().value().ty {
         Type::Path(t) => t,
         _ => {
             return Err(Error::new(
@@ -100,7 +100,14 @@ fn bitfield_tuple_struct_impl(ast: &DeriveInput, fields: &FieldsUnnamed) -> Resu
             ));
         }
     };
-    let span = field_type.path.segments.first().unwrap().ident.span();
+    let span = field_type
+        .path
+        .segments
+        .first()
+        .unwrap()
+        .value()
+        .ident
+        .span();
 
     let from_u64 = quote_spanned! {
         span => val as #field_type
@@ -138,22 +145,22 @@ fn bitfield_enum_impl(ast: &DeriveInput, data: &DataEnum) -> Result<TokenStream>
     let width = parse_remove_bits_attr(&mut ast)?;
     match width {
         None => bitfield_enum_without_width_impl(&ast, data),
-        Some(width) => bitfield_enum_with_width_impl(&ast, data, width),
+        Some(width) => bitfield_enum_with_width_impl(&ast, data, &width),
     }
 }
 
 fn bitfield_enum_with_width_impl(
     ast: &DeriveInput,
     data: &DataEnum,
-    width: u64,
+    width: &LitInt,
 ) -> Result<TokenStream> {
-    if width > 64 {
+    if width.value() > 64 {
         return Err(Error::new(
             Span::call_site(),
             "max width of bitfield enum is 64",
         ));
     }
-    let bits = width as u8;
+    let bits = width.value() as u8;
     let declare_discriminants = get_declare_discriminants_for_enum(bits, ast, data);
 
     let ident = &ast.ident;
@@ -402,14 +409,14 @@ fn try_parse_bits_attr(attr: &Attribute) -> Result<Option<LitInt>> {
     Ok(None)
 }
 
-fn parse_remove_bits_attr(ast: &mut DeriveInput) -> Result<Option<u64>> {
+fn parse_remove_bits_attr(ast: &mut DeriveInput) -> Result<Option<LitInt>> {
     let mut width = None;
     let mut bits_idx = 0;
 
     for (i, attr) in ast.attrs.iter().enumerate() {
         if let Some(w) = try_parse_bits_attr(attr)? {
             bits_idx = i;
-            width = Some(w.base10_parse()?);
+            width = Some(w);
         }
     }
 
@@ -473,7 +480,7 @@ fn get_fields_impl(fields: &[FieldSpec]) -> Vec<TokenStream> {
             let span = expected_bits.span();
             quote_spanned! {span=>
                 #[allow(dead_code)]
-                const EXPECTED_BITS: [(); #expected_bits] =
+                const EXPECTED_BITS: [(); #expected_bits as usize] =
                     [(); <#ty as ::bit_field::BitFieldSpecifier>::FIELD_WIDTH as usize];
             }
         });

@@ -2,27 +2,33 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::alloc::Layout;
 use std::fmt::{self, Display};
 use std::{mem, result};
 
-use base::{self, warn};
-use hypervisor::{Fpu, Register, Regs, Sregs, VcpuX86_64};
-use vm_memory::{GuestAddress, GuestMemory};
+use assertions::const_assert;
+use kvm;
+use kvm_sys::kvm_fpu;
+use kvm_sys::kvm_msr_entry;
+use kvm_sys::kvm_msrs;
+use kvm_sys::kvm_regs;
+use kvm_sys::kvm_sregs;
+use sys_util::{self, GuestAddress, GuestMemory, LayoutAllocation};
 
 use crate::gdt;
 
 #[derive(Debug)]
 pub enum Error {
     /// Setting up msrs failed.
-    MsrIoctlFailed(base::Error),
+    MsrIoctlFailed(sys_util::Error),
     /// Failed to configure the FPU.
-    FpuIoctlFailed(base::Error),
+    FpuIoctlFailed(sys_util::Error),
     /// Failed to get sregs for this cpu.
-    GetSRegsIoctlFailed(base::Error),
+    GetSRegsIoctlFailed(sys_util::Error),
     /// Failed to set base registers for this cpu.
-    SettingRegistersIoctl(base::Error),
+    SettingRegistersIoctl(sys_util::Error),
     /// Failed to set sregs for this cpu.
-    SetSRegsIoctlFailed(base::Error),
+    SetSRegsIoctlFailed(sys_util::Error),
     /// Writing the GDT to RAM failed.
     WriteGDTFailure,
     /// Writing the IDT to RAM failed.
@@ -59,140 +65,62 @@ impl Display for Error {
     }
 }
 
-const MTRR_MEMTYPE_UC: u8 = 0x0;
-const MTRR_MEMTYPE_WB: u8 = 0x6;
-const MTRR_VAR_VALID: u64 = 0x800;
-const MTRR_ENABLE: u64 = 0x800;
-const MTRR_PHYS_BASE_MSR: u32 = 0x200;
-const MTRR_PHYS_MASK_MSR: u32 = 0x201;
-const VAR_MTRR_NUM_MASK: u64 = 0xFF;
+fn create_msr_entries() -> Vec<kvm_msr_entry> {
+    let mut entries = Vec::<kvm_msr_entry>::new();
 
-// Returns the value of the highest bit in a 64-bit value. Equivalent to
-// 1 << HighBitSet(x)
-fn get_power_of_two(data: u64) -> u64 {
-    1 << (64 - data.leading_zeros() - 1)
-}
-
-// Returns the max length which suitable for mtrr setting based on the
-// specified (base, len)
-fn get_max_len(base: u64, len: u64) -> u64 {
-    let mut ret = get_power_of_two(len);
-
-    while base % ret != 0 {
-        ret >>= 1;
-    }
-
-    ret
-}
-
-// For the specified (Base, Len), returns (base, len) pair which could be
-// set into mtrr register. mtrr requires: the base-address alignment value can't be
-// less than its length
-fn get_mtrr_pairs(base: u64, len: u64) -> Vec<(u64, u64)> {
-    let mut vecs = Vec::new();
-
-    let mut remains = len;
-    let mut new = base;
-    while remains != 0 {
-        let max = get_max_len(new, remains);
-        vecs.push((new, max));
-        remains -= max;
-        new += max;
-    }
-
-    vecs
-}
-
-fn append_mtrr_entries(vpu: &dyn VcpuX86_64, pci_start: u64, entries: &mut Vec<Register>) {
-    // Get VAR MTRR num from MSR_MTRRcap
-    let mut msrs = vec![Register {
-        id: crate::msr_index::MSR_MTRRcap,
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_IA32_SYSENTER_CS,
+        data: 0x0,
         ..Default::default()
-    }];
-    if vpu.get_msrs(&mut msrs).is_err() {
-        warn!("get msrs fail, guest with pass through device may be very slow");
-        return;
-    }
-    let var_num = msrs[0].value & VAR_MTRR_NUM_MASK;
-
-    // Set pci_start .. 4G as UC
-    // all others are set to default WB
-    let pci_len = (1 << 32) - pci_start;
-    let vecs = get_mtrr_pairs(pci_start, pci_len);
-    if vecs.len() as u64 > var_num {
-        warn!(
-            "mtrr fail for pci mmio, please check pci_start addr,
-              guest with pass through device may be very slow"
-        );
-        return;
-    }
-
-    let phys_mask: u64 = (1 << crate::cpuid::phy_max_address_bits()) - 1;
-    for (idx, (base, len)) in vecs.iter().enumerate() {
-        let reg_idx = idx as u32 * 2;
-        entries.push(Register {
-            id: MTRR_PHYS_BASE_MSR + reg_idx,
-            value: base | MTRR_MEMTYPE_UC as u64,
-        });
-        let mask: u64 = len.wrapping_neg() & phys_mask | MTRR_VAR_VALID;
-        entries.push(Register {
-            id: MTRR_PHYS_MASK_MSR + reg_idx,
-            value: mask,
-        });
-    }
-    // Disable fixed MTRRs and enable variable MTRRs, set default type as WB
-    entries.push(Register {
-        id: crate::msr_index::MSR_MTRRdefType,
-        value: MTRR_ENABLE | MTRR_MEMTYPE_WB as u64,
     });
-}
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_IA32_SYSENTER_ESP,
+        data: 0x0,
+        ..Default::default()
+    });
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_IA32_SYSENTER_EIP,
+        data: 0x0,
+        ..Default::default()
+    });
+    // x86_64 specific msrs, we only run on x86_64 not x86
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_STAR,
+        data: 0x0,
+        ..Default::default()
+    });
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_CSTAR,
+        data: 0x0,
+        ..Default::default()
+    });
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_KERNEL_GS_BASE,
+        data: 0x0,
+        ..Default::default()
+    });
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_SYSCALL_MASK,
+        data: 0x0,
+        ..Default::default()
+    });
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_LSTAR,
+        data: 0x0,
+        ..Default::default()
+    });
+    // end of x86_64 specific code
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_IA32_TSC,
+        data: 0x0,
+        ..Default::default()
+    });
+    entries.push(kvm_msr_entry {
+        index: crate::msr_index::MSR_IA32_MISC_ENABLE,
+        data: crate::msr_index::MSR_IA32_MISC_ENABLE_FAST_STRING as u64,
+        ..Default::default()
+    });
 
-fn create_msr_entries(vcpu: &dyn VcpuX86_64, pci_start: u64) -> Vec<Register> {
-    let mut entries = vec![
-        Register {
-            id: crate::msr_index::MSR_IA32_SYSENTER_CS,
-            value: 0x0,
-        },
-        Register {
-            id: crate::msr_index::MSR_IA32_SYSENTER_ESP,
-            value: 0x0,
-        },
-        Register {
-            id: crate::msr_index::MSR_IA32_SYSENTER_EIP,
-            value: 0x0,
-        },
-        // x86_64 specific msrs, we only run on x86_64 not x86
-        Register {
-            id: crate::msr_index::MSR_STAR,
-            value: 0x0,
-        },
-        Register {
-            id: crate::msr_index::MSR_CSTAR,
-            value: 0x0,
-        },
-        Register {
-            id: crate::msr_index::MSR_KERNEL_GS_BASE,
-            value: 0x0,
-        },
-        Register {
-            id: crate::msr_index::MSR_SYSCALL_MASK,
-            value: 0x0,
-        },
-        Register {
-            id: crate::msr_index::MSR_LSTAR,
-            value: 0x0,
-        },
-        // end of x86_64 specific code
-        Register {
-            id: crate::msr_index::MSR_IA32_TSC,
-            value: 0x0,
-        },
-        Register {
-            id: crate::msr_index::MSR_IA32_MISC_ENABLE,
-            value: crate::msr_index::MSR_IA32_MISC_ENABLE_FAST_STRING as u64,
-        },
-    ];
-    append_mtrr_entries(vcpu, pci_start, &mut entries);
     entries
 }
 
@@ -201,9 +129,35 @@ fn create_msr_entries(vcpu: &dyn VcpuX86_64, pci_start: u64) -> Vec<Register> {
 /// # Arguments
 ///
 /// * `vcpu` - Structure for the vcpu that holds the vcpu fd.
-pub fn setup_msrs(vcpu: &dyn VcpuX86_64, pci_start: u64) -> Result<()> {
-    let msrs = create_msr_entries(vcpu, pci_start);
-    vcpu.set_msrs(&msrs).map_err(Error::MsrIoctlFailed)
+pub fn setup_msrs(vcpu: &kvm::Vcpu) -> Result<()> {
+    const SIZE_OF_MSRS: usize = mem::size_of::<kvm_msrs>();
+    const SIZE_OF_ENTRY: usize = mem::size_of::<kvm_msr_entry>();
+    const ALIGN_OF_MSRS: usize = mem::align_of::<kvm_msrs>();
+    const ALIGN_OF_ENTRY: usize = mem::align_of::<kvm_msr_entry>();
+    const_assert!(ALIGN_OF_MSRS >= ALIGN_OF_ENTRY);
+
+    let entry_vec = create_msr_entries();
+    let size = SIZE_OF_MSRS + entry_vec.len() * SIZE_OF_ENTRY;
+    let layout = Layout::from_size_align(size, ALIGN_OF_MSRS).expect("impossible layout");
+    let mut allocation = LayoutAllocation::zeroed(layout);
+
+    // Safe to obtain an exclusive reference because there are no other
+    // references to the allocation yet and all-zero is a valid bit pattern.
+    let msrs = unsafe { allocation.as_mut::<kvm_msrs>() };
+
+    unsafe {
+        // Mapping the unsized array to a slice is unsafe becase the length isn't known.  Providing
+        // the length used to create the struct guarantees the entire slice is valid.
+        let entries: &mut [kvm_msr_entry] = msrs.entries.as_mut_slice(entry_vec.len());
+        entries.copy_from_slice(&entry_vec);
+    }
+    msrs.nmsrs = entry_vec.len() as u32;
+
+    vcpu.set_msrs(msrs).map_err(Error::MsrIoctlFailed)?;
+
+    Ok(())
+
+    // msrs allocation is deallocated.
 }
 
 /// Configure FPU registers for x86
@@ -211,14 +165,16 @@ pub fn setup_msrs(vcpu: &dyn VcpuX86_64, pci_start: u64) -> Result<()> {
 /// # Arguments
 ///
 /// * `vcpu` - Structure for the vcpu that holds the vcpu fd.
-pub fn setup_fpu(vcpu: &dyn VcpuX86_64) -> Result<()> {
-    let fpu = Fpu {
+pub fn setup_fpu(vcpu: &kvm::Vcpu) -> Result<()> {
+    let fpu: kvm_fpu = kvm_fpu {
         fcw: 0x37f,
         mxcsr: 0x1f80,
         ..Default::default()
     };
 
-    vcpu.set_fpu(&fpu).map_err(Error::FpuIoctlFailed)
+    vcpu.set_fpu(&fpu).map_err(Error::FpuIoctlFailed)?;
+
+    Ok(())
 }
 
 /// Configure base registers for x86
@@ -229,8 +185,8 @@ pub fn setup_fpu(vcpu: &dyn VcpuX86_64) -> Result<()> {
 /// * `boot_ip` - Starting instruction pointer.
 /// * `boot_sp` - Starting stack pointer.
 /// * `boot_si` - Must point to zero page address per Linux ABI.
-pub fn setup_regs(vcpu: &dyn VcpuX86_64, boot_ip: u64, boot_sp: u64, boot_si: u64) -> Result<()> {
-    let regs = Regs {
+pub fn setup_regs(vcpu: &kvm::Vcpu, boot_ip: u64, boot_sp: u64, boot_si: u64) -> Result<()> {
+    let regs: kvm_regs = kvm_regs {
         rflags: 0x0000000000000002u64,
         rip: boot_ip,
         rsp: boot_sp,
@@ -239,7 +195,9 @@ pub fn setup_regs(vcpu: &dyn VcpuX86_64, boot_ip: u64, boot_sp: u64, boot_si: u6
         ..Default::default()
     };
 
-    vcpu.set_regs(&regs).map_err(Error::SettingRegistersIoctl)
+    vcpu.set_regs(&regs).map_err(Error::SettingRegistersIoctl)?;
+
+    Ok(())
 }
 
 const X86_CR0_PE: u64 = 0x1;
@@ -274,7 +232,7 @@ fn write_idt_value(val: u64, guest_mem: &GuestMemory) -> Result<()> {
         .map_err(|_| Error::WriteIDTFailure)
 }
 
-fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut Sregs) -> Result<()> {
+fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Result<()> {
     let gdt_table: [u64; BOOT_GDT_MAX as usize] = [
         gdt::gdt_entry(0, 0, 0),            // NULL
         gdt::gdt_entry(0xa09b, 0, 0xfffff), // CODE
@@ -282,9 +240,9 @@ fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut Sregs) -> Result<
         gdt::gdt_entry(0x808b, 0, 0xfffff), // TSS
     ];
 
-    let code_seg = gdt::segment_from_gdt(gdt_table[1], 1);
-    let data_seg = gdt::segment_from_gdt(gdt_table[2], 2);
-    let tss_seg = gdt::segment_from_gdt(gdt_table[3], 3);
+    let code_seg = gdt::kvm_segment_from_gdt(gdt_table[1], 1);
+    let data_seg = gdt::kvm_segment_from_gdt(gdt_table[2], 2);
+    let tss_seg = gdt::kvm_segment_from_gdt(gdt_table[3], 3);
 
     // Write segments
     write_gdt_table(&gdt_table[..], mem)?;
@@ -310,7 +268,7 @@ fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut Sregs) -> Result<
     Ok(())
 }
 
-fn setup_page_tables(mem: &GuestMemory, sregs: &mut Sregs) -> Result<()> {
+fn setup_page_tables(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Result<()> {
     // Puts PML4 right after zero page but aligned to 4k.
     let boot_pml4_addr = GuestAddress(0x9000);
     let boot_pdpte_addr = GuestAddress(0xa000);
@@ -342,9 +300,9 @@ fn setup_page_tables(mem: &GuestMemory, sregs: &mut Sregs) -> Result<()> {
 /// # Arguments
 ///
 /// * `mem` - The memory that will be passed to the guest.
-/// * `vcpu` - The VCPU to configure registers on.
-pub fn setup_sregs(mem: &GuestMemory, vcpu: &dyn VcpuX86_64) -> Result<()> {
-    let mut sregs = vcpu.get_sregs().map_err(Error::GetSRegsIoctlFailed)?;
+/// * `vcpu_fd` - The FD returned from the KVM_CREATE_VCPU ioctl.
+pub fn setup_sregs(mem: &GuestMemory, vcpu: &kvm::Vcpu) -> Result<()> {
+    let mut sregs: kvm_sregs = vcpu.get_sregs().map_err(Error::GetSRegsIoctlFailed)?;
 
     configure_segments_and_sregs(mem, &mut sregs)?;
     setup_page_tables(mem, &mut sregs)?; // TODO(dgreid) - Can this be done once per system instead?
@@ -357,10 +315,10 @@ pub fn setup_sregs(mem: &GuestMemory, vcpu: &dyn VcpuX86_64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vm_memory::{GuestAddress, GuestMemory};
+    use sys_util::{GuestAddress, GuestMemory};
 
     fn create_guest_mem() -> GuestMemory {
-        GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap()
+        GuestMemory::new(&vec![(GuestAddress(0), 0x10000)]).unwrap()
     }
 
     fn read_u64(gm: &GuestMemory, offset: u64) -> u64 {
@@ -370,7 +328,7 @@ mod tests {
 
     #[test]
     fn segments_and_sregs() {
-        let mut sregs = Default::default();
+        let mut sregs: kvm_sregs = Default::default();
         let gm = create_guest_mem();
         configure_segments_and_sregs(&gm, &mut sregs).unwrap();
 
@@ -395,7 +353,7 @@ mod tests {
 
     #[test]
     fn page_tables() {
-        let mut sregs = Default::default();
+        let mut sregs: kvm_sregs = Default::default();
         let gm = create_guest_mem();
         setup_page_tables(&gm, &mut sregs).unwrap();
 

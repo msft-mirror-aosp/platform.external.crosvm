@@ -5,98 +5,26 @@
 //! This module defines the protocol between `virtio-wayland` and `virtio-gpu` for sharing resources
 //! that are backed by file descriptors.
 
-use std::fmt;
 use std::fs::File;
+use std::io::Result;
 
-use serde::{Deserialize, Serialize};
+use msg_on_socket_derive::MsgOnSocket;
+use msg_socket::MsgSocket;
 
-use base::{with_as_descriptor, Tube, TubeError};
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(MsgOnSocket)]
 pub enum ResourceRequest {
-    GetBuffer { id: u32 },
-    GetFence { seqno: u64 },
+    GetResource { id: u32 },
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Default)]
-pub struct PlaneInfo {
-    pub offset: u32,
-    pub stride: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct BufferInfo {
-    #[serde(with = "with_as_descriptor")]
-    pub file: File,
-    pub planes: [PlaneInfo; RESOURE_PLANE_NUM],
-    pub modifier: u64,
-}
-
-pub const RESOURE_PLANE_NUM: usize = 4;
-#[derive(Serialize, Deserialize)]
-pub enum ResourceInfo {
-    Buffer(BufferInfo),
-    Fence {
-        #[serde(with = "with_as_descriptor")]
-        file: File,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(MsgOnSocket)]
 pub enum ResourceResponse {
-    Resource(ResourceInfo),
+    Resource(File),
     Invalid,
 }
 
-#[derive(Debug)]
-pub enum ResourceBridgeError {
-    InvalidResource(ResourceRequest),
-    SendFailure(ResourceRequest, TubeError),
-    RecieveFailure(ResourceRequest, TubeError),
-}
+pub type ResourceRequestSocket = MsgSocket<ResourceRequest, ResourceResponse>;
+pub type ResourceResponseSocket = MsgSocket<ResourceResponse, ResourceRequest>;
 
-impl fmt::Display for ResourceRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ResourceRequest::GetBuffer { id } => write!(f, "Buffer-{}", id),
-            ResourceRequest::GetFence { seqno } => write!(f, "Fence-{}", seqno),
-        }
-    }
-}
-
-impl fmt::Display for ResourceBridgeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ResourceBridgeError::InvalidResource(req) => {
-                write!(f, "attempt to send non-existent gpu resource for {}", req)
-            }
-            ResourceBridgeError::SendFailure(req, e) => write!(
-                f,
-                "failed to send a resource bridge request for {}: {}",
-                req, e
-            ),
-            ResourceBridgeError::RecieveFailure(req, e) => write!(
-                f,
-                "error receiving resource bridge response for {}: {}",
-                req, e
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ResourceBridgeError {}
-
-pub fn get_resource_info(
-    tube: &Tube,
-    request: ResourceRequest,
-) -> std::result::Result<ResourceInfo, ResourceBridgeError> {
-    if let Err(e) = tube.send(&request) {
-        return Err(ResourceBridgeError::SendFailure(request, e));
-    }
-
-    match tube.recv() {
-        Ok(ResourceResponse::Resource(info)) => Ok(info),
-        Ok(ResourceResponse::Invalid) => Err(ResourceBridgeError::InvalidResource(request)),
-        Err(e) => Err(ResourceBridgeError::RecieveFailure(request, e)),
-    }
+pub fn pair() -> Result<(ResourceRequestSocket, ResourceResponseSocket)> {
+    msg_socket::pair()
 }

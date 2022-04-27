@@ -2,21 +2,31 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::convert::TryFrom;
-use std::fs::File;
-use std::io::{Stderr, Stdin, Stdout};
-use std::mem;
-use std::net::UdpSocket;
-use std::ops::Drop;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::{
+    convert::TryFrom,
+    fs::File,
+    io::{Stderr, Stdin, Stdout},
+    mem,
+    mem::ManuallyDrop,
+    net::UdpSocket,
+    ops::Drop,
+    os::unix::{
+        io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+        net::{UnixDatagram, UnixListener, UnixStream},
+    },
+};
 
 use serde::{Deserialize, Serialize};
 
-use crate::net::{UnixSeqpacket, UnlinkUnixSeqpacketListener};
-use crate::{errno_result, PollToken, Result};
+use super::{
+    errno_result,
+    net::{UnixSeqpacket, UnlinkUnixSeqpacketListener},
+    PollToken, Result,
+};
 
 pub type RawDescriptor = RawFd;
+
+pub const INVALID_DESCRIPTOR: RawDescriptor = -1;
 
 /// Trait for forfeiting ownership of the current raw descriptor, and returning the raw descriptor
 pub trait IntoRawDescriptor {
@@ -46,7 +56,7 @@ pub fn clone_descriptor(descriptor: &dyn AsRawDescriptor) -> Result<RawDescripto
 /// Clones `fd`, returning a new file descriptor that refers to the same open file description as
 /// `fd`. The cloned fd will have the `FD_CLOEXEC` flag set but will not share any other file
 /// descriptor flags with `fd`.
-pub fn clone_fd(fd: &dyn AsRawFd) -> Result<RawFd> {
+fn clone_fd(fd: &dyn AsRawFd) -> Result<RawFd> {
     // Safe because this doesn't modify any memory and we check the return value.
     let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if ret < 0 {
@@ -60,7 +70,7 @@ pub fn clone_fd(fd: &dyn AsRawFd) -> Result<RawFd> {
 #[derive(Serialize, Deserialize, Debug, Eq)]
 #[serde(transparent)]
 pub struct SafeDescriptor {
-    #[serde(with = "crate::with_raw_descriptor")]
+    #[serde(with = "super::with_raw_descriptor")]
     descriptor: RawDescriptor,
 }
 
@@ -130,6 +140,27 @@ impl TryFrom<&dyn AsRawFd> for SafeDescriptor {
         Ok(SafeDescriptor {
             descriptor: clone_fd(fd)?,
         })
+    }
+}
+
+impl TryFrom<&dyn AsRawDescriptor> for SafeDescriptor {
+    type Error = std::io::Error;
+
+    /// Clones the underlying descriptor (handle), internally creating a new descriptor.
+    fn try_from(rd: &dyn AsRawDescriptor) -> std::result::Result<Self, Self::Error> {
+        // Safe because the underlying raw descriptor is guaranteed valid by rd's existence.
+        //
+        // Note that we are cloning the underlying raw descriptor since we have no guarantee of
+        // its existence after this function returns.
+        let rd_as_safe_desc = ManuallyDrop::new(unsafe {
+            SafeDescriptor::from_raw_descriptor(rd.as_raw_descriptor())
+        });
+
+        // We have to clone rd because we have no guarantee ownership was transferred (rd is
+        // borrowed).
+        rd_as_safe_desc
+            .try_clone()
+            .map_err(|e| Self::Error::from_raw_os_error(e.errno()))
     }
 }
 
@@ -244,8 +275,10 @@ AsRawDescriptor!(File);
 AsRawDescriptor!(UnlinkUnixSeqpacketListener);
 AsRawDescriptor!(UdpSocket);
 AsRawDescriptor!(UnixDatagram);
+AsRawDescriptor!(UnixListener);
 AsRawDescriptor!(UnixStream);
 FromRawDescriptor!(File);
+FromRawDescriptor!(UnixStream);
 FromRawDescriptor!(UnixDatagram);
 IntoRawDescriptor!(File);
 IntoRawDescriptor!(UnixDatagram);

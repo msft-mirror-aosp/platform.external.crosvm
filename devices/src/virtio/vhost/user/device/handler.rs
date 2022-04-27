@@ -45,6 +45,7 @@
 // VhostUserSlaveReqHandlerMut trait methods. These dispatch back to the supplied VhostUserBackend
 // implementation (this is what our devices implement).
 
+use base::AsRawDescriptor;
 use std::convert::{From, TryFrom};
 use std::fs::File;
 use std::num::Wrapping;
@@ -53,14 +54,13 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base::{
-    error, Event, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor, SharedMemory,
-    SharedMemoryUnix, UnlinkUnixListener,
+    clear_fd_flags, error, info, Event, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor,
+    SharedMemory, SharedMemoryUnix, UnlinkUnixListener,
 };
 use cros_async::{AsyncWrapper, Executor};
 use sync::Mutex;
-use sys_util::clear_fd_flags;
 use vm_memory::{GuestAddress, GuestMemory, MemoryRegion};
 use vmm_vhost::{
     connection::vfio::{Endpoint as VfioEndpoint, Listener as VfioListener},
@@ -74,9 +74,11 @@ use vmm_vhost::{
 
 use vmm_vhost::{Error as VhostError, Result as VhostResult, VhostUserSlaveReqHandlerMut};
 
-use crate::vfio::VfioRegionAddr;
+use crate::vfio::{VfioDevice, VfioRegionAddr};
 use crate::virtio::vhost::user::device::vvu::{
-    device::VvuDevice, doorbell::DoorbellRegion, pci::VvuPciDevice,
+    device::VvuDevice,
+    doorbell::DoorbellRegion,
+    pci::{VvuPciCaps, VvuPciDevice},
 };
 use crate::virtio::{Queue, SignalableInterrupt};
 
@@ -162,20 +164,18 @@ pub fn create_guest_memory(
 }
 
 pub fn create_vvu_guest_memory(
-    device: &VvuPciDevice,
+    vfio_dev: &VfioDevice,
+    shared_mem_addr: &VfioRegionAddr,
     contexts: &[VhostUserMemoryRegion],
 ) -> VhostResult<(GuestMemory, Vec<MappingInfo>)> {
-    let file_offset = device
-        .vfio_dev
-        .get_offset_for_addr(device.caps.shared_mem_cfg_addr())
-        .map_err(|e| {
-            error!("failed to get underlying file: {}", e);
-            VhostError::InvalidOperation
-        })?;
+    let file_offset = vfio_dev.get_offset_for_addr(shared_mem_addr).map_err(|e| {
+        error!("failed to get underlying file: {}", e);
+        VhostError::InvalidOperation
+    })?;
 
     let mut vmm_maps = Vec::with_capacity(contexts.len());
     let mut regions = Vec::with_capacity(contexts.len());
-    let page_size = sys_util::pagesize() as u64;
+    let page_size = base::pagesize() as u64;
     for region in contexts {
         let offset = file_offset + region.mmap_offset;
         assert_eq!(offset % page_size, 0);
@@ -186,7 +186,7 @@ pub fn create_vvu_guest_memory(
             size: region.memory_size,
         });
 
-        let cloned_file = device.vfio_dev.dev_file().try_clone().map_err(|e| {
+        let cloned_file = vfio_dev.dev_file().try_clone().map_err(|e| {
             error!("failed to clone vfio device file: {}", e);
             VhostError::InvalidOperation
         })?;
@@ -332,9 +332,13 @@ impl Vring {
     }
 }
 
-enum HandlerType {
+pub(super) enum HandlerType {
     VhostUser,
-    Vvu { device: Arc<Mutex<VvuPciDevice>> },
+    Vvu {
+        vfio_dev: Arc<VfioDevice>,
+        caps: VvuPciCaps,
+        notification_evts: Vec<Event>,
+    },
 }
 
 impl Default for HandlerType {
@@ -403,7 +407,7 @@ where
             .await?;
         let mut req_handler =
             SlaveReqHandler::from_stream(socket, Arc::new(std::sync::Mutex::new(self)));
-        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawFd)
+        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawDescriptor)
             .map(AsyncWrapper::new)
             .expect("failed to get safe descriptor for handler");
         let handler_source = ex
@@ -415,18 +419,29 @@ where
                 .wait_readable()
                 .await
                 .context("failed to wait for the handler socket to become readable")?;
-            req_handler
-                .handle_request()
-                .context("failed to handle a vhost-user request")?;
+            match req_handler.handle_request() {
+                Ok(()) => (),
+                Err(VhostError::ClientExit) => {
+                    info!("vhost-user connection closed");
+                    // Exit as the client closed the connection.
+                    return Ok(());
+                }
+                Err(e) => {
+                    bail!("failed to handle a vhost-user request: {}", e);
+                }
+            };
         }
     }
 
     /// Starts listening virtio-vhost-user device with VFIO to handle incoming vhost-user messages
     /// forwarded by it.
-    pub async fn run_vvu(mut self, device: VvuPciDevice, ex: &Executor) -> Result<()> {
-        let device = Arc::new(Mutex::new(device));
-        let driver = VvuDevice::new(Arc::clone(&device));
-        self.handler_type = HandlerType::Vvu { device };
+    pub async fn run_vvu(mut self, mut device: VvuPciDevice, ex: &Executor) -> Result<()> {
+        self.handler_type = HandlerType::Vvu {
+            vfio_dev: Arc::clone(&device.vfio_dev),
+            caps: device.caps.clone(),
+            notification_evts: std::mem::take(&mut device.notification_evts),
+        };
+        let driver = VvuDevice::new(device);
 
         let mut listener = VfioListener::new(driver)
             .map_err(|e| anyhow!("failed to create a VFIO listener: {}", e))
@@ -443,7 +458,7 @@ where
             .map_err(|e| anyhow!("failed to accept VFIO connection: {}", e))?
             .expect("vvu proxy is unavailable via VFIO");
 
-        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawFd)
+        let h = SafeDescriptor::try_from(&req_handler as &dyn AsRawDescriptor)
             .map(AsyncWrapper::new)
             .expect("failed to get safe descriptor for handler");
         let handler_source = ex
@@ -554,13 +569,16 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
                 }
                 create_guest_memory(contexts, files)?
             }
-            HandlerType::Vvu { device, .. } => {
+            HandlerType::Vvu {
+                vfio_dev: device,
+                caps,
+                ..
+            } => {
                 // virtio-vhost-user doesn't pass FDs.
                 if !files.is_empty() {
                     return Err(VhostError::InvalidParam);
                 }
-                let device = device.lock();
-                create_vvu_guest_memory(&device, contexts)?
+                create_vvu_guest_memory(device.as_ref(), caps.shared_mem_cfg_addr(), contexts)?
             }
         };
 
@@ -661,16 +679,16 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
                 // Safe because we own the file.
                 unsafe { Event::from_raw_descriptor(file.into_raw_descriptor()) }
             }
-            HandlerType::Vvu { device, .. } => {
+            HandlerType::Vvu {
+                notification_evts, ..
+            } => {
                 if file.is_some() {
                     return Err(VhostError::InvalidParam);
                 }
-                device.lock().notification_evts[index as usize]
-                    .try_clone()
-                    .map_err(|e| {
-                        error!("failed to clone notification_evts[{}]: {}", index, e);
-                        VhostError::InvalidOperation
-                    })?
+                notification_evts[index as usize].try_clone().map_err(|e| {
+                    error!("failed to clone notification_evts[{}]: {}", index, e);
+                    VhostError::InvalidOperation
+                })?
             }
         };
 
@@ -712,15 +730,21 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
                     VhostError::InvalidParam
                 })?)
             }
-            HandlerType::Vvu { device, .. } => {
-                let device = device.lock();
-                let vfio = Arc::clone(&device.vfio_dev);
-                let base = device.caps.doorbell_base_addr();
+            HandlerType::Vvu {
+                vfio_dev: device,
+                caps,
+                ..
+            } => {
+                let base = caps.doorbell_base_addr();
                 let addr = VfioRegionAddr {
                     index: base.index,
-                    addr: base.addr + (index as u64 * device.caps.doorbell_off_multiplier() as u64),
+                    addr: base.addr + (index as u64 * caps.doorbell_off_multiplier() as u64),
                 };
-                Doorbell::Vfio(DoorbellRegion { vfio, index, addr })
+                Doorbell::Vfio(DoorbellRegion {
+                    vfio: Arc::clone(device),
+                    index,
+                    addr,
+                })
             }
         };
 
@@ -989,6 +1013,9 @@ mod tests {
                     .unwrap();
             }
 
+            // The VMM side is supposed to stop before the device side.
+            drop(vmm_handler);
+
             vmm_bar.wait();
         });
 
@@ -1027,5 +1054,10 @@ mod tests {
         }
 
         dev_bar.wait();
+
+        match listener.handle_request() {
+            Err(VhostError::ClientExit) => (),
+            r => panic!("Err(ClientExit) was expected but {:?}", r),
+        }
     }
 }

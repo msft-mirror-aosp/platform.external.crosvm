@@ -16,7 +16,7 @@ use remain::sorted;
 use thiserror::Error;
 
 use std::cmp::{max, min};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
@@ -432,13 +432,12 @@ impl QcowFile {
             let path = backing_file_path.clone();
             let backing_raw_file = open_file(
                 Path::new(&path),
-                true, /*read_only*/
-                // TODO(b/190435784): Add support for O_DIRECT.
-                false, /*O_DIRECT*/
+                OpenOptions::new().read(true), // TODO(b/190435784): Add support for O_DIRECT.
             )
             .map_err(|e| Error::BackingFileIo(e.into()))?;
-            let backing_file = create_disk_file(backing_raw_file, max_nesting_depth)
-                .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
+            let backing_file =
+                create_disk_file(backing_raw_file, max_nesting_depth, Path::new(&path))
+                    .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
             Some(backing_file)
         } else {
             None
@@ -574,15 +573,18 @@ impl QcowFile {
         backing_file_name: &str,
         backing_file_max_nesting_depth: u32,
     ) -> Result<QcowFile> {
+        let backing_path = Path::new(backing_file_name);
         let backing_raw_file = open_file(
-            Path::new(backing_file_name),
-            true, /*read_only*/
-            // TODO(b/190435784): add support for O_DIRECT.
-            false, /*O_DIRECT*/
+            backing_path,
+            OpenOptions::new().read(true), // TODO(b/190435784): add support for O_DIRECT.
         )
         .map_err(|e| Error::BackingFileIo(e.into()))?;
-        let backing_file = create_disk_file(backing_raw_file, backing_file_max_nesting_depth)
-            .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
+        let backing_file = create_disk_file(
+            backing_raw_file,
+            backing_file_max_nesting_depth,
+            backing_path,
+        )
+        .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
         let size = backing_file.get_len().map_err(Error::BackingFileIo)?;
         let header = QcowHeader::create_for_size_and_path(size, Some(backing_file_name))?;
         let mut result = QcowFile::new_from_header(file, header, backing_file_max_nesting_depth)?;

@@ -18,9 +18,8 @@ rust_library {
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
-    edition: "2018",
+    edition: "2021",
     features: [
-        "gfxstream",
         "virgl_renderer",
         "virgl_renderer_next",
     ],
@@ -32,10 +31,13 @@ rust_library {
         "libthiserror",
     ],
     proc_macros: ["libremain"],
-    shared_libs: ["libgfxstream_backend"],
     target: {
         host: {
-            shared_libs: ["libvirglrenderer"],
+            features: ["gfxstream"],
+            shared_libs: [
+                "libgfxstream_backend",
+                "libvirglrenderer",
+            ],
         },
         android: {
             shared_libs: [
@@ -63,9 +65,8 @@ rust_test {
     test_options: {
         unit_test: true,
     },
-    edition: "2018",
+    edition: "2021",
     features: [
-        "gfxstream",
         "virgl_renderer",
         "virgl_renderer_next",
     ],
@@ -77,10 +78,13 @@ rust_test {
         "libthiserror",
     ],
     proc_macros: ["libremain"],
-    shared_libs: ["libgfxstream_backend"],
     target: {
         host: {
-            shared_libs: ["libvirglrenderer"],
+            features: ["gfxstream"],
+            shared_libs: [
+                "libgfxstream_backend",
+                "libvirglrenderer",
+            ],
         },
         android: {
             shared_libs: [
@@ -94,5 +98,3 @@ rust_test {
         },
     },
 }
-
-

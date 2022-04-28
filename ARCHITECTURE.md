@@ -8,14 +8,14 @@ The principle characteristics of crosvm are:
 - Written in Rust for security and safety
 
 A typical session of crosvm starts in `main.rs` where command line parsing is done to build up a
-`Config` structure. The `Config` is used by `run_config` in `linux.rs` to setup and execute a VM.
-Broken down into rough steps:
+`Config` structure. The `Config` is used by `run_config` in `linux/mod.rs` to setup and execute a
+VM. Broken down into rough steps:
 
 1. Load the linux kernel from an ELF file.
 1. Create a handful of control sockets used by the virtual devices.
 1. Invoke the architecture specific VM builder `Arch::build_vm` (located in `x86_64/src/lib.rs` or
    `aarch64/src/lib.rs`).
-1. `Arch::build_vm` will itself invoke the provided `create_devices` function from `linux.rs`
+1. `Arch::build_vm` will itself invoke the provided `create_devices` function from `linux/mod.rs`
 1. `create_devices` creates every PCI device, including the virtio devices, that were configured in
    `Config`, along with matching [minijail] configs for each.
 1. `Arch::generate_pci_root`, using a list of every PCI device with optional `Minijail`, will
@@ -35,12 +35,12 @@ invalid.
 
 ## Sandboxing Policy
 
-Every sandbox is made with [minijail] and starts with `create_base_minijail` in `linux.rs` which set
-some very restrictive settings. Linux namespaces and seccomp filters are used extensively. Each
-seccomp policy can be found under `seccomp/{arch}/{device}.policy` and should start by
-`@include`-ing the `common_device.policy`. With the exception of architecture specific devices (such
-as `Pl030` on ARM or `I8042` on x86_64), every device will need a different policy for each
-supported architecture.
+Every sandbox is made with [minijail] and starts with `create_base_minijail` in
+`linux/jail_helpers.rs` which set some very restrictive settings. Linux namespaces and seccomp
+filters are used extensively. Each seccomp policy can be found under
+`seccomp/{arch}/{device}.policy` and should start by `@include`-ing the `common_device.policy`. With
+the exception of architecture specific devices (such as `Pl030` on ARM or `I8042` on x86_64), every
+device will need a different policy for each supported architecture.
 
 ## The VM Control Sockets
 
@@ -51,7 +51,7 @@ separation in case a device becomes compromised by a malicious guest. For exampl
 that is able to allocate MSI routes would not be able to use the same socket to (de)register guest
 memory. During the device initialization stage, each device that requires some aspect of VM control
 will have a constructor that requires the corresponding control socket. The control socket will get
-preserved when the device is sandboxed and and the other side of the socket will be waited on in the
+preserved when the device is sandboxed and the other side of the socket will be waited on in the
 main process's control loop.
 
 The socket exposed by crosvm with the `--socket` command line argument is another form of the VM
@@ -208,7 +208,8 @@ Source code is organized into crates, each with their own unit tests.
 - `kernel_loader` - Loads elf64 kernel files to a slice of memory.
 - `kvm_sys` - Low-level (mostly) auto-generated structures and constants for using KVM.
 - `kvm` - Unsafe, low-level wrapper code for using `kvm_sys`.
-- `libvda` - Safe wrapper of [libvda], a Chrome OS HW-accelerated video decoding/encoding library.
+- `media/libvda` - Safe wrapper of [libvda], a Chrome OS HW-accelerated video decoding/encoding
+  library.
 - `net_sys` - Low-level (mostly) auto-generated structures and constants for creating TUN/TAP
   devices.
 - `net_util` - Wrapper for creating TUN/TAP devices.

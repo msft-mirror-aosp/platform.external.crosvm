@@ -19,6 +19,10 @@ import test_target
 from test_target import TestTarget
 import testvm
 from test_config import CRATE_OPTIONS, TestOption, BUILD_FEATURES
+from check_code_hygiene import (
+    has_platform_dependent_code,
+    has_crlf_line_endings,
+)
 
 USAGE = """\
 Runs tests for crosvm locally, in a vm or on a remote device.
@@ -49,8 +53,13 @@ Arch = test_target.Arch
 # Print debug info. Overriden by -v
 VERBOSE = False
 
-# Kill a test after 60 seconds to prevent frozen tests from running too long.
+# Timeouts for tests to prevent them from running too long.
 TEST_TIMEOUT_SECS = 60
+LARGE_TEST_TIMEOUT_SECS = 120
+
+# Double the timeout if the test is running in an emulation environment, which will be
+# significantly slower than native environments.
+EMULATION_TIMEOUT_MULTIPLIER = 2
 
 # Number of parallel processes for executing tests.
 PARALLELISM = 4
@@ -74,25 +83,34 @@ class Executable(NamedTuple):
     binary_path: Path
     crate_name: str
     cargo_target: str
+    kind: str
     is_test: bool
     is_fresh: bool
+    arch: Arch
 
     @property
     def name(self):
         return f"{self.crate_name}:{self.cargo_target}"
 
 
+class Crate(NamedTuple):
+    """Container for info about crate."""
+
+    name: str
+    path: Path
+
+
 def get_workspace_excludes(target_arch: Arch):
     for crate, options in CRATE_OPTIONS.items():
         if TestOption.DO_NOT_BUILD in options:
             yield crate
-        elif TestOption.BUILD_ARM_ONLY in options and (
-            target_arch != "aarch64" and target_arch != "armhf"
-        ):
+        elif TestOption.DO_NOT_BUILD_X86_64 in options and target_arch == "x86_64":
             yield crate
-        elif TestOption.BUILD_X86_ONLY in options and target_arch != "x86_64":
+        elif TestOption.DO_NOT_BUILD_AARCH64 in options and target_arch == "aarch64":
             yield crate
         elif TestOption.DO_NOT_BUILD_ARMHF in options and target_arch == "armhf":
+            yield crate
+        elif TestOption.DO_NOT_BUILD_WIN64 in options and target_arch == "win64":
             yield crate
 
 
@@ -100,22 +118,30 @@ def should_run_executable(executable: Executable, target_arch: Arch):
     options = CRATE_OPTIONS.get(executable.crate_name, [])
     if TestOption.DO_NOT_RUN in options:
         return False
-    if TestOption.RUN_ARM_ONLY in options:
-        return target_arch == "aarch64" or target_arch == "armhf"
-    if TestOption.RUN_X86_ONLY in options:
-        return target_arch == "x86_64"
+    if TestOption.DO_NOT_RUN_X86_64 in options and target_arch == "x86_64":
+        return False
+    if TestOption.DO_NOT_RUN_AARCH64 in options and target_arch == "aarch64":
+        return False
     if TestOption.DO_NOT_RUN_ARMHF in options and target_arch == "armhf":
+        return False
+    if TestOption.DO_NOT_RUN_ON_FOREIGN_KERNEL in options and target_arch != executable.arch:
         return False
     return True
 
 
-def list_common_crates():
-    for path in COMMON_ROOT.glob("*/Cargo.toml"):
-        yield path.parent.name
+def list_common_crates(target_arch: Arch):
+    excluded_crates = list(get_workspace_excludes(target_arch))
+    for path in COMMON_ROOT.glob("**/Cargo.toml"):
+        if not path.parent.name in excluded_crates:
+            yield Crate(name=path.parent.name, path=path.parent)
+
+
+def exclude_crosvm(target_arch: Arch):
+    return "crosvm" in get_workspace_excludes(target_arch)
 
 
 def cargo(
-    cargo_command: str, cwd: Path, flags: list[str], env: dict[str, str]
+    cargo_command: str, cwd: Path, flags: list[str], env: dict[str, str], build_arch: Arch
 ) -> Iterable[Executable]:
     """
     Executes a cargo command and returns the list of test binaries generated.
@@ -168,8 +194,10 @@ def cargo(
                 Path(json_line.get("executable")),
                 crate_name=json_line.get("package_id", "").split(" ")[0],
                 cargo_target=json_line.get("target").get("name"),
+                kind=json_line.get("target").get("kind")[0],
                 is_test=json_line.get("profile", {}).get("test", False),
                 is_fresh=json_line.get("fresh", False),
+                arch=build_arch,
             )
 
     if process.wait() != 0:
@@ -181,55 +209,66 @@ def cargo(
 
 def cargo_build_executables(
     flags: list[str],
+    build_arch: Arch,
     cwd: Path = Path("."),
     env: Dict[str, str] = {},
 ) -> Iterable[Executable]:
     """Build all test binaries for the given list of crates."""
     # Run build first, to make sure compiler errors of building non-test
     # binaries are caught.
-    yield from cargo("build", cwd, flags, env)
+    yield from cargo("build", cwd, flags, env, build_arch)
 
     # Build all tests and return the collected executables
-    yield from cargo("test", cwd, ["--no-run", *flags], env)
+    yield from cargo("test", cwd, ["--no-run", *flags], env, build_arch)
 
 
-def build_common_crate(build_env: dict[str, str], crate_name: str):
-    print(f"Building tests for: common/{crate_name}")
-    return list(
-        cargo_build_executables(
-            [],
-            env=build_env,
-            cwd=COMMON_ROOT / crate_name,
-        )
-    )
+def build_common_crate(build_env: dict[str, str], build_arch: Arch, crate: Crate):
+    print(f"Building tests for: common/{crate.name}")
+    return list(cargo_build_executables([], build_arch, env=build_env, cwd=crate.path))
 
 
-def build_all_binaries(target: TestTarget, target_arch: Arch):
+def build_all_binaries(target: TestTarget, build_arch: Arch):
     """Discover all crates and build them."""
     build_env = os.environ.copy()
-    build_env.update(test_target.get_cargo_env(target, target_arch))
+    build_env.update(test_target.get_cargo_env(target, build_arch))
 
     print("Building crosvm workspace")
     yield from cargo_build_executables(
         [
-            "--features=" + BUILD_FEATURES[target_arch],
+            "--features=" + BUILD_FEATURES[build_arch],
             "--verbose",
             "--workspace",
-            *[
-                f"--exclude={crate}"
-                for crate in get_workspace_excludes(target_arch)
-            ],
+            *[f"--exclude={crate}" for crate in get_workspace_excludes(build_arch)],
         ],
+        build_arch,
         cwd=CROSVM_ROOT,
         env=build_env,
     )
 
     with Pool(PARALLELISM) as pool:
         for executables in pool.imap(
-            functools.partial(build_common_crate, build_env),
-            list_common_crates(),
+            functools.partial(build_common_crate, build_env, build_arch),
+            list_common_crates(build_arch),
         ):
             yield from executables
+
+
+def is_emulated(target: TestTarget, executable: Executable) -> bool:
+    if target.is_host:
+        # User-space emulation can run foreing-arch executables on the host.
+        return executable.arch != target.arch
+    elif target.vm:
+        return target.vm == "aarch64"
+    return False
+
+
+def get_test_timeout(target: TestTarget, executable: Executable):
+    large = TestOption.LARGE in CRATE_OPTIONS.get(executable.crate_name, [])
+    timeout = LARGE_TEST_TIMEOUT_SECS if large else TEST_TIMEOUT_SECS
+    if is_emulated(target, executable):
+        return timeout * EMULATION_TIMEOUT_MULTIPLIER
+    else:
+        return timeout
 
 
 def execute_test(target: TestTarget, executable: Executable):
@@ -245,15 +284,26 @@ def execute_test(target: TestTarget, executable: Executable):
     if TestOption.SINGLE_THREADED in options:
         args += ["--test-threads=1"]
 
+    binary_path = executable.binary_path
+
+    if executable.arch == "win64" and executable.kind != "proc-macro" and os.name != "nt":
+        args.insert(0, binary_path)
+        binary_path = "wine64"
+
+
+    # proc-macros and their tests are executed on the host.
+    if executable.kind == "proc-macro":
+        target = TestTarget("host")
+
     if VERBOSE:
-        print(f"Running test {executable.name}...")
+        print(f"Running test {executable.name} on {target}...")
     try:
         # Pipe stdout/err to be printed in the main process if needed.
         test_process = test_target.exec_file_on_target(
             target,
-            executable.binary_path,
+            binary_path,
             args=args,
-            timeout=TEST_TIMEOUT_SECS,
+            timeout=get_test_timeout(target, executable),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -275,11 +325,10 @@ def execute_test(target: TestTarget, executable: Executable):
 def execute_all(
     executables: list[Executable],
     target: test_target.TestTarget,
-    arch: Arch,
     repeat: int,
 ):
     """Executes all tests in the `executables` list in parallel."""
-    executables = [e for e in executables if should_run_executable(e, arch)]
+    executables = [e for e in executables if should_run_executable(e, target.arch)]
     if repeat > 1:
         executables = executables * repeat
         random.shuffle(executables)
@@ -287,9 +336,7 @@ def execute_all(
     sys.stdout.write(f"Running {len(executables)} test binaries on {target}")
     sys.stdout.flush()
     with Pool(PARALLELISM) as pool:
-        for result in pool.imap(
-            functools.partial(execute_test, target), executables
-        ):
+        for result in pool.imap(functools.partial(execute_test, target), executables):
             if not result.success or VERBOSE:
                 msg = "passed" if result.success else "failed"
                 print()
@@ -346,38 +393,47 @@ def main():
     os.environ["RUST_BACKTRACE"] = "1"
 
     target = (
-        test_target.TestTarget(args.target)
-        if args.target
-        else test_target.TestTarget.default()
+        test_target.TestTarget(args.target) if args.target else test_target.TestTarget.default()
     )
     print("Test target:", target)
 
-    arch = args.arch
-    if not arch:
-        arch = test_target.get_target_arch(target)
-    print("Building for architecture:", arch)
+    build_arch = args.arch or target.arch
+    print("Building for architecture:", build_arch)
 
     # Start booting VM while we build
     if target.vm:
         testvm.build_if_needed(target.vm)
         testvm.up(target.vm)
 
-    executables = list(build_all_binaries(target, arch))
+    hygiene, error = has_platform_dependent_code(Path("common/sys_util_core"))
+    if not hygiene:
+        print("Error: Platform dependent code not allowed in sys_util_core crate.")
+        print("Offending line: " + error)
+        sys.exit(-1)
+
+    crlf_endings = has_crlf_line_endings()
+    if crlf_endings:
+        print("Error: Following files have crlf(dos) line encodings")
+        print(*crlf_endings)
+        sys.exit(-1)
+
+    executables = list(build_all_binaries(target, build_arch))
 
     if args.build_only:
         print("Not running tests as requested.")
         sys.exit(0)
 
-    # Upload dependencies plus the main crosvm binary for integration tests
-    test_target.prepare_target(
-        target, extra_files=[find_crosvm_binary(executables).binary_path]
+    # Upload dependencies plus the main crosvm binary for integration tests if the
+    # crosvm binary is not excluded from testing.
+    extra_files = (
+        [find_crosvm_binary(executables).binary_path] if not exclude_crosvm(build_arch) else []
     )
+
+    test_target.prepare_target(target, extra_files=extra_files)
 
     # Execute all test binaries
     test_executables = [e for e in executables if e.is_test]
-    all_results = list(
-        execute_all(test_executables, target, arch, repeat=args.repeat)
-    )
+    all_results = list(execute_all(test_executables, target, repeat=args.repeat))
 
     failed = [r for r in all_results if not r.success]
     if len(failed) == 0:

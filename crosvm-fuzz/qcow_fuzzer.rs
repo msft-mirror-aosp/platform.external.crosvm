@@ -4,9 +4,10 @@
 
 #![no_main]
 
+use base::FileReadWriteAtVolatile;
 use cros_fuzz::fuzz_target;
+use data_model::VolatileSlice;
 use disk::QcowFile;
-use tempfile;
 
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -26,9 +27,9 @@ fuzz_target!(|bytes| {
     disk_file.write_all(&bytes[16..]).unwrap();
     disk_file.seek(SeekFrom::Start(0)).unwrap();
     if let Ok(mut qcow) = QcowFile::from(disk_file, max_nesting_depth) {
-        if qcow.seek(SeekFrom::Start(addr)).is_ok() {
-            let _ = qcow.write_all(&value.to_le_bytes());
-        }
+        let mut mem = value.to_le_bytes().to_owned();
+        let vslice = VolatileSlice::new(&mut mem);
+        let _ = qcow.write_all_at_volatile(vslice, addr);
     }
 });
 

@@ -17,7 +17,6 @@ use fuse::Server;
 use futures::future::{AbortHandle, Abortable};
 use hypervisor::ProtectionType;
 use minijail::{self, Minijail};
-use once_cell::sync::OnceCell;
 use sync::Mutex;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
@@ -27,15 +26,13 @@ use crate::virtio::copy_config;
 use crate::virtio::fs::passthrough::PassthroughFs;
 use crate::virtio::fs::{process_fs_queue, virtio_fs_config, FS_MAX_TAG_LEN};
 use crate::virtio::vhost::user::device::handler::{
-    CallEvent, DeviceRequestHandler, VhostUserBackend,
+    DeviceRequestHandler, Doorbell, VhostUserBackend,
 };
-
-static FS_EXECUTOR: OnceCell<Executor> = OnceCell::new();
 
 async fn handle_fs_queue(
     mut queue: virtio::Queue,
     mem: GuestMemory,
-    call_evt: Arc<Mutex<CallEvent>>,
+    doorbell: Arc<Mutex<Doorbell>>,
     kick_evt: EventAsync,
     server: Arc<fuse::Server<PassthroughFs>>,
     tube: Arc<Mutex<Tube>>,
@@ -48,7 +45,7 @@ async fn handle_fs_queue(
             error!("Failed to read kick event for fs queue: {}", e);
             break;
         }
-        if let Err(e) = process_fs_queue(&mem, &call_evt, &mut queue, &server, &tube, slot) {
+        if let Err(e) = process_fs_queue(&mem, &doorbell, &mut queue, &server, &tube, slot) {
             error!("Process FS queue failed: {}", e);
             break;
         }
@@ -114,6 +111,7 @@ fn jail_and_fork(
 }
 
 struct FsBackend {
+    ex: Executor,
     server: Arc<fuse::Server<PassthroughFs>>,
     tag: [u8; FS_MAX_TAG_LEN],
     avail_features: u64,
@@ -124,7 +122,7 @@ struct FsBackend {
 }
 
 impl FsBackend {
-    pub fn new(tag: &str) -> anyhow::Result<Self> {
+    pub fn new(ex: &Executor, tag: &str) -> anyhow::Result<Self> {
         if tag.len() > FS_MAX_TAG_LEN {
             bail!(
                 "fs tag is too long: {} (max supported: {})",
@@ -147,6 +145,7 @@ impl FsBackend {
         let server = Arc::new(Server::new(fs));
 
         Ok(FsBackend {
+            ex: ex.clone(),
             server,
             tag: fs_tag,
             avail_features,
@@ -162,7 +161,6 @@ impl VhostUserBackend for FsBackend {
     const MAX_QUEUE_NUM: usize = 2; /* worker queue and high priority queue */
     const MAX_VRING_LEN: u16 = 1024;
 
-    type Doorbell = CallEvent;
     type Error = anyhow::Error;
 
     fn features(&self) -> u64 {
@@ -219,7 +217,7 @@ impl VhostUserBackend for FsBackend {
         idx: usize,
         mut queue: virtio::Queue,
         mem: GuestMemory,
-        call_evt: Arc<Mutex<CallEvent>>,
+        doorbell: Arc<Mutex<Doorbell>>,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
@@ -227,29 +225,27 @@ impl VhostUserBackend for FsBackend {
             handle.abort();
         }
 
-        // Safe because the executor is initialized in main() below.
-        let ex = FS_EXECUTOR.get().expect("Executor not initialized");
-
         // Enable any virtqueue features that were negotiated (like VIRTIO_RING_F_EVENT_IDX).
         queue.ack_features(self.acked_features);
 
-        let kick_evt =
-            EventAsync::new(kick_evt.0, ex).context("failed to create EventAsync for kick_evt")?;
+        let kick_evt = EventAsync::new(kick_evt.0, &self.ex)
+            .context("failed to create EventAsync for kick_evt")?;
         let (handle, registration) = AbortHandle::new_pair();
         let (_, fs_device_tube) = Tube::pair()?;
 
-        ex.spawn_local(Abortable::new(
-            handle_fs_queue(
-                queue,
-                mem,
-                call_evt,
-                kick_evt,
-                self.server.clone(),
-                Arc::new(Mutex::new(fs_device_tube)),
-            ),
-            registration,
-        ))
-        .detach();
+        self.ex
+            .spawn_local(Abortable::new(
+                handle_fs_queue(
+                    queue,
+                    mem,
+                    doorbell,
+                    kick_evt,
+                    self.server.clone(),
+                    Arc::new(Mutex::new(fs_device_tube)),
+                ),
+                registration,
+            ))
+            .detach();
 
         self.workers[idx] = Some(handle);
         Ok(())
@@ -294,7 +290,8 @@ pub fn run_fs_device(program_name: &str, args: &[&str]) -> anyhow::Result<()> {
 
     base::syslog::init().context("Failed to initialize syslog")?;
 
-    let fs_device = FsBackend::new(&opts.tag)?;
+    let ex = Executor::new().context("Failed to create executor")?;
+    let fs_device = FsBackend::new(&ex, &opts.tag)?;
 
     // Create and bind unix socket
     let listener = UnixListener::bind(opts.socket).map(UnlinkUnixListener)?;
@@ -332,14 +329,6 @@ pub fn run_fs_device(program_name: &str, args: &[&str]) -> anyhow::Result<()> {
         }
     }
 
-    // Child, we can continue by spawning the executor and set up the device
-    let ex = Executor::new().context("Failed to create executor")?;
-
-    let _ = FS_EXECUTOR.set(ex.clone());
-
-    if let Err(e) = ex.run_until(handler.run_with_listener(listener, &ex)) {
-        bail!(e);
-    }
-
-    Ok(())
+    // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
+    ex.run_until(handler.run_with_listener(listener, &ex))?
 }

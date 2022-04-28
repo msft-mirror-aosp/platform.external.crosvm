@@ -8,39 +8,42 @@
 pub mod argument;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 pub mod gdb;
-#[path = "linux.rs"]
+#[path = "linux/mod.rs"]
 pub mod platform;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net;
+use std::ops::RangeInclusive;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use arch::{Pstore, VcpuAffinity};
-use base::RawDescriptor;
 use devices::serial_device::{SerialHardware, SerialParameters};
+use devices::virtio::block::block::DiskOption;
 #[cfg(feature = "audio_cras")]
 use devices::virtio::cras_backend::Parameters as CrasSndParameters;
 use devices::virtio::fs::passthrough;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::GpuParameters;
+use devices::virtio::vhost::vsock::VhostVsockDeviceParameter;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::VideoBackendType;
 #[cfg(feature = "audio")]
 use devices::Ac97Parameters;
 #[cfg(feature = "direct")]
 use devices::BusRange;
-use devices::IommuDevType;
-use devices::StubPciParameters;
+use devices::{IommuDevType, PciAddress, StubPciParameters};
 use hypervisor::ProtectionType;
 use libc::{getegid, geteuid};
+#[cfg(feature = "gpu")]
+use platform::GpuRenderServerParameters;
+use uuid::Uuid;
 use vm_control::BatteryType;
 
 static KVM_PATH: &str = "/dev/kvm";
-static VHOST_VSOCK_PATH: &str = "/dev/vhost-vsock";
 static VHOST_NET_PATH: &str = "/dev/vhost-net";
 static SECCOMP_POLICY_DIR: &str = "/usr/share/policy/crosvm";
 
@@ -55,20 +58,6 @@ pub enum Executable {
     Plugin(PathBuf),
 }
 
-/// Maximum length of a `DiskOption` identifier.
-///
-/// This is based on the virtio-block ID length limit.
-pub const DISK_ID_LEN: usize = 20;
-
-pub struct DiskOption {
-    pub path: PathBuf,
-    pub read_only: bool,
-    pub sparse: bool,
-    pub o_direct: bool,
-    pub block_size: u32,
-    pub id: Option<[u8; DISK_ID_LEN]>,
-}
-
 pub struct VhostUserOption {
     pub socket: PathBuf,
 }
@@ -81,6 +70,13 @@ pub struct VhostUserFsOption {
 pub struct VhostUserWlOption {
     pub socket: PathBuf,
     pub vm_tube: PathBuf,
+}
+
+/// Options for virtio-vhost-user proxy device.
+pub struct VvuOption {
+    pub socket: PathBuf,
+    pub addr: Option<PciAddress>,
+    pub uuid: Option<Uuid>,
 }
 
 /// A bind mount for directories in the plugin process.
@@ -274,6 +270,18 @@ impl VfioCommand {
 
     fn validate_params(kind: &str, value: &str) -> Result<(), argument::Error> {
         match kind {
+            "guest-address" => {
+                if value.eq_ignore_ascii_case("auto") || PciAddress::from_str(value).is_ok() {
+                    Ok(())
+                } else {
+                    Err(argument::Error::InvalidValue {
+                        value: format!("{}={}", kind.to_owned(), value.to_owned()),
+                        expected: String::from(
+                            "option must be `guest-address=auto|<BUS:DEVICE.FUNCTION>`",
+                        ),
+                    })
+                }
+            }
             "iommu" => {
                 if IommuDevType::from_str(value).is_ok() {
                     Ok(())
@@ -286,13 +294,19 @@ impl VfioCommand {
             }
             _ => Err(argument::Error::InvalidValue {
                 value: format!("{}={}", kind.to_owned(), value.to_owned()),
-                expected: String::from("option must be `iommu=<val>`"),
+                expected: String::from("option must be `guest-address=<val>` and/or `iommu=<val>`"),
             }),
         }
     }
 
     pub fn get_type(&self) -> VfioType {
         self.dev_type
+    }
+
+    pub fn guest_address(&self) -> Option<PciAddress> {
+        self.params
+            .get("guest-address")
+            .and_then(|addr| PciAddress::from_str(addr).ok())
     }
 
     pub fn iommu_dev_type(&self) -> IommuDevType {
@@ -305,17 +319,6 @@ impl VfioCommand {
     }
 }
 
-pub enum VhostVsockDeviceParameter {
-    Path(PathBuf),
-    Fd(RawDescriptor),
-}
-
-impl Default for VhostVsockDeviceParameter {
-    fn default() -> Self {
-        VhostVsockDeviceParameter::Path(PathBuf::from(VHOST_VSOCK_PATH))
-    }
-}
-
 #[derive(Debug)]
 pub struct FileBackedMappingParameters {
     pub address: u64,
@@ -324,6 +327,29 @@ pub struct FileBackedMappingParameters {
     pub offset: u64,
     pub writable: bool,
     pub sync: bool,
+}
+
+#[derive(Clone)]
+pub struct HostPcieRootPortParameters {
+    pub host_path: PathBuf,
+    pub hp_gpe: Option<u32>,
+}
+
+#[derive(Debug)]
+pub struct JailConfig {
+    pub pivot_root: PathBuf,
+    pub seccomp_policy_dir: PathBuf,
+    pub seccomp_log_failures: bool,
+}
+
+impl Default for JailConfig {
+    fn default() -> Self {
+        JailConfig {
+            pivot_root: PathBuf::from(option_env!("DEFAULT_PIVOT_ROOT").unwrap_or("/var/empty")),
+            seccomp_policy_dir: PathBuf::from(SECCOMP_POLICY_DIR),
+            seccomp_log_failures: false,
+        }
+    }
 }
 
 /// Aggregate of all configurable options for a running VM.
@@ -349,6 +375,8 @@ pub struct Config {
     pub executable_path: Option<Executable>,
     pub android_fstab: Option<PathBuf>,
     pub initrd_path: Option<PathBuf>,
+    pub jail_config: Option<JailConfig>,
+    pub jail_enabled: bool,
     pub params: Vec<String>,
     pub socket_path: Option<PathBuf>,
     pub balloon_control: Option<PathBuf>,
@@ -369,11 +397,10 @@ pub struct Config {
     pub wayland_socket_paths: BTreeMap<String, PathBuf>,
     pub x_display: Option<String>,
     pub shared_dirs: Vec<SharedDir>,
-    pub sandbox: bool,
-    pub seccomp_policy_dir: PathBuf,
-    pub seccomp_log_failures: bool,
     #[cfg(feature = "gpu")]
     pub gpu_parameters: Option<GpuParameters>,
+    #[cfg(feature = "gpu")]
+    pub gpu_render_server_parameters: Option<GpuRenderServerParameters>,
     pub software_tpm: bool,
     pub display_window_keyboard: bool,
     pub display_window_mouse: bool,
@@ -383,6 +410,7 @@ pub struct Config {
     pub sound: Option<PathBuf>,
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     pub syslog_tag: Option<String>,
+    pub usb: bool,
     pub virtio_single_touch: Vec<TouchDeviceOption>,
     pub virtio_multi_touch: Vec<TouchDeviceOption>,
     pub virtio_trackpad: Vec<TouchDeviceOption>,
@@ -390,6 +418,7 @@ pub struct Config {
     pub virtio_keyboard: Vec<PathBuf>,
     pub virtio_switches: Vec<PathBuf>,
     pub virtio_input_evdevs: Vec<PathBuf>,
+    pub virtio_iommu: bool,
     pub split_irqchip: bool,
     pub vfio: Vec<VfioCommand>,
     #[cfg(feature = "video-decoder")]
@@ -421,14 +450,28 @@ pub struct Config {
     pub direct_level_irq: Vec<u32>,
     #[cfg(feature = "direct")]
     pub direct_edge_irq: Vec<u32>,
+    #[cfg(feature = "direct")]
+    pub direct_wake_irq: Vec<u32>,
+    #[cfg(feature = "direct")]
+    pub direct_gpe: Vec<u32>,
     pub dmi_path: Option<PathBuf>,
     pub no_legacy: bool,
     pub host_cpu_topology: bool,
+    pub privileged_vm: bool,
     pub stub_pci_devices: Vec<StubPciParameters>,
-    pub vvu_proxy: Vec<VhostUserOption>,
+    pub vvu_proxy: Vec<VvuOption>,
     pub coiommu_param: Option<devices::CoIommuParameters>,
     pub file_backed_mappings: Vec<FileBackedMappingParameters>,
     pub init_memory: Option<u64>,
+    #[cfg(feature = "direct")]
+    pub pcie_rp: Vec<HostPcieRootPortParameters>,
+    pub rng: bool,
+    pub force_s2idle: bool,
+    pub strict_balloon: bool,
+    pub mmio_address_ranges: Vec<RangeInclusive<u64>>,
+    pub userspace_msr: BTreeSet<u32>,
+    #[cfg(target_os = "android")]
+    pub task_profiles: Vec<String>,
 }
 
 impl Default for Config {
@@ -455,6 +498,12 @@ impl Default for Config {
             executable_path: None,
             android_fstab: None,
             initrd_path: None,
+            // We initialize the jail configuration with a default value so jail-related options can
+            // apply irrespective of whether jail is enabled or not. `jail_config` will then be
+            // assigned `None` if it turns out that `jail_enabled` is `false` after we parse all the
+            // arguments.
+            jail_config: Some(Default::default()),
+            jail_enabled: !cfg!(feature = "default-no-sandbox"),
             params: Vec::new(),
             socket_path: None,
             balloon_control: None,
@@ -474,21 +523,21 @@ impl Default for Config {
             cid: None,
             #[cfg(feature = "gpu")]
             gpu_parameters: None,
+            #[cfg(feature = "gpu")]
+            gpu_render_server_parameters: None,
             software_tpm: false,
             wayland_socket_paths: BTreeMap::new(),
             x_display: None,
             display_window_keyboard: false,
             display_window_mouse: false,
             shared_dirs: Vec::new(),
-            sandbox: !cfg!(feature = "default-no-sandbox"),
-            seccomp_policy_dir: PathBuf::from(SECCOMP_POLICY_DIR),
-            seccomp_log_failures: false,
             #[cfg(feature = "audio")]
             ac97_parameters: Vec::new(),
             #[cfg(feature = "audio")]
             sound: None,
             serial_parameters: BTreeMap::new(),
             syslog_tag: None,
+            usb: true,
             virtio_single_touch: Vec::new(),
             virtio_multi_touch: Vec::new(),
             virtio_trackpad: Vec::new(),
@@ -496,6 +545,7 @@ impl Default for Config {
             virtio_keyboard: Vec::new(),
             virtio_switches: Vec::new(),
             virtio_input_evdevs: Vec::new(),
+            virtio_iommu: false,
             split_irqchip: false,
             vfio: Vec::new(),
             #[cfg(feature = "video-decoder")]
@@ -528,13 +578,27 @@ impl Default for Config {
             direct_level_irq: Vec::new(),
             #[cfg(feature = "direct")]
             direct_edge_irq: Vec::new(),
+            #[cfg(feature = "direct")]
+            direct_wake_irq: Vec::new(),
+            #[cfg(feature = "direct")]
+            direct_gpe: Vec::new(),
             dmi_path: None,
             no_legacy: false,
             host_cpu_topology: false,
+            privileged_vm: false,
             stub_pci_devices: Vec::new(),
             coiommu_param: None,
             file_backed_mappings: Vec::new(),
             init_memory: None,
+            #[cfg(feature = "direct")]
+            pcie_rp: Vec::new(),
+            rng: true,
+            force_s2idle: false,
+            strict_balloon: false,
+            mmio_address_ranges: Vec::new(),
+            userspace_msr: BTreeSet::new(),
+            #[cfg(target_os = "android")]
+            task_profiles: Vec::new(),
         }
     }
 }

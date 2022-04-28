@@ -277,7 +277,7 @@ impl CrossDomainState {
 
     fn receive_msg(
         &self,
-        opaque_data: &mut Vec<u8>,
+        opaque_data: &mut [u8],
         descriptors: &mut [i32; CROSS_DOMAIN_MAX_IDENTIFIERS],
     ) -> RutabagaResult<(usize, Vec<File>)> {
         // If any errors happen, the socket will get dropped, preventing more reading.
@@ -320,7 +320,7 @@ impl CrossDomainWorker {
         &mut self,
         fence: RutabagaFence,
         resample_evt: &Event,
-        receive_buf: &mut Vec<u8>,
+        receive_buf: &mut [u8],
     ) -> RutabagaResult<bool> {
         let events = self.wait_ctx.wait()?;
         let mut stop_thread = false;
@@ -347,15 +347,9 @@ impl CrossDomainWorker {
                             .zip(files.into_iter())
                             .take(num_files);
 
-                        for (((identifier, mut identifier_type), mut identifier_size), mut file) in
-                            iter
-                        {
+                        for (((identifier, identifier_type), identifier_size), mut file) in iter {
                             // Safe since the descriptors from receive_msg(..) are owned by us and valid.
-                            descriptor_analysis(
-                                &mut file,
-                                &mut identifier_type,
-                                &mut identifier_size,
-                            )?;
+                            descriptor_analysis(&mut file, identifier_type, identifier_size)?;
 
                             *identifier = match *identifier_type {
                                 CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB => add_item(
@@ -748,7 +742,7 @@ impl RutabagaContext for CrossDomainContext {
         &mut self,
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
-        handle: Option<RutabagaHandle>,
+        handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         let item_id = resource_create_blob.blob_id as u32;
 
@@ -772,7 +766,7 @@ impl RutabagaContext for CrossDomainContext {
                     // create blob function, which says "the actual allocation is done via
                     // VIRTIO_GPU_CMD_SUBMIT_3D."  However, atomic resource creation is easiest for the
                     // cross-domain use case, so whatever.
-                    let hnd = match handle {
+                    let hnd = match handle_opt {
                         Some(handle) => handle,
                         None => self.gralloc.lock().allocate_memory(*reqs)?,
                     };
@@ -921,6 +915,10 @@ impl RutabagaContext for CrossDomainContext {
 
         Ok(())
     }
+
+    fn component_type(&self) -> RutabagaComponentType {
+        RutabagaComponentType::CrossDomain
+    }
 }
 
 impl RutabagaComponent for CrossDomain {
@@ -955,6 +953,7 @@ impl RutabagaComponent for CrossDomain {
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
         iovec_opt: Option<Vec<RutabagaIovec>>,
+        _handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         if resource_create_blob.blob_mem != RUTABAGA_BLOB_MEM_GUEST
             && resource_create_blob.blob_flags != RUTABAGA_BLOB_FLAG_USE_MAPPABLE

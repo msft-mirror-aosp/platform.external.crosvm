@@ -124,7 +124,7 @@ fn range_intersection(a: &Range<u64>, b: &Range<u64>) -> Range<u64> {
 }
 
 /// The version of the composite disk format supported by this implementation.
-const COMPOSITE_DISK_VERSION: u64 = 1;
+const COMPOSITE_DISK_VERSION: u64 = 2;
 
 /// A magic string placed at the beginning of a composite disk file to identify it.
 pub const CDISK_MAGIC: &str = "composite_disk\x1d";
@@ -157,7 +157,11 @@ impl CompositeDiskFile {
     /// Set up a composite disk by reading the specification from a file. The file must consist of
     /// the CDISK_MAGIC string followed by one binary instance of the CompositeDisk protocol
     /// buffer. Returns an error if it could not read the file or if the specification was invalid.
-    pub fn from_file(mut file: File, max_nesting_depth: u32) -> Result<CompositeDiskFile> {
+    pub fn from_file(
+        mut file: File,
+        max_nesting_depth: u32,
+        image_path: &Path,
+    ) -> Result<CompositeDiskFile> {
         file.seek(SeekFrom::Start(0))
             .map_err(Error::ReadSpecificationError)?;
         let mut magic_space = [0u8; CDISK_MAGIC_LEN];
@@ -168,22 +172,28 @@ impl CompositeDiskFile {
         }
         let proto: cdisk_spec::CompositeDisk =
             Message::parse_from_reader(&mut file).map_err(Error::InvalidProto)?;
-        if proto.get_version() != COMPOSITE_DISK_VERSION {
+        if proto.get_version() > COMPOSITE_DISK_VERSION {
             return Err(Error::UnknownVersion(proto.get_version()));
         }
         let mut disks: Vec<ComponentDiskPart> = proto
             .get_component_disks()
             .iter()
             .map(|disk| {
-                let file = open_file(
-                    Path::new(disk.get_file_path()),
-                    disk.get_read_write_capability() != cdisk_spec::ReadWriteCapability::READ_WRITE,
-                    // TODO(b/190435784): add support for O_DIRECT.
-                    false, /*O_DIRECT*/
+                let path = if proto.get_version() == 1 {
+                    PathBuf::from(disk.get_file_path())
+                } else {
+                    image_path.parent().unwrap().join(disk.get_file_path())
+                };
+                let comp_file = open_file(
+                    &path,
+                    OpenOptions::new().read(true).write(
+                        disk.get_read_write_capability()
+                            == cdisk_spec::ReadWriteCapability::READ_WRITE,
+                    ), // TODO(b/190435784): add support for O_DIRECT.
                 )
                 .map_err(|e| Error::OpenFile(e.into(), disk.get_file_path().to_string()))?;
                 Ok(ComponentDiskPart {
-                    file: create_disk_file(file, max_nesting_depth)
+                    file: create_disk_file(comp_file, max_nesting_depth, &path)
                         .map_err(|e| Error::DiskError(Box::new(e)))?,
                     offset: disk.get_offset(),
                     length: 0, // Assigned later
@@ -326,9 +336,7 @@ impl PunchHole for CompositeDiskFile {
                 intersection.start - disk.offset,
                 intersection.end - intersection.start,
             );
-            if result.is_err() {
-                return result;
-            }
+            result?;
         }
         Ok(())
     }
@@ -347,9 +355,7 @@ impl FileAllocate for CompositeDiskFile {
                 intersection.start - disk.offset,
                 intersection.end - intersection.start,
             );
-            if result.is_err() {
-                return result;
-            }
+            result?;
         }
         Ok(())
     }
@@ -373,8 +379,7 @@ impl AsRawDescriptors for CompositeDiskFile {
     fn as_raw_descriptors(&self) -> Vec<RawDescriptor> {
         self.component_disks
             .iter()
-            .map(|d| d.file.as_raw_descriptors())
-            .flatten()
+            .flat_map(|d| d.file.as_raw_descriptors())
             .collect()
     }
 }
@@ -729,7 +734,7 @@ mod tests {
             file2.as_raw_descriptor(),
             file3.as_raw_descriptor(),
         ];
-        in_fds.sort();
+        in_fds.sort_unstable();
         let disk_part1 = ComponentDiskPart {
             file: Box::new(file1),
             offset: 0,
@@ -747,7 +752,7 @@ mod tests {
         };
         let composite = CompositeDiskFile::new(vec![disk_part1, disk_part2, disk_part3]).unwrap();
         let mut out_fds = composite.as_raw_descriptors();
-        out_fds.sort();
+        out_fds.sort_unstable();
         assert_eq!(in_fds, out_fds);
     }
 
@@ -820,9 +825,7 @@ mod tests {
             .read_exact_at_volatile(output_volatile_memory.get_slice(0, 300).unwrap(), 0)
             .unwrap();
 
-        for i in 50..250 {
-            input_memory[i] = 0;
-        }
+        input_memory[50..250].iter_mut().for_each(|x| *x = 0);
         assert!(input_memory.iter().eq(output_memory.iter()));
     }
 
@@ -865,9 +868,7 @@ mod tests {
             .read_exact_at_volatile(output_volatile_memory.get_slice(0, 300).unwrap(), 0)
             .unwrap();
 
-        for i in 50..250 {
-            input_memory[i] = 0;
-        }
+        input_memory[50..250].iter_mut().for_each(|x| *x = 0);
         for i in 0..300 {
             println!(
                 "input[{0}] = {1}, output[{0}] = {2}",

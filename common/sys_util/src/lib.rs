@@ -4,7 +4,11 @@
 
 //! Small system utility modules for usage by other modules.
 
-mod alloc;
+// Fail sys_util compilation on windows.
+// This will make any unintentional windows code submitted to the crate unusable.
+#[cfg(windows)]
+compile_error!("sys_util is not windows friendly crate. See/use win_sys_util.");
+
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "android")]
@@ -19,16 +23,14 @@ pub mod handle_eintr;
 pub mod ioctl;
 #[macro_use]
 pub mod syslog;
+mod acpi_event;
 mod capabilities;
 mod clock;
 mod descriptor;
 mod descriptor_reflection;
-mod errno;
 mod eventfd;
-mod external_mapping;
 mod file_flags;
 pub mod file_traits;
-mod fork;
 mod get_filesystem_type;
 mod mmap;
 pub mod net;
@@ -41,7 +43,6 @@ pub mod read_dir;
 mod sched;
 pub mod scoped_path;
 pub mod scoped_signal_handler;
-mod seek_hole;
 mod shm;
 pub mod signal;
 mod signalfd;
@@ -51,59 +52,58 @@ mod timerfd;
 pub mod vsock;
 mod write_zeroes;
 
-pub use crate::alloc::LayoutAllocation;
-pub use crate::capabilities::drop_capabilities;
-pub use crate::clock::{Clock, FakeClock};
-pub use crate::descriptor::*;
-pub use crate::errno::{errno_result, Error, Result};
-pub use crate::eventfd::*;
-pub use crate::external_mapping::*;
-pub use crate::file_flags::*;
-pub use crate::fork::*;
-pub use crate::get_filesystem_type::*;
-pub use crate::ioctl::*;
-pub use crate::mmap::*;
-pub use crate::netlink::*;
-pub use crate::poll::*;
-pub use crate::priority::*;
-pub use crate::raw_fd::*;
-pub use crate::sched::*;
-pub use crate::scoped_signal_handler::*;
-pub use crate::shm::*;
-pub use crate::signal::*;
-pub use crate::signalfd::*;
-pub use crate::sock_ctrl_msg::*;
-pub use crate::terminal::*;
-pub use crate::timerfd::*;
+pub use acpi_event::*;
+pub use capabilities::drop_capabilities;
+pub use clock::{Clock, FakeClock};
+pub use descriptor::*;
 pub use descriptor_reflection::{
     deserialize_with_descriptors, with_as_descriptor, with_raw_descriptor, FileSerdeWrapper,
     SerializeDescriptors,
 };
+pub use eventfd::*;
+pub use file_flags::*;
+pub use get_filesystem_type::*;
+pub use ioctl::*;
+pub use mmap::*;
+pub use netlink::*;
+pub use poll::*;
 pub use poll_token_derive::*;
+pub use priority::*;
+pub use raw_fd::*;
+pub use sched::*;
+pub use scoped_signal_handler::*;
+pub use shm::*;
+pub use signal::*;
+pub use signalfd::*;
+pub use sock_ctrl_msg::*;
+pub use sys_util_core::{generate_scoped_event, Error, Result, *};
+pub use terminal::*;
+pub use timerfd::*;
 
-pub use crate::external_mapping::Error as ExternalMappingError;
-pub use crate::external_mapping::Result as ExternalMappingResult;
-pub use crate::file_traits::{
+pub use file_traits::{
     AsRawFds, FileAllocate, FileGetLen, FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen,
     FileSync,
 };
-pub use crate::mmap::Error as MmapError;
-pub use crate::seek_hole::SeekHole;
-pub use crate::signalfd::Error as SignalFdError;
-pub use crate::write_zeroes::{PunchHole, WriteZeroes, WriteZeroesAt};
+pub use mmap::Error as MmapError;
+pub use signalfd::Error as SignalFdError;
+pub use write_zeroes::{PunchHole, WriteZeroes, WriteZeroesAt};
 
-use std::cell::Cell;
-use std::convert::TryFrom;
-use std::ffi::CStr;
-use std::fs::{remove_file, File, OpenOptions};
-use std::mem;
-use std::ops::Deref;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::{UnixDatagram, UnixListener};
-use std::path::Path;
-use std::ptr;
-use std::time::Duration;
+use std::{
+    cell::Cell,
+    convert::TryFrom,
+    ffi::CStr,
+    fs::{remove_file, File, OpenOptions},
+    mem,
+    ops::Deref,
+    os::unix::{
+        fs::OpenOptionsExt,
+        io::{AsRawFd, FromRawFd, RawFd},
+        net::{UnixDatagram, UnixListener},
+    },
+    path::Path,
+    ptr,
+    time::Duration,
+};
 
 use libc::{
     c_int, c_long, fcntl, pipe2, syscall, sysconf, waitpid, SYS_getpid, SYS_gettid, EINVAL,

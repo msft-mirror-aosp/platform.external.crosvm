@@ -44,7 +44,7 @@ TESTVM_DIR = SCRIPT_DIR.parent.joinpath("testvm")
 TARGET_DIR = testvm.cargo_target_dir().joinpath("crosvm_tools")
 ENVRC_PATH = SCRIPT_DIR.parent.parent.joinpath(".envrc")
 
-Arch = Literal["x86_64", "aarch64", "armhf"]
+Arch = Literal["x86_64", "aarch64", "armhf", "win64"]
 
 # Enviroment variables needed for building with cargo
 BUILD_ENV = {
@@ -90,9 +90,7 @@ class Ssh:
             check=True,
         ).stdout
 
-    def upload_files(
-        self, files: list[Path], remote_dir: str = "", quiet: bool = False
-    ):
+    def upload_files(self, files: list[Path], remote_dir: str = "", quiet: bool = False):
         """Wrapper around SCP."""
         flags: list[str] = []
         if quiet:
@@ -114,6 +112,7 @@ class TestTarget(object):
     is_host: bool = False
     vm: Optional[testvm.Arch] = None
     ssh: Optional[Ssh] = None
+    __arch: Optional[Arch] = None
 
     @classmethod
     def default(cls):
@@ -134,15 +133,29 @@ class TestTarget(object):
         else:
             raise Exception(f"Invalid target {target_str}")
 
+    @property
+    def arch(self) -> Arch:
+        if not self.__arch:
+            if self.vm:
+                self.__arch = self.vm
+            elif self.ssh:
+                self.__arch = cast(Arch, self.ssh.check_output("arch").strip())
+            else:
+                self.__arch = cast(Arch, platform.machine())
+        return self.__arch
+
     def __str__(self):
         return self.target_str
 
 
 def find_rust_lib_dir():
-    cargo_path = Path(
-        subprocess.check_output(["rustup", "which", "cargo"], text=True)
-    )
-    return cargo_path.parent.parent.joinpath("lib")
+    cargo_path = Path(subprocess.check_output(["rustup", "which", "cargo"], text=True))
+    if os.name == "posix":
+        return cargo_path.parent.parent.joinpath("lib")
+    elif os.name == "nt":
+        return cargo_path.parent
+    else:
+        raise Exception(f"Unsupported build target: {os.name}")
 
 
 def find_rust_libs():
@@ -165,20 +178,21 @@ def prepare_target(target: TestTarget, extra_files: list[Path] = []):
         prepare_remote(target.ssh, extra_files)
 
 
-def get_target_arch(target: TestTarget) -> testvm.Arch:
-    if target.vm:
-        return target.vm
-    elif target.ssh:
-        return cast(testvm.Arch, target.ssh.check_output("arch").strip())
-    else:
-        return cast(testvm.Arch, platform.machine())
-
-
 def get_cargo_build_target(arch: Arch):
-    if arch == "armhf":
-        return "armv7-unknown-linux-gnueabihf"
+    if os.name == "posix":
+        if arch == "armhf":
+            return "armv7-unknown-linux-gnueabihf"
+        elif arch == "win64":
+            return "x86_64-pc-windows-gnu"
+        else:
+            return f"{arch}-unknown-linux-gnu"
+    elif os.name == "nt":
+        if arch == "win64":
+            return f"x86_64-pc-windows-msvc"
+        else:
+            return f"{arch}-pc-windows-msvc"
     else:
-        return f"{arch}-unknown-linux-gnu"
+        raise Exception(f"Unsupported build target: {os.name}")
 
 
 def get_cargo_env(target: TestTarget, build_arch: Arch):
@@ -203,7 +217,7 @@ def write_envrc(values: dict[str, str]):
 def set_target(target: TestTarget, build_arch: Optional[Arch]):
     prepare_target(target)
     if not build_arch:
-        build_arch = get_target_arch(target)
+        build_arch = target.arch
     write_envrc(get_cargo_env(target, build_arch))
     print(f"Test target: {target}")
     print(f"Target Architecture: {build_arch}")
@@ -231,7 +245,16 @@ def exec_file_on_target(
     env = os.environ.copy()
     if not target.ssh:
         # Allow test binaries to find rust's test libs.
-        env["LD_LIBRARY_PATH"] = str(find_rust_lib_dir())
+        if os.name == "posix":
+            env["LD_LIBRARY_PATH"] = str(find_rust_lib_dir())
+        elif os.name == "nt":
+            if not env["PATH"]:
+                env["PATH"] = str(find_rust_lib_dir())
+            else:
+                env["PATH"] += ";" + str(find_rust_lib_dir())
+        else:
+            raise Exception(f"Unsupported build target: {os.name}")
+
         cmd_line = [str(filepath), *args]
         return subprocess.run(
             cmd_line,
@@ -245,8 +268,7 @@ def exec_file_on_target(
         target.ssh.upload_files([filepath] + extra_files, quiet=True)
         try:
             result = target.ssh.run(
-                f"chmod +x {filename} "
-                f"&& sudo LD_LIBRARY_PATH=. ./{filename} {' '.join(args)}",
+                f"chmod +x {filename} && sudo LD_LIBRARY_PATH=. ./{filename} {' '.join(args)}",
                 timeout=timeout,
                 text=True,
                 **kwargs,
@@ -270,11 +292,7 @@ def exec_file(
 
     print(f"Executing `{Path(filepath).name} {' '.join(args)}` on {target}")
     try:
-        sys.exit(
-            exec_file_on_target(
-                target, filepath, timeout, args, extra_files
-            ).returncode
-        )
+        sys.exit(exec_file_on_target(target, filepath, timeout, args, extra_files).returncode)
     except subprocess.TimeoutExpired as e:
         print(f"Process timed out after {e.timeout}s")
 
@@ -287,9 +305,7 @@ def main():
 
     parser = argparse.ArgumentParser(usage=USAGE)
     parser.add_argument("command", choices=COMMANDS)
-    parser.add_argument(
-        "--target", type=str, help="Override default test target."
-    )
+    parser.add_argument("--target", type=str, help="Override default test target.")
     parser.add_argument(
         "--arch",
         choices=typing.get_args(Arch),

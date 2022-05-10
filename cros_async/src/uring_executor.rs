@@ -51,37 +51,54 @@
 //! ensures that only the kernel is allowed to access the `Vec` and wraps the the `Vec` in an Arc to
 //! ensure it lives long enough.
 
-use std::convert::TryInto;
-use std::fs::File;
-use std::future::Future;
-use std::io;
-use std::mem;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Weak};
-use std::task::Waker;
-use std::task::{Context, Poll};
-use std::thread::{self, ThreadId};
+use std::{
+    convert::TryInto,
+    ffi::CStr,
+    fs::File,
+    future::Future,
+    io,
+    mem::{
+        MaybeUninit, {self},
+    },
+    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc, Weak,
+    },
+    task::{Context, Poll, Waker},
+    thread::{
+        ThreadId, {self},
+    },
+};
 
 use async_task::Task;
+use base::{warn, WatchingEvents};
 use futures::task::noop_waker;
 use io_uring::URingContext;
+use once_cell::sync::Lazy;
 use pin_utils::pin_mut;
+use remain::sorted;
 use slab::Slab;
 use sync::Mutex;
-use sys_util::{warn, WatchingEvents};
 use thiserror::Error as ThisError;
 
-use crate::mem::{BackingMemory, MemRegion};
-use crate::queue::RunnableQueue;
-use crate::waker::{new_waker, WakerToken, WeakWake};
+use super::{
+    mem::{BackingMemory, MemRegion},
+    queue::RunnableQueue,
+    waker::{new_waker, WakerToken, WeakWake},
+    BlockingPool,
+};
 
+#[sorted]
 #[derive(Debug, ThisError)]
 pub enum Error {
+    /// Creating a context to wait on FDs failed.
+    #[error("Error creating the fd waiting context: {0}")]
+    CreatingContext(io_uring::Error),
     /// Failed to copy the FD for the polling context.
     #[error("Failed to copy the FD for the polling context: {0}")]
-    DuplicatingFd(sys_util::Error),
+    DuplicatingFd(base::Error),
     /// The Executor is gone.
     #[error("The URingExecutor is gone")]
     ExecutorGone,
@@ -94,9 +111,6 @@ pub enum Error {
     /// Error doing the IO.
     #[error("Error during IO: {0}")]
     Io(io::Error),
-    /// Creating a context to wait on FDs failed.
-    #[error("Error creating the fd waiting context: {0}")]
-    CreatingContext(io_uring::Error),
     /// Failed to remove the waker remove the polling context.
     #[error("Error removing from the URing context: {0}")]
     RemovingWaker(io_uring::Error),
@@ -112,29 +126,59 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        use Error::*;
+        match e {
+            DuplicatingFd(e) => e.into(),
+            ExecutorGone => io::Error::new(io::ErrorKind::Other, ExecutorGone),
+            InvalidOffset => io::Error::new(io::ErrorKind::InvalidInput, InvalidOffset),
+            InvalidSource => io::Error::new(io::ErrorKind::InvalidData, InvalidSource),
+            Io(e) => e,
+            CreatingContext(e) => e.into(),
+            RemovingWaker(e) => e.into(),
+            SubmittingOp(e) => e.into(),
+            URingContextError(e) => e.into(),
+            URingEnter(e) => e.into(),
+        }
+    }
+}
+
+static USE_URING: Lazy<bool> = Lazy::new(|| {
+    let mut utsname = MaybeUninit::zeroed();
+
+    // Safe because this will only modify `utsname` and we check the return value.
+    let res = unsafe { libc::uname(utsname.as_mut_ptr()) };
+    if res < 0 {
+        return false;
+    }
+
+    // Safe because the kernel has initialized `utsname`.
+    let utsname = unsafe { utsname.assume_init() };
+
+    // Safe because the pointer is valid and the kernel guarantees that this is a valid C string.
+    let release = unsafe { CStr::from_ptr(utsname.release.as_ptr()) };
+
+    let mut components = match release.to_str().map(|r| r.split('.').map(str::parse)) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Kernels older than 5.10 either didn't support io_uring or had bugs in the implementation.
+    match (components.next(), components.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) if (major, minor) >= (5, 10) => {
+            // The kernel version is new enough so check if we can actually make a uring context.
+            URingContext::new(8).is_ok()
+        }
+        _ => false,
+    }
+});
+
 // Checks if the uring executor is available.
 // Caches the result so that the check is only run once.
 // Useful for falling back to the FD executor on pre-uring kernels.
 pub(crate) fn use_uring() -> bool {
-    const UNKNOWN: u32 = 0;
-    const URING: u32 = 1;
-    const FD: u32 = 2;
-    static USE_URING: AtomicU32 = AtomicU32::new(UNKNOWN);
-    match USE_URING.load(Ordering::Relaxed) {
-        UNKNOWN => {
-            // Create a dummy uring context to check that the kernel understands the syscalls.
-            if URingContext::new(8).is_ok() {
-                USE_URING.store(URING, Ordering::Relaxed);
-                true
-            } else {
-                USE_URING.store(FD, Ordering::Relaxed);
-                false
-            }
-        }
-        URING => true,
-        FD => false,
-        _ => unreachable!("invalid use uring state"),
-    }
+    *USE_URING
 }
 
 pub struct RegisteredSource {
@@ -259,6 +303,7 @@ struct RawExecutor {
     ctx: URingContext,
     queue: RunnableQueue,
     ring: Mutex<Ring>,
+    blocking_pool: BlockingPool,
     thread_id: Mutex<Option<ThreadId>>,
     state: AtomicI32,
 }
@@ -272,6 +317,7 @@ impl RawExecutor {
                 ops: Slab::with_capacity(NUM_ENTRIES),
                 registered_sources: Slab::with_capacity(NUM_ENTRIES),
             }),
+            blocking_pool: Default::default(),
             thread_id: Mutex::new(None),
             state: AtomicI32::new(PROCESSING),
         })
@@ -331,6 +377,14 @@ impl RawExecutor {
         let (runnable, task) = async_task::spawn_local(f, schedule);
         runnable.schedule();
         task
+    }
+
+    fn spawn_blocking<F, R>(self: &Arc<Self>, f: F) -> Task<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.blocking_pool.spawn(f)
     }
 
     fn runs_tasks_on_current_thread(&self) -> bool {
@@ -475,7 +529,7 @@ impl RawExecutor {
     fn submit_poll(
         &self,
         source: &RegisteredSource,
-        events: &sys_util::WatchingEvents,
+        events: &base::WatchingEvents,
     ) -> Result<WakerToken> {
         let mut ring = self.ring.lock();
         let src = ring
@@ -584,9 +638,12 @@ impl RawExecutor {
 
         // The addresses have already been validated, so unwrapping them will succeed.
         // validate their addresses before submitting.
-        let iovecs = addrs
-            .iter()
-            .map(|&mem_range| *mem.get_volatile_slice(mem_range).unwrap().as_iobuf());
+        let iovecs = addrs.iter().map(|&mem_range| {
+            *mem.get_volatile_slice(mem_range)
+                .unwrap()
+                .as_iobuf()
+                .as_ref()
+        });
 
         unsafe {
             // Safe because all the addresses are within the Memory that an Arc is kept for the
@@ -634,9 +691,12 @@ impl RawExecutor {
 
         // The addresses have already been validated, so unwrapping them will succeed.
         // validate their addresses before submitting.
-        let iovecs = addrs
-            .iter()
-            .map(|&mem_range| *mem.get_volatile_slice(mem_range).unwrap().as_iobuf());
+        let iovecs = addrs.iter().map(|&mem_range| {
+            *mem.get_volatile_slice(mem_range)
+                .unwrap()
+                .as_iobuf()
+                .as_ref()
+        });
 
         unsafe {
             // Safe because all the addresses are within the Memory that an Arc is kept for the
@@ -735,11 +795,19 @@ impl URingExecutor {
         self.raw.spawn_local(f)
     }
 
+    pub fn spawn_blocking<F, R>(&self, f: F) -> Task<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.raw.spawn_blocking(f)
+    }
+
     pub fn run(&self) -> Result<()> {
         let waker = new_waker(Arc::downgrade(&self.raw));
         let mut cx = Context::from_waker(&waker);
 
-        self.raw.run(&mut cx, crate::empty::<()>())
+        self.raw.run(&mut cx, super::empty::<()>())
     }
 
     pub fn run_until<F: Future>(&self, f: F) -> Result<F::Output> {
@@ -768,7 +836,7 @@ impl URingExecutor {
 unsafe fn dup_fd(fd: RawFd) -> Result<RawFd> {
     let ret = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0);
     if ret < 0 {
-        Err(Error::DuplicatingFd(sys_util::Error::last()))
+        Err(Error::DuplicatingFd(base::Error::last()))
     } else {
         Ok(ret)
     }
@@ -832,16 +900,20 @@ impl Drop for PendingOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::io::{Read, Write};
-    use std::mem;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use std::{
+        future::Future,
+        io::{Read, Write},
+        mem,
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     use futures::executor::block_on;
 
-    use super::*;
-    use crate::mem::{BackingMemory, MemRegion, VecIoWrapper};
+    use super::{
+        super::mem::{BackingMemory, MemRegion, VecIoWrapper},
+        *,
+    };
 
     // A future that returns ready when the uring queue is empty.
     struct UringQueueEmpty<'a> {
@@ -862,13 +934,17 @@ mod tests {
 
     #[test]
     fn dont_drop_backing_mem_read() {
+        if !use_uring() {
+            return;
+        }
+
         // Create a backing memory wrapped in an Arc and check that the drop isn't called while the
         // op is pending.
         let bm =
             Arc::new(VecIoWrapper::from(vec![0u8; 4096])) as Arc<dyn BackingMemory + Send + Sync>;
 
         // Use pipes to create a future that will block forever.
-        let (rx, mut tx) = sys_util::pipe(true).unwrap();
+        let (rx, mut tx) = base::pipe(true).unwrap();
 
         // Set up the TLS for the uring_executor by creating one.
         let ex = URingExecutor::new().unwrap();
@@ -902,13 +978,17 @@ mod tests {
 
     #[test]
     fn dont_drop_backing_mem_write() {
+        if !use_uring() {
+            return;
+        }
+
         // Create a backing memory wrapped in an Arc and check that the drop isn't called while the
         // op is pending.
         let bm =
             Arc::new(VecIoWrapper::from(vec![0u8; 4096])) as Arc<dyn BackingMemory + Send + Sync>;
 
         // Use pipes to create a future that will block forever.
-        let (mut rx, tx) = sys_util::new_pipe_full().expect("Pipe failed");
+        let (mut rx, tx) = base::new_pipe_full().expect("Pipe failed");
 
         // Set up the TLS for the uring_executor by creating one.
         let ex = URingExecutor::new().unwrap();
@@ -934,7 +1014,7 @@ mod tests {
         // Finishing the operation should put the Arc count back to 1.
         // write to the pipe to wake the read pipe and then wait for the uring result in the
         // executor.
-        let mut buf = vec![0u8; sys_util::round_up_to_page_size(1)];
+        let mut buf = vec![0u8; base::round_up_to_page_size(1)];
         rx.read_exact(&mut buf).expect("read to empty failed");
         ex.run_until(UringQueueEmpty { ex: &ex })
             .expect("Failed to wait for write pipe ready");
@@ -943,6 +1023,10 @@ mod tests {
 
     #[test]
     fn canceled_before_completion() {
+        if !use_uring() {
+            return;
+        }
+
         async fn cancel_io(op: PendingOperation) {
             mem::drop(op);
         }
@@ -955,7 +1039,7 @@ mod tests {
         let bm =
             Arc::new(VecIoWrapper::from(vec![0u8; 16])) as Arc<dyn BackingMemory + Send + Sync>;
 
-        let (rx, tx) = sys_util::pipe(true).expect("Pipe failed");
+        let (rx, tx) = base::pipe(true).expect("Pipe failed");
 
         let ex = URingExecutor::new().unwrap();
 
@@ -981,6 +1065,10 @@ mod tests {
 
     #[test]
     fn drop_before_completion() {
+        if !use_uring() {
+            return;
+        }
+
         const VALUE: u64 = 0xef6c_a8df_b842_eb9c;
 
         async fn check_op(op: PendingOperation) {
@@ -991,7 +1079,7 @@ mod tests {
             }
         }
 
-        let (mut rx, mut tx) = sys_util::pipe(true).expect("Pipe failed");
+        let (mut rx, mut tx) = base::pipe(true).expect("Pipe failed");
 
         let ex = URingExecutor::new().unwrap();
 
@@ -1026,6 +1114,10 @@ mod tests {
 
     #[test]
     fn drop_on_different_thread() {
+        if !use_uring() {
+            return;
+        }
+
         let ex = URingExecutor::new().unwrap();
 
         let ex2 = ex.clone();
@@ -1035,7 +1127,7 @@ mod tests {
 
         // Leave an uncompleted operation in the queue so that the drop impl will try to drive it to
         // completion.
-        let (_rx, tx) = sys_util::pipe(true).expect("Pipe failed");
+        let (_rx, tx) = base::pipe(true).expect("Pipe failed");
         let tx = ex.register_source(&tx).expect("Failed to register source");
         let bm = Arc::new(VecIoWrapper::from(0xf2e96u64.to_ne_bytes().to_vec()));
         let op = tx

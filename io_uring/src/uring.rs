@@ -7,15 +7,20 @@
 #![allow(clippy::cast_ptr_alignment)]
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs::File;
+use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use base::{
+    AsRawDescriptor, MappedRegion, MemoryMapping, MemoryMappingBuilder, Protection, RawDescriptor,
+    WatchingEvents,
+};
 use data_model::IoBufMut;
+use remain::sorted;
 use sync::Mutex;
-use sys_util::{MappedRegion, MemoryMapping, Protection, WatchingEvents};
+use thiserror::Error as ThisError;
 
 use crate::bindings::*;
 use crate::syscalls::*;
@@ -24,37 +29,37 @@ use crate::syscalls::*;
 /// for callers to identify each request.
 pub type UserData = u64;
 
-#[derive(Debug)]
+#[sorted]
+#[derive(Debug, ThisError)]
 pub enum Error {
+    /// Failed to map the completion ring.
+    #[error("Failed to mmap completion ring {0}")]
+    MappingCompleteRing(base::MmapError),
+    /// Failed to map submit entries.
+    #[error("Failed to mmap submit entries {0}")]
+    MappingSubmitEntries(base::MmapError),
+    /// Failed to map the submit ring.
+    #[error("Failed to mmap submit ring {0}")]
+    MappingSubmitRing(base::MmapError),
+    /// Too many ops are already queued.
+    #[error("No space for more ring entries, try increasing the size passed to `new`")]
+    NoSpace,
     /// The call to `io_uring_enter` failed with the given errno.
+    #[error("Failed to enter io uring: {0}")]
     RingEnter(libc::c_int),
     /// The call to `io_uring_setup` failed with the given errno.
+    #[error("Failed to setup io uring {0}")]
     Setup(libc::c_int),
-    /// Failed to map the completion ring.
-    MappingCompleteRing(sys_util::MmapError),
-    /// Failed to map the submit ring.
-    MappingSubmitRing(sys_util::MmapError),
-    /// Failed to map submit entries.
-    MappingSubmitEntries(sys_util::MmapError),
-    /// Too many ops are already queued.
-    NoSpace,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            RingEnter(e) => write!(f, "Failed to enter io uring {}", e),
-            Setup(e) => write!(f, "Failed to setup io uring {}", e),
-            MappingCompleteRing(e) => write!(f, "Failed to mmap completion ring {}", e),
-            MappingSubmitRing(e) => write!(f, "Failed to mmap submit ring {}", e),
-            MappingSubmitEntries(e) => write!(f, "Failed to mmap submit entries {}", e),
-            NoSpace => write!(
-                f,
-                "No space for more ring entries, try increasing the size passed to `new`",
-            ),
+impl From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        use Error::*;
+        match e {
+            RingEnter(errno) => io::Error::from_raw_os_error(errno),
+            Setup(errno) => io::Error::from_raw_os_error(errno),
+            e => io::Error::new(io::ErrorKind::Other, e),
         }
     }
 }
@@ -74,6 +79,31 @@ struct SubmitQueue {
     submitting: usize, // The number of ops in the process of being submitted.
     added: usize,      // The number of ops added since the last call to `io_uring_enter`.
     num_sqes: usize,   // The total number of sqes allocated in shared memory.
+}
+
+// Helper functions to set io_uring_sqe bindgen union members in a less verbose manner.
+impl io_uring_sqe {
+    pub fn set_addr(&mut self, val: u64) {
+        self.__bindgen_anon_2.addr = val;
+    }
+    pub fn set_off(&mut self, val: u64) {
+        self.__bindgen_anon_1.off = val;
+    }
+
+    pub fn set_buf_index(&mut self, val: u16) {
+        self.__bindgen_anon_4
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            .buf_index = val;
+    }
+
+    pub fn set_rw_flags(&mut self, val: libc::c_int) {
+        self.__bindgen_anon_3.rw_flags = val;
+    }
+
+    pub fn set_poll_events(&mut self, val: u16) {
+        self.__bindgen_anon_3.poll_events = val;
+    }
 }
 
 impl SubmitQueue {
@@ -149,10 +179,10 @@ impl SubmitQueue {
             iovec.iov_base = ptr as *const libc::c_void as *mut _;
             iovec.iov_len = len;
             sqe.opcode = op;
-            sqe.addr = iovec as *const _ as *const libc::c_void as u64;
+            sqe.set_addr(iovec as *const _ as *const libc::c_void as u64);
             sqe.len = 1;
-            sqe.__bindgen_anon_1.off = offset;
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
+            sqe.set_off(offset);
+            sqe.set_buf_index(0);
             sqe.ioprio = 0;
             sqe.user_data = user_data;
             sqe.flags = 0;
@@ -175,7 +205,7 @@ impl SubmitQueue {
 /// # use std::fs::File;
 /// # use std::os::unix::io::AsRawFd;
 /// # use std::path::Path;
-/// # use sys_util::WatchingEvents;
+/// # use base::WatchingEvents;
 /// # use io_uring::URingContext;
 /// let f = File::open(Path::new("/dev/zero")).unwrap();
 /// let uring = URingContext::new(16).unwrap();
@@ -214,40 +244,43 @@ impl URingContext {
             // Safe because we trust the kernel to set valid sizes in `io_uring_setup` and any error
             // is checked.
             let submit_ring = SubmitQueueState::new(
-                MemoryMapping::from_fd_offset_protection_populate(
-                    &ring_file,
+                MemoryMappingBuilder::new(
                     ring_params.sq_off.array as usize
                         + ring_params.sq_entries as usize * std::mem::size_of::<u32>(),
-                    u64::from(IORING_OFF_SQ_RING),
-                    Protection::read_write(),
-                    true,
                 )
+                .from_file(&ring_file)
+                .offset(u64::from(IORING_OFF_SQ_RING))
+                .protection(Protection::read_write())
+                .populate()
+                .build()
                 .map_err(Error::MappingSubmitRing)?,
                 &ring_params,
             );
 
             let num_sqe = ring_params.sq_entries as usize;
             let submit_queue_entries = SubmitQueueEntries {
-                mmap: MemoryMapping::from_fd_offset_protection_populate(
-                    &ring_file,
+                mmap: MemoryMappingBuilder::new(
                     ring_params.sq_entries as usize * std::mem::size_of::<io_uring_sqe>(),
-                    u64::from(IORING_OFF_SQES),
-                    Protection::read_write(),
-                    true,
                 )
+                .from_file(&ring_file)
+                .offset(u64::from(IORING_OFF_SQES))
+                .protection(Protection::read_write())
+                .populate()
+                .build()
                 .map_err(Error::MappingSubmitEntries)?,
                 len: num_sqe,
             };
 
             let complete_ring = CompleteQueueState::new(
-                MemoryMapping::from_fd_offset_protection_populate(
-                    &ring_file,
+                MemoryMappingBuilder::new(
                     ring_params.cq_off.cqes as usize
                         + ring_params.cq_entries as usize * std::mem::size_of::<io_uring_cqe>(),
-                    u64::from(IORING_OFF_CQ_RING),
-                    Protection::read_write(),
-                    true,
                 )
+                .from_file(&ring_file)
+                .offset(u64::from(IORING_OFF_CQ_RING))
+                .protection(Protection::read_write())
+                .populate()
+                .build()
                 .map_err(Error::MappingCompleteRing)?,
                 &ring_params,
             );
@@ -310,6 +343,7 @@ impl URingContext {
             .add_rw_op(ptr, len, fd, offset, user_data, IORING_OP_READV as u8)
     }
 
+    /// # Safety
     /// See 'writev' but accepts an iterator instead of a vector if there isn't already a vector in
     /// existence.
     pub unsafe fn add_writev_iter<I>(
@@ -355,10 +389,10 @@ impl URingContext {
     ) -> Result<()> {
         self.submit_ring.lock().prep_next_sqe(|sqe, _iovec| {
             sqe.opcode = IORING_OP_WRITEV as u8;
-            sqe.addr = iovecs.as_ptr() as *const _ as *const libc::c_void as u64;
+            sqe.set_addr(iovecs.as_ptr() as *const _ as *const libc::c_void as u64);
             sqe.len = iovecs.len() as u32;
-            sqe.__bindgen_anon_1.off = offset;
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
+            sqe.set_off(offset);
+            sqe.set_buf_index(0);
             sqe.ioprio = 0;
             sqe.user_data = user_data;
             sqe.flags = 0;
@@ -368,6 +402,7 @@ impl URingContext {
         Ok(())
     }
 
+    /// # Safety
     /// See 'readv' but accepts an iterator instead of a vector if there isn't already a vector in
     /// existence.
     pub unsafe fn add_readv_iter<I>(
@@ -413,10 +448,10 @@ impl URingContext {
     ) -> Result<()> {
         self.submit_ring.lock().prep_next_sqe(|sqe, _iovec| {
             sqe.opcode = IORING_OP_READV as u8;
-            sqe.addr = iovecs.as_ptr() as *const _ as *const libc::c_void as u64;
+            sqe.set_addr(iovecs.as_ptr() as *const _ as *const libc::c_void as u64);
             sqe.len = iovecs.len() as u32;
-            sqe.__bindgen_anon_1.off = offset;
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
+            sqe.set_off(offset);
+            sqe.set_buf_index(0);
             sqe.ioprio = 0;
             sqe.user_data = user_data;
             sqe.flags = 0;
@@ -434,11 +469,11 @@ impl URingContext {
             sqe.fd = -1;
             sqe.user_data = user_data;
 
-            sqe.addr = 0;
+            sqe.set_addr(0);
             sqe.len = 0;
-            sqe.__bindgen_anon_1.off = 0;
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
-            sqe.__bindgen_anon_2.rw_flags = 0;
+            sqe.set_off(0);
+            sqe.set_buf_index(0);
+            sqe.set_rw_flags(0);
             sqe.ioprio = 0;
             sqe.flags = 0;
         })
@@ -452,11 +487,11 @@ impl URingContext {
             sqe.fd = fd;
             sqe.user_data = user_data;
 
-            sqe.addr = 0;
+            sqe.set_addr(0);
             sqe.len = 0;
-            sqe.__bindgen_anon_1.off = 0;
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
-            sqe.__bindgen_anon_2.rw_flags = 0;
+            sqe.set_off(0);
+            sqe.set_buf_index(0);
+            sqe.set_rw_flags(0);
             sqe.ioprio = 0;
             sqe.flags = 0;
         })
@@ -477,13 +512,13 @@ impl URingContext {
             sqe.opcode = IORING_OP_FALLOCATE as u8;
 
             sqe.fd = fd;
-            sqe.addr = len;
+            sqe.set_addr(len);
             sqe.len = mode;
-            sqe.__bindgen_anon_1.off = offset;
+            sqe.set_off(offset);
             sqe.user_data = user_data;
 
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
-            sqe.__bindgen_anon_2.rw_flags = 0;
+            sqe.set_buf_index(0);
+            sqe.set_rw_flags(0);
             sqe.ioprio = 0;
             sqe.flags = 0;
         })
@@ -504,12 +539,12 @@ impl URingContext {
             sqe.opcode = IORING_OP_POLL_ADD as u8;
             sqe.fd = fd;
             sqe.user_data = user_data;
-            sqe.__bindgen_anon_2.poll_events = events.get_raw() as u16;
+            sqe.set_poll_events(events.get_raw() as u16);
 
-            sqe.addr = 0;
+            sqe.set_addr(0);
             sqe.len = 0;
-            sqe.__bindgen_anon_1.off = 0;
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
+            sqe.set_off(0);
+            sqe.set_buf_index(0);
             sqe.ioprio = 0;
             sqe.flags = 0;
         })
@@ -526,12 +561,12 @@ impl URingContext {
             sqe.opcode = IORING_OP_POLL_REMOVE as u8;
             sqe.fd = fd;
             sqe.user_data = user_data;
-            sqe.__bindgen_anon_2.poll_events = events.get_raw() as u16;
+            sqe.set_poll_events(events.get_raw() as u16);
 
-            sqe.addr = 0;
+            sqe.set_addr(0);
             sqe.len = 0;
-            sqe.__bindgen_anon_1.off = 0;
-            sqe.__bindgen_anon_3.__bindgen_anon_1.buf_index = 0;
+            sqe.set_off(0);
+            sqe.set_buf_index(0);
             sqe.ioprio = 0;
             sqe.flags = 0;
         })
@@ -624,6 +659,12 @@ impl URingContext {
 impl AsRawFd for URingContext {
     fn as_raw_fd(&self) -> RawFd {
         self.ring_file.as_raw_fd()
+    }
+}
+
+impl AsRawDescriptor for URingContext {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.ring_file.as_raw_descriptor()
     }
 }
 
@@ -851,8 +892,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use base::{pipe, PollContext};
     use sync::{Condvar, Mutex};
-    use sys_util::{pipe, PollContext};
     use tempfile::{tempfile, TempDir};
 
     use super::*;
@@ -999,8 +1040,8 @@ mod tests {
         let uring = URingContext::new(16).unwrap();
         let mut buf = [0u8; 4096];
         let mut f = create_test_file(0);
-        f.write(&buf).unwrap();
-        f.write(&buf).unwrap();
+        f.write_all(&buf).unwrap();
+        f.write_all(&buf).unwrap();
 
         unsafe {
             // Safe because the `wait` call waits until the kernel is done mutating `buf`.
@@ -1018,8 +1059,8 @@ mod tests {
         let uring = URingContext::new(16).unwrap();
         let mut buf = [0u8; 4096];
         let mut f = create_test_file(0);
-        f.write(&buf).unwrap();
-        f.write(&buf).unwrap();
+        f.write_all(&buf).unwrap();
+        f.write_all(&buf).unwrap();
 
         let ctx: PollContext<u64> = PollContext::build_with(&[(&uring, 1)]).unwrap();
         {
@@ -1075,11 +1116,11 @@ mod tests {
 
         let mut read_back = [0u8; BUF_SIZE];
         f.seek(SeekFrom::Start(OFFSET)).unwrap();
-        f.read(&mut read_back).unwrap();
+        f.read_exact(&mut read_back).unwrap();
         assert!(!read_back.iter().any(|&b| b != 0xaa));
-        f.read(&mut read_back).unwrap();
+        f.read_exact(&mut read_back).unwrap();
         assert!(!read_back.iter().any(|&b| b != 0xff));
-        f.read(&mut read_back).unwrap();
+        f.read_exact(&mut read_back).unwrap();
         assert!(!read_back.iter().any(|&b| b != 0x55));
     }
 
@@ -1097,7 +1138,7 @@ mod tests {
                 .truncate(true)
                 .open(&file_path)
                 .unwrap();
-            f.write(&buf).unwrap();
+            f.write_all(&buf).unwrap();
         }
 
         let init_size = std::fs::metadata(&file_path).unwrap().len() as usize;

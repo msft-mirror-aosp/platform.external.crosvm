@@ -7,7 +7,7 @@
 #![allow(non_snake_case)]
 
 use base::{ioctl_io_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
-use data_model::FlexibleArray;
+use data_model::{flexible_array_impl, FlexibleArray};
 // Each of the below modules defines ioctls specific to their platform.
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -32,8 +32,8 @@ pub mod x86 {
     ioctl_iow_nr!(KVM_SET_LAPIC, KVMIO, 0x8f, kvm_lapic_state);
     ioctl_iow_nr!(KVM_SET_CPUID2, KVMIO, 0x90, kvm_cpuid2);
     ioctl_iowr_nr!(KVM_GET_CPUID2, KVMIO, 0x91, kvm_cpuid2);
-    ioctl_iow_nr!(KVM_X86_SETUP_MCE, KVMIO, 0x9c, __u64);
-    ioctl_ior_nr!(KVM_X86_GET_MCE_CAP_SUPPORTED, KVMIO, 0x9d, __u64);
+    ioctl_iow_nr!(KVM_X86_SETUP_MCE, KVMIO, 0x9c, u64);
+    ioctl_ior_nr!(KVM_X86_GET_MCE_CAP_SUPPORTED, KVMIO, 0x9d, u64);
     ioctl_iow_nr!(KVM_X86_SET_MCE, KVMIO, 0x9e, kvm_x86_mce);
     ioctl_ior_nr!(KVM_GET_VCPU_EVENTS, KVMIO, 0x9f, kvm_vcpu_events);
     ioctl_iow_nr!(KVM_SET_VCPU_EVENTS, KVMIO, 0xa0, kvm_vcpu_events);
@@ -75,7 +75,7 @@ ioctl_iow_nr!(
     kvm_userspace_memory_region
 );
 ioctl_io_nr!(KVM_SET_TSS_ADDR, KVMIO, 0x47);
-ioctl_iow_nr!(KVM_SET_IDENTITY_MAP_ADDR, KVMIO, 0x48, __u64);
+ioctl_iow_nr!(KVM_SET_IDENTITY_MAP_ADDR, KVMIO, 0x48, u64);
 ioctl_io_nr!(KVM_CREATE_IRQCHIP, KVMIO, 0x60);
 ioctl_iow_nr!(KVM_IRQ_LINE, KVMIO, 0x61, kvm_irq_level);
 ioctl_iowr_nr!(KVM_GET_IRQCHIP, KVMIO, 0x62, kvm_irqchip);
@@ -156,23 +156,7 @@ ioctl_io_nr!(KVM_SMI, KVMIO, 0xb7);
 pub use crate::x86::*;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl FlexibleArray<kvm_cpuid_entry2> for kvm_cpuid2 {
-    fn set_len(&mut self, len: usize) {
-        self.nent = len as u32;
-    }
-
-    fn get_len(&self) -> usize {
-        self.nent as usize
-    }
-
-    fn get_slice(&self, len: usize) -> &[kvm_cpuid_entry2] {
-        unsafe { self.entries.as_slice(len) }
-    }
-
-    fn get_mut_slice(&mut self, len: usize) -> &mut [kvm_cpuid_entry2] {
-        unsafe { self.entries.as_mut_slice(len) }
-    }
-}
+flexible_array_impl!(kvm_cpuid2, kvm_cpuid_entry2, nent, entries);
 
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub use aarch64::*;

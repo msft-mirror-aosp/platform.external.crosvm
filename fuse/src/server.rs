@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::cmp::{max, min};
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
@@ -24,11 +25,17 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
 /// A trait for reading from the underlying FUSE endpoint.
 pub trait Reader: io::Read {}
 
+impl<R: Reader> Reader for &'_ mut R {}
+
 /// A trait for writing to the underlying FUSE endpoint. The FUSE device expects the write
 /// operation to happen in one write transaction. Since there are cases when data needs to be
 /// generated earlier than the header, it implies the writer implementation to keep an internal
 /// buffer. The buffer then can be flushed once header and data are both prepared.
 pub trait Writer: io::Write {
+    /// The type passed in to the closure in `write_at`. For most implementations, this should be
+    /// `Self`.
+    type ClosureWriter: Writer + ZeroCopyWriter;
+
     /// Allows a closure to generate and write data at the current writer's offset. The current
     /// writer is passed as a mutable reference to the closure. As an example, this provides an
     /// adapter for the read implementation of a filesystem to write directly to the final buffer
@@ -41,10 +48,25 @@ pub trait Writer: io::Write {
     /// complexity.
     fn write_at<F>(&mut self, offset: usize, f: F) -> io::Result<usize>
     where
-        F: Fn(&mut Self) -> io::Result<usize>;
+        F: Fn(&mut Self::ClosureWriter) -> io::Result<usize>;
 
     /// Checks if the writer can still accept certain amount of data.
     fn has_sufficient_buffer(&self, size: u32) -> bool;
+}
+
+impl<W: Writer> Writer for &'_ mut W {
+    type ClosureWriter = W::ClosureWriter;
+
+    fn write_at<F>(&mut self, offset: usize, f: F) -> io::Result<usize>
+    where
+        F: Fn(&mut Self::ClosureWriter) -> io::Result<usize>,
+    {
+        (**self).write_at(offset, f)
+    }
+
+    fn has_sufficient_buffer(&self, size: u32) -> bool {
+        (**self).has_sufficient_buffer(size)
+    }
 }
 
 /// A trait for memory mapping for DAX.
@@ -194,7 +216,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         match self
             .fs
-            .lookup(Context::from(in_header), in_header.nodeid.into(), &name)
+            .lookup(Context::from(in_header), in_header.nodeid.into(), name)
         {
             Ok(entry) => {
                 let out = EntryOut::from(entry);
@@ -933,6 +955,7 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::DO_READDIRPLUS
             | FsOptions::READDIRPLUS_AUTO
             | FsOptions::ATOMIC_O_TRUNC
+            | FsOptions::MAX_PAGES
             | FsOptions::MAP_ALIGNMENT;
 
         let capable = FsOptions::from_bits_truncate(flags);
@@ -952,6 +975,11 @@ impl<F: FileSystem + Sync> Server<F> {
                     enabled.remove(FsOptions::ATOMIC_O_TRUNC);
                 }
 
+                let max_write = self.fs.max_buffer_size();
+                let max_pages = min(
+                    max(max_readahead, max_write) / pagesize() as u32,
+                    u16::MAX as u32,
+                ) as u16;
                 let out = InitOut {
                     major: KERNEL_VERSION,
                     minor: KERNEL_MINOR_VERSION,
@@ -959,8 +987,9 @@ impl<F: FileSystem + Sync> Server<F> {
                     flags: enabled.bits(),
                     max_background: ::std::u16::MAX,
                     congestion_threshold: (::std::u16::MAX / 4) * 3,
-                    max_write: self.fs.max_buffer_size(),
+                    max_write,
                     time_gran: 1, // nanoseconds
+                    max_pages,
                     map_alignment: pagesize().trailing_zeros() as u16,
                     ..Default::default()
                 };
@@ -1672,7 +1701,7 @@ fn reply_ok<T: DataInit, W: Writer>(
         len += size_of::<T>();
     }
 
-    if let Some(ref data) = data {
+    if let Some(data) = data {
         len += data.len();
     }
 

@@ -4,6 +4,8 @@
 
 @include /usr/share/policy/crosvm/common_device.policy
 
+_llseek: 1
+lseek: 1
 madvise: 1
 open: return ENOENT
 openat: return ENOENT
@@ -12,3 +14,8 @@ setrlimit: 1
 sched_setscheduler: 1
 socketpair: arg0 == AF_UNIX
 prctl: arg0 == PR_SET_NAME
+timerfd_create: 1
+timerfd_gettime: 1
+timerfd_gettime64: 1
+timerfd_settime: 1
+timerfd_settime64: 1

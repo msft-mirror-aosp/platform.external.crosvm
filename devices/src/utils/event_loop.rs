@@ -4,8 +4,8 @@
 
 use super::error::{Error, Result};
 use base::{
-    error, warn, AsRawDescriptor, Descriptor, EpollContext, EpollEvents, Event, RawDescriptor,
-    WatchingEvents,
+    error, warn, wrap_descriptor, AsRawDescriptor, Descriptor, EpollContext, EpollEvents, Event,
+    RawDescriptor, WatchingEvents,
 };
 use std::collections::BTreeMap;
 use std::mem::drop;
@@ -48,7 +48,7 @@ pub struct EventLoop {
 
 /// Interface for event handler.
 pub trait EventHandler: Send + Sync {
-    fn on_event(&self) -> anyhow::Result<()>;
+    fn on_event(&self) -> std::result::Result<(), ()>;
 }
 
 impl EventLoop {
@@ -65,8 +65,11 @@ impl EventLoop {
             Arc::new(Mutex::new(BTreeMap::new()));
         let poll_ctx: EpollContext<Descriptor> = EpollContext::new()
             .and_then(|pc| {
-                pc.add(&stop_evt, Descriptor(stop_evt.as_raw_descriptor()))
-                    .and(Ok(pc))
+                pc.add(
+                    &wrap_descriptor(&stop_evt),
+                    Descriptor(stop_evt.as_raw_descriptor()),
+                )
+                .and(Ok(pc))
             })
             .map_err(Error::CreateWaitContext)?;
 
@@ -96,40 +99,39 @@ impl EventLoop {
                         }
                     };
                     for event in &events {
-                        let fd = event.token().as_raw_descriptor();
-                        if fd == stop_evt.as_raw_descriptor() {
+                        if event.token().as_raw_descriptor() == stop_evt.as_raw_descriptor() {
                             return;
-                        }
-
-                        let mut locked = fd_callbacks.lock();
-                        let weak_handler = match locked.get(&fd) {
-                            Some(cb) => cb.clone(),
-                            None => {
-                                warn!("callback for fd {} already removed", fd);
-                                continue;
-                            }
-                        };
-
-                        // If the file descriptor is hung up, remove it after calling the handler
-                        // one final time.
-                        let mut remove = event.hungup();
-
-                        if let Some(handler) = weak_handler.upgrade() {
-                            // Drop lock before triggering the event.
-                            drop(locked);
-                            if let Err(e) = handler.on_event() {
-                                error!("removing event handler due to error: {:#}", e);
-                                remove = true;
-                            }
-                            locked = fd_callbacks.lock();
                         } else {
-                            // If the handler is already gone, we remove the fd.
-                            remove = true;
-                        }
-
-                        if remove {
-                            let _ = poll_ctx.delete(&event.token());
-                            let _ = locked.remove(&fd);
+                            let fd = event.token().as_raw_descriptor();
+                            let mut locked = fd_callbacks.lock();
+                            let weak_handler = match locked.get(&fd) {
+                                Some(cb) => cb.clone(),
+                                None => {
+                                    warn!("callback for fd {} already removed", fd);
+                                    continue;
+                                }
+                            };
+                            match weak_handler.upgrade() {
+                                Some(handler) => {
+                                    // Drop lock before triggering the event.
+                                    drop(locked);
+                                    match handler.on_event() {
+                                        Ok(()) => {}
+                                        Err(_) => {
+                                            error!("event loop stopping due to handle event error");
+                                            fail_handle.fail();
+                                            return;
+                                        }
+                                    };
+                                }
+                                // If the handler is already gone, we remove the fd.
+                                None => {
+                                    let _ = poll_ctx.delete(&Descriptor(fd));
+                                    if locked.remove(&fd).is_none() {
+                                        error!("fail to remove handler for file descriptor {}", fd);
+                                    }
+                                }
+                            };
                         }
                     }
                 }
@@ -160,7 +162,7 @@ impl EventLoop {
         // This might fail due to epoll syscall. Check epoll_ctl(2).
         self.poll_ctx
             .add_fd_with_events(
-                descriptor,
+                &wrap_descriptor(descriptor),
                 events,
                 Descriptor(descriptor.as_raw_descriptor()),
             )
@@ -176,7 +178,7 @@ impl EventLoop {
         }
         // This might fail due to epoll syscall. Check epoll_ctl(2).
         self.poll_ctx
-            .delete(descriptor)
+            .delete(&wrap_descriptor(descriptor))
             .map_err(Error::WaitContextDeleteDescriptor)?;
         self.handlers.lock().remove(&descriptor.as_raw_descriptor());
         Ok(())
@@ -206,7 +208,7 @@ mod tests {
     }
 
     impl EventHandler for EventLoopTestHandler {
-        fn on_event(&self) -> anyhow::Result<()> {
+        fn on_event(&self) -> std::result::Result<(), ()> {
             self.evt.read().unwrap();
             *self.val.lock().unwrap() += 1;
             self.cvar.notify_one();
@@ -237,12 +239,7 @@ mod tests {
         )
         .unwrap();
         self_evt.write(1).unwrap();
-        {
-            let mut val = h.val.lock().unwrap();
-            while *val < 1 {
-                val = h.cvar.wait(val).unwrap();
-            }
-        }
+        let _ = h.cvar.wait(h.val.lock().unwrap()).unwrap();
         l.stop();
         j.join().unwrap();
         assert_eq!(*(h.val.lock().unwrap()), 1);

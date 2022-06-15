@@ -11,17 +11,19 @@ use std::process::Command;
 // Performs a recursive search for a file with name under path and returns the full path if such a
 // file is found.
 fn scan_path<P: AsRef<Path>, O: AsRef<OsStr>>(path: P, name: O) -> Option<PathBuf> {
-    for entry in (fs::read_dir(path).ok()?).flatten() {
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+    for entry in fs::read_dir(path).ok()? {
+        if let Ok(entry) = entry {
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
 
-        if file_type.is_file() && entry.file_name() == name.as_ref() {
-            return Some(entry.path());
-        } else if file_type.is_dir() {
-            if let Some(found) = scan_path(entry.path(), name.as_ref()) {
-                return Some(found);
+            if file_type.is_file() && entry.file_name() == name.as_ref() {
+                return Some(entry.path());
+            } else if file_type.is_dir() {
+                if let Some(found) = scan_path(entry.path(), name.as_ref()) {
+                    return Some(found);
+                }
             }
         }
     }
@@ -30,7 +32,7 @@ fn scan_path<P: AsRef<Path>, O: AsRef<OsStr>>(path: P, name: O) -> Option<PathBu
 
 // Searches for the given protocol in both the system wide and bundles protocols path.
 fn find_protocol(name: &str) -> PathBuf {
-    let protocols_path = pkg_config::get_variable("wayland-protocols", "pkgdatadir")
+    let protocols_path = env::var("WAYLAND_PROTOCOLS_PATH")
         .unwrap_or_else(|_| "/usr/share/wayland-protocols".to_owned());
     let protocol_file_name = PathBuf::from(format!("{}.xml", name));
 
@@ -85,9 +87,8 @@ fn main() {
     for protocol in &[
         "aura-shell",
         "linux-dmabuf-unstable-v1",
-        "xdg-shell",
+        "xdg-shell-unstable-v6",
         "viewporter",
-        "virtio-gpu-metadata-v1",
     ] {
         build.file(compile_protocol(protocol, &out_dir));
     }

@@ -2,18 +2,31 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use data_model::VolatileSlice;
-use remain::sorted;
-use thiserror::Error as ThisError;
+use std::fmt::{self, Display};
 
-#[sorted]
-#[derive(ThisError, Debug)]
+use data_model::VolatileSlice;
+
+#[derive(Debug)]
 pub enum Error {
     /// Invalid offset or length given for an iovec in backing memory.
-    #[error("Invalid offset/len for getting a slice from {0} with len {1}.")]
     InvalidOffset(u64, usize),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            InvalidOffset(base, len) => write!(
+                f,
+                "Invalid offset/len for getting a slice from {} with len {}.",
+                base, len
+            ),
+        }
+    }
+}
+impl std::error::Error for Error {}
 
 /// Used to index subslices of backing memory. Like an iovec, but relative to the start of the
 /// memory region instead of an absolute pointer.
@@ -55,9 +68,9 @@ impl From<Vec<u8>> for VecIoWrapper {
     }
 }
 
-impl From<VecIoWrapper> for Vec<u8> {
-    fn from(v: VecIoWrapper) -> Vec<u8> {
-        v.inner.into()
+impl Into<Vec<u8>> for VecIoWrapper {
+    fn into(self) -> Vec<u8> {
+        self.inner.into()
     }
 }
 

@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 
-use base::{error, info, Event, WaitContext};
+use base::{error, info, Event, Tube, WaitContext};
 use vm_memory::GuestMemory;
 
 use crate::virtio::queue::{DescriptorChain, Queue};
@@ -21,44 +21,24 @@ use crate::virtio::video::{Error, Result};
 use crate::virtio::{Interrupt, Reader, SignalableInterrupt, Writer};
 
 pub struct Worker {
-    interrupt: Interrupt,
-    mem: GuestMemory,
-    cmd_queue: Queue,
-    cmd_evt: Event,
-    event_queue: Queue,
-    event_evt: Event,
-    kill_evt: Event,
-    // Stores descriptors in which responses for asynchronous commands will be written.
-    desc_map: AsyncCmdDescMap,
+    pub interrupt: Interrupt,
+    pub mem: GuestMemory,
+    pub cmd_evt: Event,
+    pub event_evt: Event,
+    pub kill_evt: Event,
+    pub resource_bridge: Tube,
 }
 
 /// Pair of a descriptor chain and a response to be written.
 type WritableResp = (DescriptorChain, response::CmdResponse);
 
 impl Worker {
-    pub fn new(
-        interrupt: Interrupt,
-        mem: GuestMemory,
-        cmd_queue: Queue,
-        cmd_evt: Event,
-        event_queue: Queue,
-        event_evt: Event,
-        kill_evt: Event,
-    ) -> Self {
-        Self {
-            interrupt,
-            mem,
-            cmd_queue,
-            cmd_evt,
-            event_queue,
-            event_evt,
-            kill_evt,
-            desc_map: Default::default(),
-        }
-    }
-
     /// Writes responses into the command queue.
-    fn write_responses(&mut self, responses: &mut VecDeque<WritableResp>) -> Result<()> {
+    fn write_responses(
+        &self,
+        cmd_queue: &mut Queue,
+        responses: &mut VecDeque<WritableResp>,
+    ) -> Result<()> {
         if responses.is_empty() {
             return Ok(());
         }
@@ -72,19 +52,18 @@ impl Worker {
                     response, e
                 );
             }
-            self.cmd_queue
-                .add_used(&self.mem, desc_index, writer.bytes_written() as u32);
+            cmd_queue.add_used(&self.mem, desc_index, writer.bytes_written() as u32);
         }
-        self.cmd_queue.trigger_interrupt(&self.mem, &self.interrupt);
+        self.interrupt.signal_used_queue(cmd_queue.vector);
         Ok(())
     }
 
     /// Writes a `VideoEvt` into the event queue.
-    fn write_event(&mut self, event: event::VideoEvt) -> Result<()> {
-        let desc = self
-            .event_queue
-            .pop(&self.mem)
+    fn write_event(&self, event_queue: &mut Queue, event: event::VideoEvt) -> Result<()> {
+        let desc = event_queue
+            .peek(&self.mem)
             .ok_or(Error::DescriptorNotAvailable)?;
+        event_queue.pop_peeked(&self.mem);
 
         let desc_index = desc.index;
         let mut writer =
@@ -92,16 +71,17 @@ impl Worker {
         event
             .write(&mut writer)
             .map_err(|error| Error::WriteEventFailure { event, error })?;
-        self.event_queue
-            .add_used(&self.mem, desc_index, writer.bytes_written() as u32);
-        self.event_queue
-            .trigger_interrupt(&self.mem, &self.interrupt);
+        event_queue.add_used(&self.mem, desc_index, writer.bytes_written() as u32);
+        self.interrupt.signal_used_queue(event_queue.vector);
         Ok(())
     }
 
     fn write_event_responses(
-        &mut self,
+        &self,
         event_responses: Vec<VideoEvtResponseType>,
+        cmd_queue: &mut Queue,
+        event_queue: &mut Queue,
+        desc_map: &mut AsyncCmdDescMap,
         stream_id: u32,
     ) -> Result<()> {
         let mut responses: VecDeque<WritableResp> = Default::default();
@@ -112,7 +92,7 @@ impl Worker {
                         tag,
                         response: cmd_result,
                     } = async_response;
-                    match self.desc_map.remove(&tag) {
+                    match desc_map.remove(&tag) {
                         Some(desc) => {
                             let cmd_response = match cmd_result {
                                 Ok(r) => r,
@@ -139,18 +119,21 @@ impl Worker {
                     }
                 }
                 VideoEvtResponseType::Event(evt) => {
-                    self.write_event(evt)?;
+                    self.write_event(event_queue, evt)?;
                 }
             }
         }
 
-        if let Err(e) = self.write_responses(&mut responses) {
+        if let Err(e) = self.write_responses(cmd_queue, &mut responses) {
             error!("Failed to write event responses: {:?}", e);
             // Ignore result of write_event for a fatal error.
-            let _ = self.write_event(VideoEvt {
-                typ: EvtType::Error,
-                stream_id,
-            });
+            let _ = self.write_event(
+                event_queue,
+                VideoEvt {
+                    typ: EvtType::Error,
+                    stream_id,
+                },
+            );
             return Err(e);
         }
 
@@ -159,10 +142,13 @@ impl Worker {
 
     /// Handles a `DescriptorChain` value sent via the command queue and returns a `VecDeque`
     /// of `WritableResp` to be sent to the guest.
-    fn handle_command_desc(
-        &mut self,
-        device: &mut dyn Device,
+    fn handle_command_desc<T: Device>(
+        &self,
+        cmd_queue: &mut Queue,
+        event_queue: &mut Queue,
+        device: &mut T,
         wait_ctx: &WaitContext<Token>,
+        desc_map: &mut AsyncCmdDescMap,
         desc: DescriptorChain,
     ) -> Result<VecDeque<WritableResp>> {
         let mut responses: VecDeque<WritableResp> = Default::default();
@@ -178,12 +164,10 @@ impl Worker {
             VideoCmd::ResourceDestroyAll {
                 stream_id,
                 queue_type,
-            } => self
-                .desc_map
-                .create_cancellation_responses(&stream_id, Some(queue_type), None),
-            VideoCmd::StreamDestroy { stream_id } => self
-                .desc_map
-                .create_cancellation_responses(&stream_id, None, None),
+            } => desc_map.create_cancellation_responses(&stream_id, Some(queue_type), None),
+            VideoCmd::StreamDestroy { stream_id } => {
+                desc_map.create_cancellation_responses(&stream_id, None, None)
+            }
             VideoCmd::QueueClear {
                 stream_id,
                 queue_type: QueueType::Output,
@@ -191,11 +175,7 @@ impl Worker {
                 // TODO(b/153406792): Due to a workaround for a limitation in the VDA api,
                 // clearing the output queue doesn't go through the same Async path as clearing
                 // the input queue. However, we still need to cancel the pending resources.
-                self.desc_map.create_cancellation_responses(
-                    &stream_id,
-                    Some(QueueType::Output),
-                    None,
-                )
+                desc_map.create_cancellation_responses(&stream_id, Some(QueueType::Output), None)
             }
             _ => Default::default(),
         };
@@ -211,7 +191,7 @@ impl Worker {
                     e.into()
                 }
             };
-            match self.desc_map.remove(&tag) {
+            match desc_map.remove(&tag) {
                 Some(destroy_desc) => {
                     responses.push_back((destroy_desc, destroy_response));
                 }
@@ -220,7 +200,8 @@ impl Worker {
         }
 
         // Process the command by the device.
-        let (cmd_response, event_responses_with_id) = device.process_cmd(cmd, wait_ctx);
+        let (cmd_response, event_responses_with_id) =
+            device.process_cmd(cmd, &wait_ctx, &self.resource_bridge);
         match cmd_response {
             VideoCmdResponseType::Sync(r) => {
                 responses.push_back((desc, r));
@@ -229,39 +210,67 @@ impl Worker {
                 // If the command expects an asynchronous response,
                 // store `desc` to use it after the back-end device notifies the
                 // completion.
-                self.desc_map.insert(tag, desc);
+                desc_map.insert(tag, desc);
             }
         }
         if let Some((stream_id, event_responses)) = event_responses_with_id {
-            self.write_event_responses(event_responses, stream_id)?;
+            self.write_event_responses(
+                event_responses,
+                cmd_queue,
+                event_queue,
+                desc_map,
+                stream_id,
+            )?;
         }
 
         Ok(responses)
     }
 
     /// Handles each command in the command queue.
-    fn handle_command_queue(
-        &mut self,
-        device: &mut dyn Device,
+    fn handle_command_queue<T: Device>(
+        &self,
+        cmd_queue: &mut Queue,
+        event_queue: &mut Queue,
+        device: &mut T,
         wait_ctx: &WaitContext<Token>,
+        desc_map: &mut AsyncCmdDescMap,
     ) -> Result<()> {
         let _ = self.cmd_evt.read();
-        while let Some(desc) = self.cmd_queue.pop(&self.mem) {
-            let mut resps = self.handle_command_desc(device, wait_ctx, desc)?;
-            self.write_responses(&mut resps)?;
+        while let Some(desc) = cmd_queue.pop(&self.mem) {
+            let mut resps =
+                self.handle_command_desc(cmd_queue, event_queue, device, wait_ctx, desc_map, desc)?;
+            self.write_responses(cmd_queue, &mut resps)?;
         }
         Ok(())
     }
 
     /// Handles an event notified via an event.
-    fn handle_event(&mut self, device: &mut dyn Device, stream_id: u32) -> Result<()> {
-        if let Some(event_responses) = device.process_event(&mut self.desc_map, stream_id) {
-            self.write_event_responses(event_responses, stream_id)?;
+    fn handle_event<T: Device>(
+        &self,
+        cmd_queue: &mut Queue,
+        event_queue: &mut Queue,
+        device: &mut T,
+        desc_map: &mut AsyncCmdDescMap,
+        stream_id: u32,
+    ) -> Result<()> {
+        if let Some(event_responses) = device.process_event(desc_map, stream_id) {
+            self.write_event_responses(
+                event_responses,
+                cmd_queue,
+                event_queue,
+                desc_map,
+                stream_id,
+            )?;
         }
         Ok(())
     }
 
-    pub fn run(&mut self, mut device: Box<dyn Device>) -> Result<()> {
+    pub fn run<T: Device>(
+        &mut self,
+        mut cmd_queue: Queue,
+        mut event_queue: Queue,
+        mut device: T,
+    ) -> Result<()> {
         let wait_ctx: WaitContext<Token> = WaitContext::build_with(&[
             (&self.cmd_evt, Token::CmdQueue),
             (&self.event_evt, Token::EventQueue),
@@ -275,19 +284,34 @@ impl Worker {
         })
         .map_err(Error::WaitContextCreationFailed)?;
 
+        // Stores descriptors in which responses for asynchronous commands will be written.
+        let mut desc_map: AsyncCmdDescMap = Default::default();
+
         loop {
             let wait_events = wait_ctx.wait().map_err(Error::WaitError)?;
 
             for wait_event in wait_events.iter().filter(|e| e.is_readable) {
                 match wait_event.token {
                     Token::CmdQueue => {
-                        self.handle_command_queue(device.as_mut(), &wait_ctx)?;
+                        self.handle_command_queue(
+                            &mut cmd_queue,
+                            &mut event_queue,
+                            &mut device,
+                            &wait_ctx,
+                            &mut desc_map,
+                        )?;
                     }
                     Token::EventQueue => {
                         let _ = self.event_evt.read();
                     }
                     Token::Event { id } => {
-                        self.handle_event(device.as_mut(), id)?;
+                        self.handle_event(
+                            &mut cmd_queue,
+                            &mut event_queue,
+                            &mut device,
+                            &mut desc_map,
+                            id,
+                        )?;
                     }
                     Token::InterruptResample => {
                         self.interrupt.interrupt_resample();

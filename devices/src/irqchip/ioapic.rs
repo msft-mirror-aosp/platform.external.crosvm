@@ -6,16 +6,16 @@
 // See https://www.intel.com/content/dam/doc/datasheet/io-controller-hub-10-family-datasheet.pdf
 // for a specification.
 
+use std::fmt::{self, Display};
+
 use super::IrqEvent;
 use crate::bus::BusAccessInfo;
 use crate::BusDevice;
 use base::{error, warn, Error, Event, Result, Tube, TubeError};
 use hypervisor::{
     IoapicRedirectionTableEntry, IoapicState, MsiAddressMessage, MsiDataMessage, TriggerMode,
-    MAX_IOAPIC_PINS, NUM_IOAPIC_PINS,
+    NUM_IOAPIC_PINS,
 };
-use remain::sorted;
-use thiserror::Error;
 use vm_control::{VmIrqRequest, VmIrqResponse};
 
 // ICH10 I/O APIC version: 0x20
@@ -146,7 +146,7 @@ impl BusDevice for Ioapic {
 
 impl Ioapic {
     pub fn new(irq_tube: Tube, num_pins: usize) -> Result<Ioapic> {
-        let num_pins = num_pins.max(NUM_IOAPIC_PINS).min(MAX_IOAPIC_PINS);
+        let num_pins = num_pins.max(NUM_IOAPIC_PINS as usize);
         let mut entry = IoapicRedirectionTableEntry::new();
         entry.set_interrupt_mask(true);
         Ok(Ioapic {
@@ -156,26 +156,10 @@ impl Ioapic {
             rtc_remote_irr: false,
             out_events: (0..num_pins).map(|_| None).collect(),
             resample_events: Vec::new(),
-            redirect_table: (0..num_pins).map(|_| entry).collect(),
+            redirect_table: (0..num_pins).map(|_| entry.clone()).collect(),
             interrupt_level: (0..num_pins).map(|_| false).collect(),
             irq_tube,
         })
-    }
-
-    pub fn init_direct_gsi<F>(&mut self, register_irqfd: F) -> Result<()>
-    where
-        F: Fn(u32, &Event) -> Result<()>,
-    {
-        for (gsi, out_event) in self.out_events.iter_mut().enumerate() {
-            let event = Event::new()?;
-            register_irqfd(gsi as u32, &event)?;
-            *out_event = Some(IrqEvent {
-                gsi: gsi as u32,
-                event,
-                resample_event: None,
-            });
-        }
-        Ok(())
     }
 
     pub fn get_ioapic_state(&self) -> IoapicState {
@@ -397,12 +381,7 @@ impl Ioapic {
             evt.gsi
         } else {
             let event = Event::new().map_err(IoapicError::CreateEvent)?;
-            let request = VmIrqRequest::AllocateOneMsi {
-                irqfd: event,
-                device_id: self.device_id(),
-                queue_id: index,
-                device_name: self.debug_label(),
-            };
+            let request = VmIrqRequest::AllocateOneMsi { irqfd: event };
             self.irq_tube
                 .send(&request)
                 .map_err(IoapicError::AllocateOneMsiSend)?;
@@ -415,7 +394,7 @@ impl Ioapic {
                     self.out_events[index] = Some(IrqEvent {
                         gsi,
                         event: match request {
-                            VmIrqRequest::AllocateOneMsi { irqfd, .. } => irqfd,
+                            VmIrqRequest::AllocateOneMsi { irqfd } => irqfd,
                             _ => unreachable!(),
                         },
                         resample_event: None,
@@ -466,23 +445,33 @@ impl Ioapic {
     }
 }
 
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 enum IoapicError {
-    #[error("AddMsiRoute failed: {0}")]
     AddMsiRoute(Error),
-    #[error("failed to receive AddMsiRoute response: {0}")]
     AddMsiRouteRecv(TubeError),
-    #[error("failed to send AddMsiRoute request: {0}")]
     AddMsiRouteSend(TubeError),
-    #[error("AllocateOneMsi failed: {0}")]
     AllocateOneMsi(Error),
-    #[error("failed to receive AllocateOneMsi response: {0}")]
     AllocateOneMsiRecv(TubeError),
-    #[error("failed to send AllocateOneMsi request: {0}")]
     AllocateOneMsiSend(TubeError),
-    #[error("failed to create event object: {0}")]
     CreateEvent(Error),
+}
+
+impl Display for IoapicError {
+    #[remain::check]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::IoapicError::*;
+
+        #[sorted]
+        match self {
+            AddMsiRoute(e) => write!(f, "AddMsiRoute failed: {}", e),
+            AddMsiRouteRecv(e) => write!(f, "failed to receive AddMsiRoute response: {}", e),
+            AddMsiRouteSend(e) => write!(f, "failed to send AddMsiRoute request: {}", e),
+            AllocateOneMsi(e) => write!(f, "AllocateOneMsi failed: {}", e),
+            AllocateOneMsiRecv(e) => write!(f, "failed to receive AllocateOneMsi response: {}", e),
+            AllocateOneMsiSend(e) => write!(f, "failed to send AllocateOneMsi request: {}", e),
+            CreateEvent(e) => write!(f, "failed to create event object: {}", e),
+        }
+    }
 }
 
 #[cfg(test)]

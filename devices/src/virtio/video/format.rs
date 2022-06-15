@@ -45,8 +45,27 @@ pub enum Profile {
 }
 impl_try_from_le32_for_enumn!(Profile, "profile");
 
+macro_rules! impl_libvda_conversion {
+    ( $( ( $x:ident, $y:ident ) ),* ) => {
+        pub fn from_libvda_profile(p: libvda::Profile) -> Option<Self> {
+            match p {
+                $(libvda::Profile::$x => Some(Self::$y),)*
+                _ => None
+            }
+        }
+
+        // TODO(alexlau): Remove this after encoder CL lands.
+        #[allow(dead_code)]
+        pub fn to_libvda_profile(&self) -> Option<libvda::Profile> {
+            match self {
+                $(Self::$y => Some(libvda::Profile::$x),)*
+                _ => None
+            }
+        }
+    }
+}
+
 impl Profile {
-    #[cfg(any(feature = "video-encoder", feature = "libvda"))]
     pub fn to_format(&self) -> Format {
         use Profile::*;
         match self {
@@ -66,6 +85,31 @@ impl Profile {
             VP9Profile0 | VP9Profile1 | VP9Profile2 | VP9Profile3 => Format::VP9,
         }
     }
+
+    impl_libvda_conversion!(
+        (H264ProfileBaseline, H264Baseline),
+        (H264ProfileMain, H264Main),
+        (H264ProfileExtended, H264Extended),
+        (H264ProfileHigh, H264High),
+        (H264ProfileHigh10Profile, H264High10),
+        (H264ProfileHigh422Profile, H264High422),
+        (
+            H264ProfileHigh444PredictiveProfile,
+            H264High444PredictiveProfile
+        ),
+        (H264ProfileScalableBaseline, H264ScalableBaseline),
+        (H264ProfileScalableHigh, H264ScalableHigh),
+        (H264ProfileStereoHigh, H264StereoHigh),
+        (H264ProfileMultiviewHigh, H264MultiviewHigh),
+        (HevcProfileMain, HevcMain),
+        (HevcProfileMain10, HevcMain10),
+        (HevcProfileMainStillPicture, HevcMainStillPicture),
+        (VP8, VP8Profile0),
+        (VP9Profile0, VP9Profile0),
+        (VP9Profile1, VP9Profile1),
+        (VP9Profile2, VP9Profile2),
+        (VP9Profile3, VP9Profile3)
+    );
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, N, Clone, Copy, Debug)]
@@ -118,40 +162,6 @@ impl Display for Format {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, N, Clone, Copy, Debug)]
-#[repr(u32)]
-pub enum BitrateMode {
-    VBR = VIRTIO_VIDEO_BITRATE_MODE_VBR,
-    CBR = VIRTIO_VIDEO_BITRATE_MODE_CBR,
-}
-impl_try_from_le32_for_enumn!(BitrateMode, "bitrate_mode");
-
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone)]
-pub enum Bitrate {
-    /// Constant bitrate.
-    CBR { target: u32 },
-    /// Variable bitrate.
-    VBR { target: u32, peak: u32 },
-}
-
-#[cfg(feature = "video-encoder")]
-impl Bitrate {
-    pub fn mode(&self) -> BitrateMode {
-        match self {
-            Bitrate::CBR { .. } => BitrateMode::CBR,
-            Bitrate::VBR { .. } => BitrateMode::VBR,
-        }
-    }
-
-    pub fn target(&self) -> u32 {
-        match self {
-            Bitrate::CBR { target } => *target,
-            Bitrate::VBR { target, .. } => *target,
-        }
-    }
-}
-
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Crop {
     pub left: u32,
@@ -161,34 +171,12 @@ pub struct Crop {
 }
 impl_from_for_interconvertible_structs!(virtio_video_crop, Crop, left, top, width, height);
 
-#[derive(PartialEq, Eq, Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct PlaneFormat {
     pub plane_size: u32,
     pub stride: u32,
 }
 impl_from_for_interconvertible_structs!(virtio_video_plane_format, PlaneFormat, plane_size, stride);
-
-impl PlaneFormat {
-    pub fn get_plane_layout(format: Format, width: u32, height: u32) -> Option<Vec<PlaneFormat>> {
-        match format {
-            Format::NV12 => Some(vec![
-                // Y plane, 1 sample per pixel.
-                PlaneFormat {
-                    plane_size: width * height,
-                    stride: width,
-                },
-                // UV plane, 1 sample per group of 4 pixels for U and V.
-                PlaneFormat {
-                    // Add one vertical line so odd resolutions result in an extra UV line to cover all the
-                    // Y samples.
-                    plane_size: width * ((height + 1) / 2),
-                    stride: width,
-                },
-            ]),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FormatRange {
@@ -243,7 +231,6 @@ impl Response for FormatDesc {
     }
 }
 
-#[cfg(feature = "video-encoder")]
 fn clamp_size(size: u32, min: u32, step: u32) -> u32 {
     match step {
         0 | 1 => size,
@@ -260,7 +247,6 @@ fn clamp_size(size: u32, min: u32, step: u32) -> u32 {
 
 /// Parses a slice of valid frame formats and the desired resolution
 /// and returns the closest available resolution.
-#[cfg(feature = "video-encoder")]
 pub fn find_closest_resolution(
     frame_formats: &[FrameFormat],
     desired_width: u32,
@@ -289,17 +275,10 @@ pub fn find_closest_resolution(
 }
 
 /// A rectangle used to describe portions of a frame.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
-}
-
-/// Description of the layout for a single plane.
-#[derive(Debug, Clone)]
-pub struct FramePlane {
-    pub offset: usize,
-    pub stride: usize,
 }

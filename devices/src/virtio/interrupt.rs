@@ -3,11 +3,8 @@
 // found in the LICENSE file.
 
 use super::{INTERRUPT_STATUS_CONFIG_CHANGED, INTERRUPT_STATUS_USED_RING, VIRTIO_MSI_NO_VECTOR};
-use crate::irq_event::IrqLevelEvent;
 use crate::pci::MsixConfig;
 use base::Event;
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use sync::Mutex;
@@ -34,7 +31,8 @@ pub trait SignalableInterrupt {
 
 pub struct Interrupt {
     interrupt_status: Arc<AtomicUsize>,
-    interrupt_evt: IrqLevelEvent,
+    interrupt_evt: Event,
+    interrupt_resample_evt: Event,
     msix_config: Option<Arc<Mutex<MsixConfig>>>,
     config_msix_vector: u16,
 }
@@ -64,7 +62,7 @@ impl SignalableInterrupt for Interrupt {
             == 0
         {
             // Write to irqfd to inject INTx interrupt
-            self.interrupt_evt.trigger().unwrap();
+            self.interrupt_evt.write(1).unwrap();
         }
     }
 
@@ -73,81 +71,36 @@ impl SignalableInterrupt for Interrupt {
     }
 
     fn get_resample_evt(&self) -> Option<&Event> {
-        Some(self.interrupt_evt.get_resample())
+        Some(&self.interrupt_resample_evt)
     }
 
     fn do_interrupt_resample(&self) {
         if self.interrupt_status.load(Ordering::SeqCst) != 0 {
-            self.interrupt_evt.trigger().unwrap();
+            self.interrupt_evt.write(1).unwrap();
         }
     }
-}
-
-impl<I: SignalableInterrupt> SignalableInterrupt for Arc<Mutex<I>> {
-    fn signal(&self, vector: u16, interrupt_status_mask: u32) {
-        self.lock().signal(vector, interrupt_status_mask);
-    }
-
-    fn signal_used_queue(&self, vector: u16) {
-        self.lock().signal_used_queue(vector);
-    }
-
-    fn signal_config_changed(&self) {
-        self.lock().signal_config_changed();
-    }
-
-    fn get_resample_evt(&self) -> Option<&Event> {
-        // Cannot get resample event from a borrowed item.
-        None
-    }
-
-    fn do_interrupt_resample(&self) {}
-}
-
-impl<I: SignalableInterrupt> SignalableInterrupt for Rc<RefCell<I>> {
-    fn signal(&self, vector: u16, interrupt_status_mask: u32) {
-        self.borrow().signal(vector, interrupt_status_mask);
-    }
-
-    fn signal_used_queue(&self, vector: u16) {
-        self.borrow().signal_used_queue(vector);
-    }
-
-    fn signal_config_changed(&self) {
-        self.borrow().signal_config_changed();
-    }
-
-    fn get_resample_evt(&self) -> Option<&Event> {
-        // Cannot get resample event from a borrowed item.
-        None
-    }
-
-    fn do_interrupt_resample(&self) {}
 }
 
 impl Interrupt {
     pub fn new(
         interrupt_status: Arc<AtomicUsize>,
-        interrupt_evt: IrqLevelEvent,
+        interrupt_evt: Event,
+        interrupt_resample_evt: Event,
         msix_config: Option<Arc<Mutex<MsixConfig>>>,
         config_msix_vector: u16,
     ) -> Interrupt {
         Interrupt {
             interrupt_status,
             interrupt_evt,
+            interrupt_resample_evt,
             msix_config,
             config_msix_vector,
         }
     }
 
-    /// Get a reference to the interrupt event.
-    pub fn get_interrupt_evt(&self) -> &Event {
-        self.interrupt_evt.get_trigger()
-    }
-
     /// Handle interrupt resampling event, reading the value from the event and doing the resample.
     pub fn interrupt_resample(&self) {
-        self.interrupt_evt.clear_resample();
+        let _ = self.interrupt_resample_evt.read();
         self.do_interrupt_resample();
     }
 

@@ -5,21 +5,27 @@
 use bit_field::Error as BitFieldError;
 use bit_field::*;
 use data_model::DataInit;
-use remain::sorted;
 use std::fmt::{self, Display};
-use thiserror::Error;
 use vm_memory::GuestAddress;
 
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("cannot cast trb from raw memory")]
-    CannotCastTrb,
-    #[error("we got an unknown trb type value: {0}")]
     UnknownTrbType(BitFieldError),
+    CannotCastTrb,
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            UnknownTrbType(e) => write!(f, "we got an unknown trb type value: {}", e),
+            CannotCastTrb => write!(f, "cannot cast trb from raw memory"),
+        }
+    }
+}
 
 // Fixed size of all TRB types.
 const TRB_SIZE: usize = 16;

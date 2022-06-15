@@ -12,14 +12,14 @@ use std::sync::{Arc, Mutex};
 /// The callback might not be invoked in certain cases. Don't depend this for safety.
 #[derive(Clone)]
 pub struct RingBufferStopCallback {
-    _inner: Arc<Mutex<RingBufferStopCallbackInner>>,
+    inner: Arc<Mutex<RingBufferStopCallbackInner>>,
 }
 
 impl RingBufferStopCallback {
     /// Create new callback from closure.
     pub fn new<C: 'static + FnMut() + Send>(cb: C) -> RingBufferStopCallback {
         RingBufferStopCallback {
-            _inner: Arc::new(Mutex::new(RingBufferStopCallbackInner {
+            inner: Arc::new(Mutex::new(RingBufferStopCallbackInner {
                 callback: Box::new(cb),
             })),
         }

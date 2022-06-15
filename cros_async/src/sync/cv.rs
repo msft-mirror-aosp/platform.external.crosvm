@@ -2,19 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
-    cell::UnsafeCell,
-    hint, mem,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::cell::UnsafeCell;
+use std::mem;
+use std::sync::atomic::{spin_loop_hint, AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use super::super::sync::{
-    mu::{MutexGuard, MutexReadGuard, RawMutex},
-    waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor},
-};
+use crate::sync::mu::{MutexGuard, MutexReadGuard, RawMutex};
+use crate::sync::waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor};
 
 const SPINLOCK: usize = 1 << 0;
 const HAS_WAITERS: usize = 1 << 1;
@@ -33,10 +27,7 @@ const HAS_WAITERS: usize = 1 << 1;
 /// use std::thread;
 /// use std::sync::mpsc::channel;
 ///
-/// use cros_async::{
-///     block_on,
-///     sync::{Condvar, Mutex},
-/// };
+/// use cros_async::sync::{block_on, Condvar, Mutex};
 ///
 /// const N: usize = 13;
 ///
@@ -101,10 +92,7 @@ impl Condvar {
     /// # use std::sync::Arc;
     /// # use std::thread;
     ///
-    /// # use cros_async::{
-    /// #     block_on,
-    /// #     sync::{Condvar, Mutex},
-    /// # };
+    /// # use cros_async::sync::{block_on, Condvar, Mutex};
     ///
     /// # let mu = Arc::new(Mutex::new(false));
     /// # let cv = Arc::new(Condvar::new());
@@ -183,7 +171,7 @@ impl Condvar {
                 )
                 .is_err()
         {
-            hint::spin_loop();
+            spin_loop_hint();
             oldstate = self.state.load(Ordering::Relaxed);
         }
 
@@ -235,7 +223,7 @@ impl Condvar {
                 )
                 .is_err()
         {
-            hint::spin_loop();
+            spin_loop_hint();
             oldstate = self.state.load(Ordering::Relaxed);
         }
 
@@ -293,7 +281,7 @@ impl Condvar {
                 )
                 .is_err()
         {
-            hint::spin_loop();
+            spin_loop_hint();
             oldstate = self.state.load(Ordering::Relaxed);
         }
 
@@ -331,7 +319,7 @@ impl Condvar {
                 )
                 .is_err()
         {
-            hint::spin_loop();
+            spin_loop_hint();
             oldstate = self.state.load(Ordering::Relaxed);
         }
 
@@ -453,31 +441,23 @@ fn cancel_waiter(cv: usize, waiter: &Waiter, wake_next: bool) {
 mod test {
     use super::*;
 
-    use std::{
-        future::Future,
-        mem, ptr,
-        rc::Rc,
-        sync::{
-            mpsc::{channel, Sender},
-            Arc,
-        },
-        task::{Context, Poll},
-        thread::{
-            JoinHandle, {self},
-        },
-        time::Duration,
-    };
+    use std::future::Future;
+    use std::mem;
+    use std::ptr;
+    use std::rc::Rc;
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
-    use futures::{
-        channel::oneshot,
-        select,
-        task::{waker_ref, ArcWake},
-        FutureExt,
-    };
+    use futures::channel::oneshot;
+    use futures::task::{waker_ref, ArcWake};
+    use futures::{select, FutureExt};
     use futures_executor::{LocalPool, LocalSpawner, ThreadPool};
     use futures_util::task::LocalSpawnExt;
 
-    use super::super::super::{block_on, sync::Mutex};
+    use crate::sync::{block_on, Mutex};
 
     // Dummy waker used when we want to manually drive futures.
     struct TestWaker;

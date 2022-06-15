@@ -38,12 +38,6 @@ impl RunnableQueue {
     }
 }
 
-impl Default for RunnableQueue {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<'q> IntoIterator for &'q RunnableQueue {
     type Item = Runnable;
     type IntoIter = RunnableQueueIter<'q>;

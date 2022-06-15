@@ -14,17 +14,15 @@ use vm_control::{
 };
 use vm_memory::GuestAddress;
 
+#[cfg(target_arch = "x86_64")]
+use gdbstub::arch::x86::X86_64_SSE as GdbArch;
 use gdbstub::arch::Arch;
 use gdbstub::target::ext::base::singlethread::{ResumeAction, SingleThreadOps, StopReason};
-use gdbstub::target::ext::base::{BaseOps, GdbInterrupt};
-use gdbstub::target::ext::breakpoints::{
-    Breakpoints, BreakpointsOps, HwBreakpoint, HwBreakpointOps,
-};
+use gdbstub::target::ext::base::BaseOps;
+use gdbstub::target::ext::breakpoints::{HwBreakpoint, HwBreakpointOps};
 use gdbstub::target::TargetError::NonFatal;
 use gdbstub::target::{Target, TargetResult};
 use gdbstub::Connection;
-#[cfg(target_arch = "x86_64")]
-use gdbstub_arch::x86::X86_64_SSE as GdbArch;
 use remain::sorted;
 use thiserror::Error as ThisError;
 
@@ -143,7 +141,7 @@ impl Target for GdbStub {
     }
 
     // TODO(keiichiw): sw_breakpoint, hw_watchpoint, extended_mode, monitor_cmd, section_offsets
-    fn breakpoints(&mut self) -> Option<BreakpointsOps<Self>> {
+    fn hw_breakpoint(&mut self) -> Option<HwBreakpointOps<Self>> {
         Some(self)
     }
 }
@@ -152,7 +150,7 @@ impl SingleThreadOps for GdbStub {
     fn resume(
         &mut self,
         action: ResumeAction,
-        check_gdb_interrupt: GdbInterrupt,
+        check_gdb_interrupt: &mut dyn FnMut() -> bool,
     ) -> Result<StopReason<ArchUsize>, Self::Error> {
         let single_step = ResumeAction::Step == action;
 
@@ -175,15 +173,13 @@ impl SingleThreadOps for GdbStub {
             "Failed to resume the target"
         })?;
 
-        let mut check_gdb_interrupt = check_gdb_interrupt.no_async();
         // Polling
         loop {
-            // TODO(keiichiw): handle error?
-            if let Ok(msg) = self
+            match self
                 .from_vcpu
                 .recv_timeout(std::time::Duration::from_millis(100))
             {
-                match msg.msg {
+                Ok(msg) => match msg.msg {
                     VcpuDebugStatus::HitBreakPoint => {
                         if single_step {
                             return Ok(StopReason::DoneStep);
@@ -194,10 +190,11 @@ impl SingleThreadOps for GdbStub {
                     status => {
                         error!("Unexpected VcpuDebugStatus: {:?}", status);
                     }
-                }
-            }
+                },
+                Err(_) => {} // TODO(keiichiw): handle error?
+            };
 
-            if check_gdb_interrupt.pending() {
+            if check_gdb_interrupt() {
                 self.vm_request(VmRequest::Suspend).map_err(|e| {
                     error!("Failed to suspend the target: {}", e);
                     "Failed to suspend the target"
@@ -294,20 +291,10 @@ impl SingleThreadOps for GdbStub {
     }
 }
 
-impl Breakpoints for GdbStub {
-    fn hw_breakpoint(&mut self) -> Option<HwBreakpointOps<Self>> {
-        Some(self)
-    }
-}
-
 impl HwBreakpoint for GdbStub {
     /// Add a new hardware breakpoint.
     /// Return `Ok(false)` if the operation could not be completed.
-    fn add_hw_breakpoint(
-        &mut self,
-        addr: <Self::Arch as Arch>::Usize,
-        _kind: <Self::Arch as Arch>::BreakpointKind,
-    ) -> TargetResult<bool, Self> {
+    fn add_hw_breakpoint(&mut self, addr: <Self::Arch as Arch>::Usize) -> TargetResult<bool, Self> {
         // If we already have 4 breakpoints, we cannot set a new one.
         if self.hw_breakpoints.len() >= 4 {
             error!("Not allowed to set more than 4 HW breakpoints");
@@ -335,7 +322,6 @@ impl HwBreakpoint for GdbStub {
     fn remove_hw_breakpoint(
         &mut self,
         addr: <Self::Arch as Arch>::Usize,
-        _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
         self.hw_breakpoints.retain(|&b| b.0 != addr);
 

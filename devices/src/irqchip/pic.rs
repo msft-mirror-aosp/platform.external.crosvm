@@ -191,14 +191,17 @@ impl Pic {
     /// Determines the external interrupt number that the PIC is prepared to inject, if any.
     pub fn get_external_interrupt(&mut self) -> Option<u8> {
         self.interrupt_request = false;
-        // If there is no interrupt request, return `None` to avoid the interrupt entirely.
-        // The architecturally correct behavior in this case is to inject a spurious interrupt.
-        // Although this case only occurs as a result of a race condition where the interrupt
-        // might also be avoided entirely.  The KVM unit test OS, which several unit tests rely
-        // upon, doesn't properly handle spurious interrupts.  Also spurious interrupts are much
-        // more common in this code than real hardware because the hardware race is much much much
-        // smaller.
-        let irq_primary = self.get_irq(PicSelect::Primary)?;
+        let irq_primary = if let Some(irq) = self.get_irq(PicSelect::Primary) {
+            irq
+        } else {
+            // The architecturally correct behavior in this case is to inject a spurious interrupt.
+            // Although this case only occurs as a result of a race condition where the interrupt
+            // might also be avoided entirely.  Here we return `None` to avoid the interrupt
+            // entirely.  The KVM unit test OS, which several unit tests rely upon, doesn't
+            // properly handle spurious interrupts.  Also spurious interrupts are much more common
+            // in this code than real hardware because the hardware race is much much much smaller.
+            return None;
+        };
 
         self.interrupt_ack(PicSelect::Primary, irq_primary);
         let int_num = if irq_primary == PRIMARY_PIC_CASCADE_PIN {
@@ -541,17 +544,15 @@ mod tests {
         // The PIC is added to the io_bus in three locations, so the offset depends on which
         // address range the address is in. The PIC implementation currently does not use the
         // offset, but we're setting it accurately here in case it does in the future.
-        let base_address = if (PIC_PRIMARY..PIC_PRIMARY + 0x2).contains(&address) {
-            PIC_PRIMARY
-        } else if (PIC_SECONDARY..PIC_SECONDARY + 0x2).contains(&address) {
-            PIC_SECONDARY
-        } else if (PIC_PRIMARY_ELCR..PIC_PRIMARY_ELCR + 0x2).contains(&address) {
-            PIC_PRIMARY_ELCR
-        } else {
-            panic!("invalid PIC address: {:#x}", address);
+        let offset = match address {
+            x if x >= PIC_PRIMARY && x < PIC_PRIMARY + 0x2 => address - PIC_PRIMARY,
+            x if x >= PIC_SECONDARY && x < PIC_SECONDARY + 0x2 => address - PIC_SECONDARY,
+            x if x >= PIC_PRIMARY_ELCR && x < PIC_PRIMARY_ELCR + 0x2 => address - PIC_PRIMARY_ELCR,
+            _ => panic!("invalid PIC address: {:#x}", address),
         };
+
         BusAccessInfo {
-            offset: address - base_address,
+            offset,
             address,
             id: 0,
         }

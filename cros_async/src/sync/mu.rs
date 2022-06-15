@@ -2,20 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
-    cell::UnsafeCell,
-    hint, mem,
-    ops::{Deref, DerefMut},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    thread::yield_now,
-};
+use std::cell::UnsafeCell;
+use std::mem;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{spin_loop_hint, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread::yield_now;
 
-use super::super::sync::waiter::{
-    Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor,
-};
+use crate::sync::waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor};
 
 // Set when the mutex is exclusively locked.
 const LOCKED: usize = 1 << 0;
@@ -188,7 +182,7 @@ fn get_wake_list(waiters: &mut WaiterList) -> (WaiterList, usize) {
 #[inline]
 fn cpu_relax(iterations: usize) {
     for _ in 0..iterations {
-        hint::spin_loop();
+        spin_loop_hint();
     }
 }
 
@@ -524,7 +518,7 @@ impl RawMutex {
                 )
                 .is_err()
         {
-            hint::spin_loop();
+            spin_loop_hint();
             oldstate = self.state.load(Ordering::Relaxed);
         }
 
@@ -599,7 +593,7 @@ impl RawMutex {
             )
             .is_err()
         {
-            hint::spin_loop();
+            spin_loop_hint();
             oldstate = self.state.load(Ordering::Relaxed);
         }
 
@@ -656,7 +650,7 @@ fn cancel_waiter(raw: usize, waiter: &Waiter, wake_next: bool) {
 /// use std::thread;
 /// use std::sync::mpsc::channel;
 ///
-/// use cros_async::{block_on, sync::Mutex};
+/// use cros_async::sync::{block_on, Mutex};
 ///
 /// const N: usize = 10;
 ///
@@ -887,34 +881,24 @@ impl<'a, T: ?Sized> Drop for MutexReadGuard<'a, T> {
 mod test {
     use super::*;
 
-    use std::{
-        future::Future,
-        mem,
-        pin::Pin,
-        rc::Rc,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc::{channel, Sender},
-            Arc,
-        },
-        task::{Context, Poll, Waker},
-        thread,
-        time::Duration,
-    };
+    use std::future::Future;
+    use std::mem;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+    use std::thread;
+    use std::time::Duration;
 
-    use futures::{
-        channel::oneshot,
-        pending, select,
-        task::{waker_ref, ArcWake},
-        FutureExt,
-    };
+    use futures::channel::oneshot;
+    use futures::task::{waker_ref, ArcWake};
+    use futures::{pending, select, FutureExt};
     use futures_executor::{LocalPool, ThreadPool};
     use futures_util::task::LocalSpawnExt;
 
-    use super::super::super::{
-        block_on,
-        sync::{Condvar, SpinLock},
-    };
+    use crate::sync::{block_on, Condvar, SpinLock};
 
     #[derive(Debug, Eq, PartialEq)]
     struct NonCopy(u32);

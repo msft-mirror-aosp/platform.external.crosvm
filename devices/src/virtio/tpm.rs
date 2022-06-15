@@ -2,15 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::env;
+use std::fmt::{self, Display};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::ops::BitOrAssign;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::thread;
 
 use base::{error, Event, PollToken, RawDescriptor, WaitContext};
-use remain::sorted;
-use sync::Mutex;
-use thiserror::Error;
 use vm_memory::GuestMemory;
 
 use super::{
@@ -35,17 +35,17 @@ struct Worker {
     mem: GuestMemory,
     queue_evt: Event,
     kill_evt: Event,
-    backend: Arc<Mutex<dyn TpmBackend>>,
+    device: Device,
 }
 
-pub trait TpmBackend: Send {
-    fn execute_command<'a>(&'a mut self, command: &[u8]) -> &'a [u8];
+struct Device {
+    simulator: tpm2::Simulator,
 }
 
-impl Worker {
-    fn perform_work(&mut self, desc: DescriptorChain) -> Result<u32> {
-        let mut reader = Reader::new(self.mem.clone(), desc.clone()).map_err(Error::Descriptor)?;
-        let mut writer = Writer::new(self.mem.clone(), desc).map_err(Error::Descriptor)?;
+impl Device {
+    fn perform_work(&mut self, mem: &GuestMemory, desc: DescriptorChain) -> Result<u32> {
+        let mut reader = Reader::new(mem.clone(), desc.clone()).map_err(Error::Descriptor)?;
+        let mut writer = Writer::new(mem.clone(), desc).map_err(Error::Descriptor)?;
 
         let available_bytes = reader.available_bytes();
         if available_bytes > TPM_BUFSIZE {
@@ -57,9 +57,7 @@ impl Worker {
         let mut command = vec![0u8; available_bytes];
         reader.read_exact(&mut command).map_err(Error::Read)?;
 
-        let mut backend = self.backend.lock();
-
-        let response = backend.execute_command(&command);
+        let response = self.simulator.execute_command(&command);
 
         if response.len() > TPM_BUFSIZE {
             return Err(Error::ResponseTooLong {
@@ -75,29 +73,31 @@ impl Worker {
             });
         }
 
-        writer.write_all(response).map_err(Error::Write)?;
+        writer.write_all(&response).map_err(Error::Write)?;
 
         Ok(writer.bytes_written() as u32)
     }
+}
 
+impl Worker {
     fn process_queue(&mut self) -> NeedsInterrupt {
-        let mut needs_interrupt = NeedsInterrupt::No;
-        while let Some(avail_desc) = self.queue.pop(&self.mem) {
-            let index = avail_desc.index;
+        let avail_desc = match self.queue.pop(&self.mem) {
+            Some(avail_desc) => avail_desc,
+            None => return NeedsInterrupt::No,
+        };
 
-            let len = match self.perform_work(avail_desc) {
-                Ok(len) => len,
-                Err(err) => {
-                    error!("{}", err);
-                    0
-                }
-            };
+        let index = avail_desc.index;
 
-            self.queue.add_used(&self.mem, index, len);
-            needs_interrupt = NeedsInterrupt::Yes;
-        }
+        let len = match self.device.perform_work(&self.mem, avail_desc) {
+            Ok(len) => len,
+            Err(err) => {
+                error!("{}", err);
+                0
+            }
+        };
 
-        needs_interrupt
+        self.queue.add_used(&self.mem, index, len);
+        NeedsInterrupt::Yes
     }
 
     fn run(mut self) {
@@ -154,7 +154,7 @@ impl Worker {
                 }
             }
             if needs_interrupt == NeedsInterrupt::Yes {
-                self.queue.trigger_interrupt(&self.mem, &self.interrupt);
+                self.interrupt.signal_used_queue(self.queue.vector);
             }
         }
     }
@@ -162,15 +162,15 @@ impl Worker {
 
 /// Virtio vTPM device.
 pub struct Tpm {
-    backend: Arc<Mutex<dyn TpmBackend>>,
+    storage: PathBuf,
     kill_evt: Option<Event>,
     worker_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Tpm {
-    pub fn new(backend: Arc<Mutex<dyn TpmBackend>>) -> Tpm {
+    pub fn new(storage: PathBuf) -> Tpm {
         Tpm {
-            backend,
+            storage,
             kill_evt: None,
             worker_thread: None,
         }
@@ -215,7 +215,15 @@ impl VirtioDevice for Tpm {
         let queue = queues.remove(0);
         let queue_evt = queue_evts.remove(0);
 
-        let backend = self.backend.clone();
+        if let Err(err) = fs::create_dir_all(&self.storage) {
+            error!("vtpm failed to create directory for simulator: {}", err);
+            return;
+        }
+        if let Err(err) = env::set_current_dir(&self.storage) {
+            error!("vtpm failed to change into simulator directory: {}", err);
+            return;
+        }
+        let simulator = tpm2::Simulator::singleton_in_current_directory();
 
         let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
@@ -232,7 +240,7 @@ impl VirtioDevice for Tpm {
             mem,
             queue_evt,
             kill_evt,
-            backend,
+            device: Device { simulator },
         };
 
         let worker_result = thread::Builder::new()
@@ -266,22 +274,38 @@ impl BitOrAssign for NeedsInterrupt {
 
 type Result<T> = std::result::Result<T, Error>;
 
-#[sorted]
-#[derive(Error, Debug)]
 enum Error {
-    #[error("vtpm response buffer is too small: {size} < {required} bytes")]
-    BufferTooSmall { size: usize, required: usize },
-    #[error("vtpm command is too long: {size} > {} bytes", TPM_BUFSIZE)]
     CommandTooLong { size: usize },
-    #[error("virtio descriptor error: {0}")]
     Descriptor(DescriptorError),
-    #[error("vtpm failed to read from guest memory: {0}")]
     Read(io::Error),
-    #[error(
-        "vtpm simulator generated a response that is unexpectedly long: {size} > {} bytes",
-        TPM_BUFSIZE
-    )]
     ResponseTooLong { size: usize },
-    #[error("vtpm failed to write to guest memory: {0}")]
+    BufferTooSmall { size: usize, required: usize },
     Write(io::Error),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            CommandTooLong { size } => write!(
+                f,
+                "vtpm command is too long: {} > {} bytes",
+                size, TPM_BUFSIZE
+            ),
+            Descriptor(e) => write!(f, "virtio descriptor error: {}", e),
+            Read(e) => write!(f, "vtpm failed to read from guest memory: {}", e),
+            ResponseTooLong { size } => write!(
+                f,
+                "vtpm simulator generated a response that is unexpectedly long: {} > {} bytes",
+                size, TPM_BUFSIZE
+            ),
+            BufferTooSmall { size, required } => write!(
+                f,
+                "vtpm response buffer is too small: {} < {} bytes",
+                size, required
+            ),
+            Write(e) => write!(f, "vtpm failed to write to guest memory: {}", e),
+        }
+    }
 }

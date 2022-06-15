@@ -2,18 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor};
-use crate::{FakeClock, RawDescriptor, Result};
-
-use crate::platform::{FakeTimerFd, TimerFd};
-use std::{
-    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
-    sync::Arc,
-    time::Duration,
+use crate::{
+    AsRawDescriptor, FakeClock, FromRawDescriptor, IntoRawDescriptor, RawDescriptor, Result,
 };
-use sync::Mutex;
 
-/// See [TimerFd](crate::platform::TimerFd) for struct- and method-level
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::sync::Arc;
+use std::time::Duration;
+use sync::Mutex;
+use sys_util::{FakeTimerFd, TimerFd};
+
+/// See [TimerFd](sys_util::TimerFd) for struct- and method-level
 /// documentation.
 pub struct Timer(pub TimerFd);
 impl Timer {
@@ -22,7 +21,7 @@ impl Timer {
     }
 }
 
-/// See [FakeTimerFd](crate::platform::FakeTimerFd) for struct- and method-level
+/// See [FakeTimerFd](sys_util::FakeTimerFd) for struct- and method-level
 /// documentation.
 pub struct FakeTimer(FakeTimerFd);
 impl FakeTimer {
@@ -40,6 +39,10 @@ macro_rules! build_timer {
 
             pub fn wait(&mut self) -> Result<()> {
                 self.0.wait().map(|_| ())
+            }
+
+            pub fn is_armed(&self) -> Result<bool> {
+                self.0.is_armed()
             }
 
             pub fn clear(&mut self) -> Result<()> {

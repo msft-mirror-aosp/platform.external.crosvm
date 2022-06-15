@@ -2,25 +2,32 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{BusAccessInfo, BusDevice, IrqLevelEvent};
+use crate::{BusAccessInfo, BusDevice};
 use acpi_tables::{aml, aml::Aml};
 use base::{
     error, warn, AsRawDescriptor, Descriptor, Event, PollToken, RawDescriptor, Tube, WaitContext,
 };
 use power_monitor::{BatteryStatus, CreatePowerMonitorFn};
-use remain::sorted;
+use std::fmt::{self, Display};
 use std::sync::Arc;
 use std::thread;
 use sync::Mutex;
-use thiserror::Error;
 use vm_control::{BatControlCommand, BatControlResult};
 
 /// Errors for battery devices.
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum BatteryError {
-    #[error("Non 32-bit mmio address space")]
     Non32BitMmioAddress,
+}
+
+impl Display for BatteryError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::BatteryError::*;
+
+        match self {
+            Non32BitMmioAddress => write!(f, "Non 32-bit mmio address space"),
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, BatteryError>;
@@ -93,7 +100,8 @@ pub struct GoldfishBattery {
     state: Arc<Mutex<GoldfishBatteryState>>,
     mmio_base: u32,
     irq_num: u32,
-    irq_evt: IrqLevelEvent,
+    irq_evt: Event,
+    irq_resample_evt: Event,
     activated: bool,
     monitor_thread: Option<thread::JoinHandle<()>>,
     kill_evt: Option<Event>,
@@ -135,7 +143,8 @@ const BATTERY_HEALTH_VAL_UNKNOWN: u32 = 0;
 
 fn command_monitor(
     tube: Tube,
-    irq_evt: IrqLevelEvent,
+    irq_evt: Event,
+    irq_resample_evt: Event,
     kill_evt: Event,
     state: Arc<Mutex<GoldfishBatteryState>>,
     create_power_monitor: Option<Box<dyn CreatePowerMonitorFn>>,
@@ -143,7 +152,7 @@ fn command_monitor(
     let wait_ctx: WaitContext<Token> = match WaitContext::build_with(&[
         (&Descriptor(tube.as_raw_descriptor()), Token::Commands),
         (
-            &Descriptor(irq_evt.get_resample().as_raw_descriptor()),
+            &Descriptor(irq_resample_evt.as_raw_descriptor()),
             Token::Resample,
         ),
         (&Descriptor(kill_evt.as_raw_descriptor()), Token::Kill),
@@ -219,7 +228,7 @@ fn command_monitor(
                     };
 
                     if inject_irq {
-                        let _ = irq_evt.trigger();
+                        let _ = irq_evt.write(1);
                     }
 
                     if let Err(e) = tube.send(&BatControlResult::Ok) {
@@ -267,14 +276,14 @@ fn command_monitor(
                     }
 
                     if inject_irq {
-                        let _ = irq_evt.trigger();
+                        let _ = irq_evt.write(1);
                     }
                 }
 
                 Token::Resample => {
-                    irq_evt.clear_resample();
+                    let _ = irq_resample_evt.read();
                     if state.lock().int_status() != 0 {
-                        let _ = irq_evt.trigger();
+                        let _ = irq_evt.write(1);
                     }
                 }
 
@@ -292,11 +301,13 @@ impl GoldfishBattery {
     ///               which will be put into the ACPI DSDT.
     /// * `irq_evt` - The interrupt event used to notify driver about
     ///               the battery properties changing.
+    /// * `irq_resample_evt` - Resample interrupt event notified at EOI.
     /// * `socket` - Battery control socket
     pub fn new(
         mmio_base: u64,
         irq_num: u32,
-        irq_evt: IrqLevelEvent,
+        irq_evt: Event,
+        irq_resample_evt: Event,
         tube: Tube,
         create_power_monitor: Option<Box<dyn CreatePowerMonitorFn>>,
     ) -> Result<Self> {
@@ -322,6 +333,7 @@ impl GoldfishBattery {
             mmio_base: mmio_base as u32,
             irq_num,
             irq_evt,
+            irq_resample_evt,
             activated: false,
             monitor_thread: None,
             kill_evt: None,
@@ -333,8 +345,8 @@ impl GoldfishBattery {
     /// return the fds used by this device
     pub fn keep_rds(&self) -> Vec<RawDescriptor> {
         let mut rds = vec![
-            self.irq_evt.get_trigger().as_raw_descriptor(),
-            self.irq_evt.get_resample().as_raw_descriptor(),
+            self.irq_evt.as_raw_descriptor(),
+            self.irq_resample_evt.as_raw_descriptor(),
         ];
 
         if let Some(tube) = &self.tube {
@@ -364,13 +376,21 @@ impl GoldfishBattery {
 
         if let Some(tube) = self.tube.take() {
             let irq_evt = self.irq_evt.try_clone().unwrap();
+            let irq_resample_evt = self.irq_resample_evt.try_clone().unwrap();
             let bat_state = self.state.clone();
 
             let create_monitor_fn = self.create_power_monitor.take();
             let monitor_result = thread::Builder::new()
                 .name(self.debug_label())
                 .spawn(move || {
-                    command_monitor(tube, irq_evt, kill_evt, bat_state, create_monitor_fn);
+                    command_monitor(
+                        tube,
+                        irq_evt,
+                        irq_resample_evt,
+                        kill_evt,
+                        bat_state,
+                        create_monitor_fn,
+                    );
                 });
 
             self.monitor_thread = match monitor_result {

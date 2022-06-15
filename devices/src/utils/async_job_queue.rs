@@ -4,9 +4,7 @@
 
 use super::{Error, Result};
 use super::{EventHandler, EventLoop};
-
-use anyhow::Context;
-use base::{Event, WatchingEvents};
+use base::{error, Event, WatchingEvents};
 use std::mem;
 use std::sync::Arc;
 use sync::Mutex;
@@ -42,11 +40,17 @@ impl AsyncJobQueue {
 }
 
 impl EventHandler for AsyncJobQueue {
-    fn on_event(&self) -> anyhow::Result<()> {
+    fn on_event(&self) -> std::result::Result<(), ()> {
         // We want to read out the event, but the value is not important.
-        let _ = self.evt.read().context("read event failed")?;
+        match self.evt.read() {
+            Ok(_) => {}
+            Err(e) => {
+                error!("read event failed {}", e);
+                return Err(());
+            }
+        }
 
-        let jobs = mem::take(&mut *self.jobs.lock());
+        let jobs = mem::replace(&mut *self.jobs.lock(), Vec::new());
         for mut cb in jobs {
             cb();
         }

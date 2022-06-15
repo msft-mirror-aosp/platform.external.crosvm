@@ -9,14 +9,13 @@ use proto::system_api::power_supply_properties::{
     PowerSupplyProperties, PowerSupplyProperties_BatteryState, PowerSupplyProperties_ExternalPower,
 };
 
-use dbus::ffidisp::{BusType, Connection, ConnectionItem, WatchEvent};
+use dbus::{BusType, Connection, ConnectionItem, WatchEvent};
 
 use protobuf::error::ProtobufError;
 use protobuf::Message;
-use remain::sorted;
-use thiserror::Error;
 
 use std::error::Error;
+use std::fmt;
 use std::os::unix::io::RawFd;
 
 // Interface name from power_manager/dbus_bindings/org.chromium.PowerManager.xml.
@@ -68,21 +67,30 @@ impl From<PowerSupplyProperties> for PowerData {
     }
 }
 
-#[sorted]
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum DBusMonitorError {
-    #[error("failed to convert protobuf message: {0}")]
-    ConvertProtobuf(ProtobufError),
-    #[error("failed to add D-Bus match rule: {0}")]
-    DBusAddMatch(dbus::Error),
-    #[error("failed to connect to D-Bus: {0}")]
     DBusConnect(dbus::Error),
-    #[error("failed to read D-Bus message: {0}")]
-    DBusRead(dbus::arg::TypeMismatchError),
-    #[error("multiple D-Bus fds")]
-    MultipleDBusFd,
-    #[error("no D-Bus fd")]
+    DBusAddMatch(dbus::Error),
     NoDBusFd,
+    MultipleDBusFd,
+    DBusRead(dbus::arg::TypeMismatchError),
+    ConvertProtobuf(ProtobufError),
+}
+
+impl Error for DBusMonitorError {}
+
+impl fmt::Display for DBusMonitorError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::DBusMonitorError::*;
+        match self {
+            DBusConnect(e) => write!(f, "failed to connect to D-Bus: {}", e),
+            DBusAddMatch(e) => write!(f, "failed to add D-Bus match rule: {}", e),
+            NoDBusFd => write!(f, "no D-Bus fd"),
+            MultipleDBusFd => write!(f, "multiple D-Bus fds"),
+            DBusRead(e) => write!(f, "failed to read D-Bus message: {}", e),
+            ConvertProtobuf(e) => write!(f, "failed to convert protobuf message: {}", e),
+        }
+    }
 }
 
 pub struct DBusMonitor {
@@ -144,7 +152,14 @@ impl PowerMonitor for DBusMonitor {
                         }
                     };
 
-                    if &*interface != POWER_INTERFACE_NAME {
+                    let interface_name = match interface.as_cstr().to_str() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return last;
+                        }
+                    };
+
+                    if interface_name != POWER_INTERFACE_NAME {
                         return last;
                     }
 
@@ -155,7 +170,14 @@ impl PowerMonitor for DBusMonitor {
                         }
                     };
 
-                    if &*member != POLL_SIGNAL_NAME {
+                    let member_name = match member.as_cstr().to_str() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return last;
+                        }
+                    };
+
+                    if member_name != POLL_SIGNAL_NAME {
                         return last;
                     }
 

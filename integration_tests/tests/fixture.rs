@@ -2,12 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use libc::O_DIRECT;
 use std::ffi::CString;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::sync_channel;
@@ -15,6 +11,7 @@ use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 use std::{env, process::Child};
+use std::{fs::File, process::Stdio};
 
 use anyhow::{anyhow, Result};
 use base::syslog;
@@ -176,9 +173,7 @@ impl TestVm {
 
     /// Downloads prebuilts if needed.
     fn initialize_once() {
-        if let Err(e) = syslog::init() {
-            panic!("failed to initiailize syslog: {}", e);
-        }
+        syslog::init().unwrap();
 
         // It's possible the prebuilts downloaded by crosvm-9999.ebuild differ
         // from the version that crosvm was compiled for.
@@ -210,19 +205,6 @@ impl TestVm {
             }
         }
         assert!(rootfs_path.exists(), "{:?} does not exist", rootfs_path);
-
-        // Check if the test file system is a known compatible one. Needs to support features like O_DIRECT.
-        if let Err(e) = OpenOptions::new()
-            .custom_flags(O_DIRECT)
-            .write(false)
-            .read(true)
-            .open(rootfs_path)
-        {
-            panic!(
-                "File open with O_DIRECT expected to work but did not: {}",
-                e
-            );
-        }
     }
 
     // Adds 2 serial devices:
@@ -246,23 +228,18 @@ impl TestVm {
     }
 
     /// Configures the VM kernel and rootfs to load from the guest_under_test assets.
-    fn configure_kernel(command: &mut Command, o_direct: bool) {
-        let rootfs_and_option = format!(
-            "{}{}",
-            rootfs_path().to_str().unwrap(),
-            if o_direct { ",o_direct=true" } else { "" }
-        );
+    fn configure_kernel(command: &mut Command) {
         command
-            .args(&["--root", &rootfs_and_option])
+            .args(&["--root", rootfs_path().to_str().unwrap()])
             .args(&["--params", "init=/bin/delegate"])
             .arg(kernel_path());
     }
 
     /// Instanciate a new crosvm instance. The first call will trigger the download of prebuilt
     /// files if necessary.
-    pub fn new(additional_arguments: &[&str], debug: bool, o_direct: bool) -> Result<TestVm> {
+    pub fn new(additional_arguments: &[&str], debug: bool) -> Result<TestVm> {
         static PREP_ONCE: Once = Once::new();
-        PREP_ONCE.call_once(TestVm::initialize_once);
+        PREP_ONCE.call_once(|| TestVm::initialize_once());
 
         // Create two named pipes to communicate with the guest.
         let test_dir = TempDir::new()?;
@@ -276,13 +253,16 @@ impl TestVm {
         let mut command = Command::new(find_crosvm_binary());
         command.args(&["run", "--disable-sandbox"]);
         TestVm::configure_serial_devices(&mut command, &from_guest_pipe, &to_guest_pipe);
-        command.args(&["--socket", control_socket_path.to_str().unwrap()]);
+        command.args(&["--socket", &control_socket_path.to_str().unwrap()]);
         command.args(additional_arguments);
 
-        TestVm::configure_kernel(&mut command, o_direct);
+        TestVm::configure_kernel(&mut command);
 
         println!("$ {:?}", command);
-
+        if !debug {
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
+        }
         let process = command.spawn()?;
 
         // Open pipes. Panic if we cannot connect after a timeout.

@@ -5,11 +5,9 @@
 // Need non-snake case so the macro can re-use type names for variables.
 #![allow(non_snake_case)]
 
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use futures::future::{maybe_done, FutureExt, MaybeDone};
 
@@ -26,7 +24,7 @@ macro_rules! generate {
         $(#[$doc:meta])*
         ($Select:ident, <$($Fut:ident),*>),
     )*) => ($(
-
+        #[must_use = "Combinations of futures don't do anything unless run in an executor."]
         paste::item! {
             pub(crate) struct $Select<$($Fut: Future + Unpin),*> {
                 $($Fut: MaybeDone<$Fut>,)*
@@ -86,7 +84,4 @@ generate! {
 
     /// _Future for the [`select6`] function.
     (Select6, <_Fut1, _Fut2, _Fut3, _Fut4, _Fut5, _Fut6>),
-
-    /// _Future for the [`select7`] function.
-    (Select7, <_Fut1, _Fut2, _Fut3, _Fut4, _Fut5, _Fut6, _Fut7>),
 }

@@ -2,8 +2,8 @@
 name = "acpi_tables"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
-edition = "2021"
+edition = "2018"
 
 [dependencies]
-data_model = { path = "../common/data_model" }
-tempfile = "3"
+data_model = { path = "../data_model" }
+tempfile = { path = "../tempfile" }

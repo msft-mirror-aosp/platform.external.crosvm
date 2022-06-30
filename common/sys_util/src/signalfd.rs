@@ -2,18 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::fs::File;
-use std::mem;
-use std::os::raw::c_int;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::result;
+use std::{
+    fs::File,
+    mem,
+    os::{
+        raw::c_int,
+        unix::io::{AsRawFd, FromRawFd, RawFd},
+    },
+    result,
+};
 
-use libc::{c_void, read, signalfd, signalfd_siginfo};
-use libc::{EAGAIN, SFD_CLOEXEC, SFD_NONBLOCK};
+use libc::{c_void, read, signalfd, signalfd_siginfo, EAGAIN, SFD_CLOEXEC, SFD_NONBLOCK};
 use remain::sorted;
 use thiserror::Error;
 
-use crate::{errno, signal, AsRawDescriptor, RawDescriptor};
+use super::{signal, AsRawDescriptor, Error as ErrnoError, RawDescriptor};
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -23,17 +26,17 @@ pub enum Error {
     CreateBlockSignal(signal::Error),
     /// Failed to create a new signalfd.
     #[error("failed to create a new signalfd: {0}")]
-    CreateSignalFd(errno::Error),
+    CreateSignalFd(ErrnoError),
     /// Failed to construct sigset when creating signalfd.
     #[error("failed to construct sigset when creating signalfd: {0}")]
-    CreateSigset(errno::Error),
+    CreateSigset(ErrnoError),
     /// Signalfd could be read, but didn't return a full siginfo struct.
     /// This wraps the number of bytes that were actually read.
     #[error("signalfd failed to return a full siginfo struct, read only {0} bytes")]
     SignalFdPartialRead(usize),
     /// Unable to read from signalfd.
     #[error("unable to read from signalfd: {0}")]
-    SignalFdRead(errno::Error),
+    SignalFdRead(ErrnoError),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -59,7 +62,7 @@ impl SignalFd {
         // This is safe as we check the return value and know that fd is valid.
         let fd = unsafe { signalfd(-1, &sigset, SFD_CLOEXEC | SFD_NONBLOCK) };
         if fd < 0 {
-            return Err(Error::CreateSignalFd(errno::Error::last()));
+            return Err(Error::CreateSignalFd(ErrnoError::last()));
         }
 
         // Mask out the normal handler for the signal.
@@ -95,7 +98,7 @@ impl SignalFd {
         };
 
         if ret < 0 {
-            let err = errno::Error::last();
+            let err = ErrnoError::last();
             if err.errno() == EAGAIN {
                 Ok(None)
             } else {
@@ -136,10 +139,9 @@ impl Drop for SignalFd {
 mod tests {
     use super::*;
 
-    use crate::signal::SIGRTMIN;
+    use super::super::signal::SIGRTMIN;
     use libc::{pthread_sigmask, raise, sigismember, sigset_t};
-    use std::mem;
-    use std::ptr::null;
+    use std::{mem, ptr::null};
 
     #[test]
     fn new() {

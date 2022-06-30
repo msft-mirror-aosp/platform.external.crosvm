@@ -2,24 +2,28 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::ffi::{CStr, CString};
-use std::fs::{read_link, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::{
+    ffi::{CStr, CString},
+    fs::{read_link, File},
+    io::{
+        Read, Seek, SeekFrom, Write, {self},
+    },
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+};
 
 use libc::{
-    self, c_char, c_int, c_long, c_uint, close, fcntl, ftruncate64, off64_t, syscall,
-    SYS_memfd_create, EINVAL, F_ADD_SEALS, F_GET_SEALS, F_SEAL_FUTURE_WRITE, F_SEAL_GROW,
-    F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE, MFD_ALLOW_SEALING,
+    c_char, c_int, c_long, c_uint, close, fcntl, ftruncate64, off64_t, syscall, SYS_memfd_create,
+    EINVAL, F_ADD_SEALS, F_GET_SEALS, F_SEAL_FUTURE_WRITE, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK,
+    F_SEAL_WRITE, MFD_ALLOW_SEALING, {self},
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{errno, errno_result, Result};
+use super::{errno_result, Error, Result};
 
 /// A shared memory file descriptor and its size.
 #[derive(Serialize, Deserialize)]
 pub struct SharedMemory {
-    #[serde(with = "crate::with_as_descriptor")]
+    #[serde(with = "super::with_as_descriptor")]
     fd: File,
     size: u64,
 }
@@ -118,9 +122,7 @@ impl SharedMemory {
     /// Note that the given name may not have NUL characters anywhere in it, or this will return an
     /// error.
     pub fn named<T: Into<Vec<u8>>>(name: T) -> Result<SharedMemory> {
-        Self::new(Some(
-            &CString::new(name).map_err(|_| errno::Error::new(EINVAL))?,
-        ))
+        Self::new(Some(&CString::new(name).map_err(|_| Error::new(EINVAL))?))
     }
 
     /// Convenience function for `SharedMemory::new` that has an arbitrary and unspecified name.
@@ -221,7 +223,7 @@ impl SharedMemory {
                     .trim_end_matches(" (deleted)")
                     .to_owned()
             })
-            .ok_or_else(|| errno::Error::new(EINVAL))
+            .ok_or_else(|| Error::new(EINVAL))
     }
 }
 
@@ -300,7 +302,7 @@ pub fn kernel_has_memfd() -> bool {
     unsafe {
         let fd = memfd_create(b"/test_memfd_create\0".as_ptr() as *const c_char, 0);
         if fd < 0 {
-            if errno::Error::last().errno() == libc::ENOSYS {
+            if Error::last().errno() == libc::ENOSYS {
                 return false;
             }
             return true;
@@ -318,7 +320,7 @@ mod tests {
 
     use data_model::VolatileMemory;
 
-    use crate::MemoryMapping;
+    use super::super::MemoryMapping;
 
     #[test]
     fn named() {

@@ -79,13 +79,13 @@ rust_binary_host {
         "libremain",
     ],
     shared_libs: [
+        "libwayland_client",
         "libminijail",
         "libcap",
     ],
     static_libs: [
         "libusb",
         "libdisplay_wl",
-        "libwayland_client",
         "libffi",
         "libfdt",
     ],

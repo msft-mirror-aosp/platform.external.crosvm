@@ -28,7 +28,14 @@ cc_library_host_static {
     generated_headers: ["gpu_display_client_protocol_headers"],
     export_generated_headers: ["gpu_display_client_protocol_headers"],
 
-    static_libs: ["libwayland_client"],
+    shared_libs: ["libwayland_client"],
+
+    target: {
+        linux_glibc_x86: {
+            // libffi broken on x86, see b/162610242
+            enabled: false,
+        },
+    },
 }
 
 wayland_protocol_codegen {

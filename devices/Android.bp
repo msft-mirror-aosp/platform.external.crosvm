@@ -94,7 +94,10 @@ rust_test {
             ],
         },
         android: {
-            shared_libs: ["libdrm"],
+            shared_libs: [
+                "libcutils",
+                "libdrm",
+            ],
             static_libs: [
                 "libepoxy",
                 "libgbm",

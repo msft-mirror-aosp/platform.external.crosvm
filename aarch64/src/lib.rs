@@ -16,6 +16,7 @@ use arch::{
 };
 use base::{Event, MemoryMappingBuilder, SendTube};
 use devices::serial_device::{SerialHardware, SerialParameters};
+use devices::vmwdt::{VMWDT_DEFAULT_CLOCK_HZ, VMWDT_DEFAULT_TIMEOUT_SEC};
 use devices::{
     Bus, BusDeviceObj, BusError, IrqChip, IrqChipAArch64, IrqEventSource, PciAddress,
     PciConfigMmio, PciDevice, Serial,
@@ -29,7 +30,7 @@ use remain::sorted;
 use resources::{AddressRange, SystemAllocator, SystemAllocatorConfig};
 use sync::Mutex;
 use thiserror::Error;
-use vm_control::BatteryType;
+use vm_control::{BatControl, BatteryType};
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
 
 mod fdt;
@@ -99,6 +100,11 @@ const AARCH64_RTC_SIZE: u64 = 0x1000;
 // The RTC device gets the second interrupt line
 const AARCH64_RTC_IRQ: u32 = 1;
 
+// Place the virtual watchdog device at page 3
+const AARCH64_VMWDT_ADDR: u64 = 0x3000;
+// The virtual watchdog device gets one 4k page
+const AARCH64_VMWDT_SIZE: u64 = 0x1000;
+
 // PCI MMIO configuration region base address.
 const AARCH64_PCI_CFG_BASE: u64 = 0x10000;
 // PCI MMIO configuration region size.
@@ -116,6 +122,8 @@ const AARCH64_PMU_IRQ: u32 = 7;
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("failed to allocate IRQ number")]
+    AllocateIrq,
     #[error("bios could not be loaded: {0}")]
     BiosLoadFailure(arch::LoadImageError),
     #[error("failed to build arm pvtime memory: {0}")]
@@ -126,6 +134,8 @@ pub enum Error {
     CloneIrqChip(base::Error),
     #[error("the given kernel command line was invalid: {0}")]
     Cmdline(kernel_cmdline::Error),
+    #[error("unable to create battery devices: {0}")]
+    CreateBatDevices(arch::DeviceRegistrationError),
     #[error("unable to make an Event: {0}")]
     CreateEvent(base::Error),
     #[error("FDT could not be created: {0}")]
@@ -237,7 +247,7 @@ impl arch::LinuxArch for AArch64 {
         system_allocator: &mut SystemAllocator,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
-        _battery: (&Option<BatteryType>, Option<Minijail>),
+        (bat_type, bat_jail): (&Option<BatteryType>, Option<Minijail>),
         mut vm: V,
         ramoops_region: Option<arch::pstore::RamoopsRegion>,
         devs: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
@@ -263,7 +273,7 @@ impl arch::LinuxArch for AArch64 {
             VmImage::Kernel(ref mut kernel_image) => {
                 let kernel_end: u64;
                 let kernel_size: usize;
-                let elf_result = kernel_loader::load_kernel(&mem, get_kernel_addr(), kernel_image);
+                let elf_result = kernel_loader::load_elf64(&mem, get_kernel_addr(), kernel_image);
                 if elf_result == Err(kernel_loader::Error::InvalidElfMagicNumber) {
                     kernel_size =
                         arch::load_image(&mem, kernel_image, get_kernel_addr(), u64::max_value())
@@ -404,7 +414,7 @@ impl arch::LinuxArch for AArch64 {
             .into_iter()
             .map(|(dev, jail_orig)| (*(dev.into_platform_device().unwrap()), jail_orig))
             .collect();
-        let mut platform_pid_debug_label_map = arch::generate_platform_bus(
+        let mut platform_pid_debug_label_map = arch::sys::unix::generate_platform_bus(
             platform_devices,
             irq_chip.as_irq_chip_mut(),
             &mmio_bus,
@@ -413,7 +423,12 @@ impl arch::LinuxArch for AArch64 {
         .map_err(Error::CreatePlatformBus)?;
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
 
-        Self::add_arch_devs(irq_chip.as_irq_chip_mut(), &mmio_bus)?;
+        Self::add_arch_devs(
+            irq_chip.as_irq_chip_mut(),
+            &mmio_bus,
+            vcpu_count,
+            _vm_evt_wrtube,
+        )?;
 
         let com_evt_1_3 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         let com_evt_2_4 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
@@ -474,6 +489,39 @@ impl arch::LinuxArch for AArch64 {
             })
             .collect();
 
+        let (bat_control, bat_mmio_base_and_irq) = match bat_type {
+            Some(BatteryType::Goldfish) => {
+                let bat_irq = system_allocator.allocate_irq().ok_or(Error::AllocateIrq)?;
+
+                // a dummy AML buffer. Aarch64 crosvm doesn't use ACPI.
+                let mut amls = Vec::new();
+                let (control_tube, mmio_base) = arch::sys::unix::add_goldfish_battery(
+                    &mut amls,
+                    bat_jail,
+                    &mmio_bus,
+                    irq_chip.as_irq_chip_mut(),
+                    bat_irq,
+                    system_allocator,
+                )
+                .map_err(Error::CreateBatDevices)?;
+                (
+                    Some(BatControl {
+                        type_: BatteryType::Goldfish,
+                        control_tube,
+                    }),
+                    Some((mmio_base, bat_irq)),
+                )
+            }
+            None => (None, None),
+        };
+
+        let vmwdt_cfg = fdt::VmWdtConfig {
+            base: AARCH64_VMWDT_ADDR,
+            size: AARCH64_VMWDT_SIZE,
+            clock_hz: VMWDT_DEFAULT_CLOCK_HZ,
+            timeout_sec: VMWDT_DEFAULT_TIMEOUT_SEC,
+        };
+
         fdt::create_fdt(
             AARCH64_FDT_MAX_SIZE as usize,
             &mem,
@@ -491,14 +539,18 @@ impl arch::LinuxArch for AArch64 {
             use_pmu,
             psci_version,
             components.swiotlb,
+            bat_mmio_base_and_irq,
+            vmwdt_cfg,
         )
         .map_err(Error::CreateFdt)?;
+
+        let vcpu_init = vec![VcpuInitAArch64::default(); vcpu_count];
 
         Ok(RunnableLinuxVm {
             vm,
             vcpu_count,
             vcpus: Some(vcpus),
-            vcpu_init: VcpuInitAArch64 {},
+            vcpu_init,
             vcpu_affinity: components.vcpu_affinity,
             no_smt: components.no_smt,
             irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
@@ -509,7 +561,7 @@ impl arch::LinuxArch for AArch64 {
             suspend_evt,
             rt_cpus: components.rt_cpus,
             delay_rt: components.delay_rt,
-            bat_control: None,
+            bat_control,
             pm: None,
             resume_notify_devices: Vec::new(),
             root_config: pci_root,
@@ -522,7 +574,7 @@ impl arch::LinuxArch for AArch64 {
         _hypervisor: &dyn Hypervisor,
         _irq_chip: &mut dyn IrqChipAArch64,
         _vcpu: &mut dyn VcpuAArch64,
-        _vcpu_init: &VcpuInitAArch64,
+        _vcpu_init: VcpuInitAArch64,
         _vcpu_id: usize,
         _num_cpus: usize,
         _has_bios: bool,
@@ -599,7 +651,14 @@ impl AArch64 {
     ///
     /// * `irq_chip` - The IRQ chip to add irqs to.
     /// * `bus` - The bus to add devices to.
-    fn add_arch_devs(irq_chip: &mut dyn IrqChip, bus: &Bus) -> Result<()> {
+    /// * `vcpu_count` - The number of virtual CPUs for this guest VM
+    /// * `vm_evt_wrtube` - The notification channel
+    fn add_arch_devs(
+        irq_chip: &mut dyn IrqChip,
+        bus: &Bus,
+        vcpu_count: usize,
+        vm_evt_wrtube: &SendTube,
+    ) -> Result<()> {
         let rtc_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         let rtc = devices::pl030::Pl030::new(rtc_evt.try_clone().map_err(Error::CloneEvent)?);
         irq_chip
@@ -612,6 +671,12 @@ impl AArch64 {
             AARCH64_RTC_SIZE,
         )
         .expect("failed to add rtc device");
+
+        let vm_wdt = Arc::new(Mutex::new(
+            devices::vmwdt::Vmwdt::new(vcpu_count, vm_evt_wrtube.try_clone().unwrap()).unwrap(),
+        ));
+        bus.insert(vm_wdt, AARCH64_VMWDT_ADDR, AARCH64_VMWDT_SIZE)
+            .expect("failed to add vmwdt device");
 
         Ok(())
     }

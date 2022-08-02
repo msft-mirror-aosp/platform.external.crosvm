@@ -16,10 +16,10 @@ sh_binary_host {
             src: "crosvm",
         },
         darwin: {
-           src: "crosvm",
+            src: "crosvm",
         },
         linux_bionic: {
-          src: "crosvm_bionic",
-       },
+            src: "crosvm",
+        },
     },
 }

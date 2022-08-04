@@ -6,17 +6,14 @@
 
 use rutabaga_gfx::RutabagaWsi;
 use serde::Deserialize;
-use serde::Deserializer;
 use serde::Serialize;
-use serde_keyvalue::FromKeyValues;
 
 use super::GpuMode;
 
 pub const DEFAULT_DISPLAY_WIDTH: u32 = 1280;
 pub const DEFAULT_DISPLAY_HEIGHT: u32 = 1024;
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, FromKeyValues)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct DisplayParameters {
     pub width: u32,
     pub height: u32,
@@ -31,57 +28,23 @@ impl Default for DisplayParameters {
     }
 }
 
-fn deserialize_wsi<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<RutabagaWsi>, D::Error> {
-    let s = String::deserialize(deserializer)?;
-
-    match s.as_str() {
-        "vk" => Ok(Some(RutabagaWsi::Vulkan)),
-        _ => Err(serde::de::Error::custom(
-            "gpu parameter 'wsi' should be vk".to_string(),
-        )),
-    }
-}
-
-fn deserialize_context_mask<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-    let s = String::deserialize(deserializer)?;
-    let context_types: Vec<String> = s.split(':').map(|s| s.to_string()).collect();
-
-    Ok(rutabaga_gfx::calculate_context_mask(context_types))
-}
-
-#[derive(Debug, Serialize, Deserialize, FromKeyValues)]
-#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GpuParameters {
-    #[serde(rename = "backend")]
-    pub mode: GpuMode,
-    #[serde(skip)]
     pub display_params: Vec<DisplayParameters>,
-    #[serde(rename = "egl")]
     pub renderer_use_egl: bool,
-    #[serde(rename = "gles")]
     pub renderer_use_gles: bool,
-    #[serde(rename = "glx")]
     pub renderer_use_glx: bool,
-    #[serde(rename = "surfaceless")]
     pub renderer_use_surfaceless: bool,
-    #[serde(rename = "angle")]
-    pub gfxstream_use_guest_angle: Option<bool>,
-    #[serde(rename = "vulkan")]
-    pub use_vulkan: Option<bool>,
-    #[serde(skip)]
+    pub gfxstream_use_guest_angle: bool,
+    pub use_vulkan: bool,
     pub gfxstream_support_gles31: bool,
-    #[serde(deserialize_with = "deserialize_wsi")]
     pub wsi: Option<RutabagaWsi>,
     pub udmabuf: bool,
+    pub mode: GpuMode,
     pub cache_path: Option<String>,
     pub cache_size: Option<String>,
     pub pci_bar_size: u64,
-    #[serde(
-        rename = "context-types",
-        deserialize_with = "deserialize_context_mask"
-    )]
     pub context_mask: u64,
 }
 
@@ -93,8 +56,8 @@ impl Default for GpuParameters {
             renderer_use_gles: true,
             renderer_use_glx: false,
             renderer_use_surfaceless: true,
-            gfxstream_use_guest_angle: None,
-            use_vulkan: None,
+            gfxstream_use_guest_angle: false,
+            use_vulkan: false,
             mode: if cfg!(feature = "virgl_renderer") {
                 GpuMode::ModeVirglRenderer
             } else {

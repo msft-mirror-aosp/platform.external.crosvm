@@ -13,6 +13,9 @@ use devices::virtio::GpuDisplayParameters;
 use devices::virtio::GpuParameters;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuMode;
+use devices::virtio::DEFAULT_DISPLAY_HEIGHT;
+#[cfg(feature = "gpu")]
+use devices::virtio::DEFAULT_DISPLAY_WIDTH;
 use devices::IommuDevType;
 use devices::PciAddress;
 use devices::SerialParameters;
@@ -222,7 +225,10 @@ pub(crate) fn validate_gpu_config(cfg: &mut Config) -> Result<(), String> {
             ));
         }
         if gpu_parameters.display_params.is_empty() {
-            gpu_parameters.display_params.push(Default::default());
+            gpu_parameters.display_params.push(GpuDisplayParameters {
+                width: DEFAULT_DISPLAY_WIDTH,
+                height: DEFAULT_DISPLAY_HEIGHT,
+            });
         }
 
         let width = gpu_parameters.display_params[0].width;

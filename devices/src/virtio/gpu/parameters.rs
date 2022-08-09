@@ -6,7 +6,9 @@
 
 use rutabaga_gfx::RutabagaWsi;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
+use serde_keyvalue::FromKeyValues;
 
 use super::GpuMode;
 
@@ -14,7 +16,8 @@ pub const DEFAULT_DISPLAY_WIDTH: u32 = 1280;
 pub const DEFAULT_DISPLAY_HEIGHT: u32 = 1024;
 pub const DEFAULT_REFRESH_RATE: u32 = 60;
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct DisplayParameters {
     pub width: u32,
     pub height: u32,
@@ -64,20 +67,34 @@ fn deserialize_context_mask<'de, D: Deserializer<'de>>(deserializer: D) -> Resul
 #[derive(Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct GpuParameters {
+    #[serde(rename = "backend")]
+    pub mode: GpuMode,
+    #[serde(skip)]
     pub display_params: Vec<DisplayParameters>,
+    #[serde(rename = "egl")]
     pub renderer_use_egl: bool,
+    #[serde(rename = "gles")]
     pub renderer_use_gles: bool,
+    #[serde(rename = "glx")]
     pub renderer_use_glx: bool,
+    #[serde(rename = "surfaceless")]
     pub renderer_use_surfaceless: bool,
-    pub gfxstream_use_guest_angle: bool,
-    pub use_vulkan: bool,
+    #[serde(rename = "angle")]
+    pub gfxstream_use_guest_angle: Option<bool>,
+    #[serde(rename = "vulkan")]
+    pub use_vulkan: Option<bool>,
+    #[serde(skip)]
     pub gfxstream_support_gles31: bool,
+    #[serde(deserialize_with = "deserialize_wsi")]
     pub wsi: Option<RutabagaWsi>,
     pub udmabuf: bool,
-    pub mode: GpuMode,
     pub cache_path: Option<String>,
     pub cache_size: Option<String>,
     pub pci_bar_size: u64,
+    #[serde(
+        rename = "context-types",
+        deserialize_with = "deserialize_context_mask"
+    )]
     pub context_mask: u64,
 }
 
@@ -89,8 +106,8 @@ impl Default for GpuParameters {
             renderer_use_gles: true,
             renderer_use_glx: false,
             renderer_use_surfaceless: true,
-            gfxstream_use_guest_angle: false,
-            use_vulkan: false,
+            gfxstream_use_guest_angle: None,
+            use_vulkan: None,
             mode: if cfg!(feature = "virgl_renderer") {
                 GpuMode::ModeVirglRenderer
             } else {

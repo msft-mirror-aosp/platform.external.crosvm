@@ -1317,7 +1317,6 @@ pub struct Config {
     #[cfg(feature = "video-encoder")]
     pub video_enc: Option<VideoDeviceConfig>,
     pub virtio_input_evdevs: Vec<PathBuf>,
-    pub virtio_iommu: bool,
     pub virtio_keyboard: Vec<PathBuf>,
     pub virtio_mice: Vec<PathBuf>,
     pub virtio_multi_touch: Vec<TouchDeviceOption>,
@@ -1514,7 +1513,6 @@ impl Default for Config {
             #[cfg(feature = "video-encoder")]
             video_enc: None,
             virtio_input_evdevs: Vec::new(),
-            virtio_iommu: false,
             virtio_keyboard: Vec::new(),
             virtio_mice: Vec::new(),
             virtio_multi_touch: Vec::new(),

@@ -1178,7 +1178,6 @@ impl VirtioDevice for Gpu {
                     | 1 << VIRTIO_GPU_F_RESOURCE_UUID
                     | 1 << VIRTIO_GPU_F_RESOURCE_BLOB
                     | 1 << VIRTIO_GPU_F_CONTEXT_INIT
-                    | 1 << VIRTIO_GPU_F_EDID
                     | 1 << VIRTIO_GPU_F_RESOURCE_SYNC;
 
                 if self.udmabuf {

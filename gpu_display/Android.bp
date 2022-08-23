@@ -16,44 +16,6 @@ package {
     default_applicable_licenses: ["external_crosvm_license"],
 }
 
-rust_test {
-    name: "gpu_display_test_src_lib",
-    defaults: ["crosvm_defaults"],
-    host_supported: true,
-    crate_name: "gpu_display",
-    cargo_env_compat: true,
-    cargo_pkg_version: "0.1.0",
-    srcs: ["src/lib.rs"],
-    test_suites: ["general-tests"],
-    auto_gen_config: true,
-    test_options: {
-        unit_test: true,
-    },
-    edition: "2021",
-    rustlibs: [
-        "libbase_rust",
-        "libdata_model",
-        "liblibc",
-        "liblinux_input_sys",
-        "libthiserror",
-    ],
-    proc_macros: ["libremain"],
-    static_libs: ["libdisplay_wl"],
-
-    // added manually
-    target: {
-        host: {
-            shared_libs: ["libwayland_client"],
-        },
-        android: {
-            static_libs: [
-                "libwayland_client_static",
-                "libffi",
-            ],
-        },
-    },
-}
-
 rust_library {
     name: "libgpu_display",
     defaults: ["crosvm_defaults"],

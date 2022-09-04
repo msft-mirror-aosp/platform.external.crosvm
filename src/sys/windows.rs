@@ -1962,6 +1962,7 @@ where
         pci_devices,
         irq_chip,
         &mut vcpu_ids,
+        cfg.dump_device_tree_blob.clone(),
         /*debugcon_jail=*/ None,
         None,
     )

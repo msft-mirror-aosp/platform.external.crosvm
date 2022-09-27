@@ -62,8 +62,10 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
         disk.block_size,
         None,
         None,
-    )?)
-    .into_backend(&ex)?;
+        None,
+        None,
+        None,
+    )?);
 
     let listener = VhostUserListener::new_from_socket_or_vfio(
         &opts.socket,

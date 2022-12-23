@@ -642,7 +642,8 @@ async fn request_queue<I: SignalableInterrupt>(
 fn run(
     state: State,
     iommu_device_tube: Tube,
-    mut queues: Vec<(Queue, Event)>,
+    mut queues: Vec<Queue>,
+    queue_evts: Vec<Event>,
     kill_evt: Event,
     interrupt: Interrupt,
     translate_response_senders: Option<BTreeMap<u32, Tube>>,
@@ -651,8 +652,12 @@ fn run(
     let state = Rc::new(RefCell::new(state));
     let ex = Executor::new().expect("Failed to create an executor");
 
-    let (req_queue, req_evt) = queues.remove(0);
-    let req_evt = EventAsync::new(req_evt, &ex).expect("Failed to create async event for queue");
+    let mut evts_async: Vec<EventAsync> = queue_evts
+        .into_iter()
+        .map(|e| EventAsync::new(e, &ex).expect("Failed to create async event for queue"))
+        .collect();
+
+    let (req_queue, req_evt) = (queues.remove(0), evts_async.remove(0));
 
     let f_resample = async_utils::handle_irq_resample(&ex, interrupt.clone());
     let f_kill = async_utils::await_and_exit(&ex, kill_evt);
@@ -832,9 +837,10 @@ impl VirtioDevice for Iommu {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        queues: Vec<(Queue, Event)>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
     ) -> anyhow::Result<()> {
-        if queues.len() != QUEUE_SIZES.len() {
+        if queues.len() != QUEUE_SIZES.len() || queue_evts.len() != QUEUE_SIZES.len() {
             return Err(anyhow!(
                 "expected {} queues, got {}",
                 QUEUE_SIZES.len(),
@@ -877,6 +883,7 @@ impl VirtioDevice for Iommu {
                     state,
                     iommu_device_tube,
                     queues,
+                    queue_evts,
                     kill_evt,
                     interrupt,
                     translate_response_senders,

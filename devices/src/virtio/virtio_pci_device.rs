@@ -8,6 +8,7 @@ use std::sync::Arc;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use acpi_tables::sdt::SDT;
 use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Context;
 use base::error;
 use base::AsRawDescriptor;
@@ -470,6 +471,10 @@ impl VirtioPciDevice {
         Ok(())
     }
 
+    fn clone_queue_evts(&self) -> Result<Vec<Event>> {
+        self.queue_evts.iter().map(|e| e.try_clone()).collect()
+    }
+
     /// Activates the underlying `VirtioDevice`. `assign_irq` has to be called first.
     fn activate(&mut self) -> anyhow::Result<()> {
         let interrupt_evt = if let Some(ref evt) = self.interrupt_evt {
@@ -488,31 +493,36 @@ impl VirtioPciDevice {
         );
         self.interrupt = Some(interrupt.clone());
 
-        // Use ready queues and their events.
-        let queues = self
-            .queues
-            .iter()
-            .zip(self.queue_evts.iter())
-            .filter(|(q, _)| q.ready())
-            .map(|(queue, evt)| {
-                Ok((
-                    queue.clone(),
-                    evt.try_clone().context("failed to clone queue_evt")?,
-                ))
-            })
-            .collect::<anyhow::Result<Vec<(Queue, Event)>>>()?;
+        match self.clone_queue_evts() {
+            Ok(queue_evts) => {
+                // Use ready queues and their events.
+                let (queues, queue_evts) = self
+                    .queues
+                    .clone()
+                    .into_iter()
+                    .zip(queue_evts.into_iter())
+                    .filter(|(q, _)| q.ready())
+                    .unzip();
 
-        if let Some(iommu) = &self.iommu {
-            self.device.set_iommu(iommu);
+                if let Some(iommu) = &self.iommu {
+                    self.device.set_iommu(iommu);
+                }
+
+                if let Err(e) = self.device.activate(mem, interrupt, queues, queue_evts) {
+                    error!("{} activate failed: {:#}", self.debug_label(), e);
+                    self.common_config.driver_status |= VIRTIO_CONFIG_S_NEEDS_RESET as u8;
+                } else {
+                    self.device_activated = true;
+                }
+            }
+            Err(e) => {
+                bail!(
+                    "{} not activate due to failed to clone queue_evts: {}",
+                    self.debug_label(),
+                    e
+                );
+            }
         }
-
-        if let Err(e) = self.device.activate(mem, interrupt, queues) {
-            error!("{} activate failed: {:#}", self.debug_label(), e);
-            self.common_config.driver_status |= VIRTIO_CONFIG_S_NEEDS_RESET as u8;
-        } else {
-            self.device_activated = true;
-        }
-
         Ok(())
     }
 }
@@ -928,11 +938,11 @@ impl Suspendable for VirtioPciDevice {
         self.device.wake()
     }
 
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&self) -> anyhow::Result<String> {
         self.device.snapshot()
     }
 
-    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+    fn restore(&mut self, data: &str) -> anyhow::Result<()> {
         self.device.restore(data)
     }
 }

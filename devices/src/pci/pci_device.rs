@@ -699,11 +699,11 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
 }
 
 impl<T: PciDevice + ?Sized> Suspendable for Box<T> {
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&self) -> anyhow::Result<String> {
         (**self).snapshot()
     }
 
-    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+    fn restore(&mut self, data: &str) -> anyhow::Result<()> {
         (**self).restore(data)
     }
 

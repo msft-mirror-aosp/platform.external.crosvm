@@ -117,7 +117,8 @@ pub trait VirtioDevice: Send + Suspendable {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        queues: Vec<(Queue, Event)>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
     ) -> Result<()>;
 
     /// Optionally deactivates this device. If the reset method is

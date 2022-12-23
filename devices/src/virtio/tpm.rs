@@ -222,12 +222,14 @@ impl VirtioDevice for Tpm {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: Vec<(Queue, Event)>,
+        mut queues: Vec<Queue>,
+        mut queue_evts: Vec<Event>,
     ) -> anyhow::Result<()> {
-        if queues.len() != 1 {
+        if queues.len() != 1 || queue_evts.len() != 1 {
             return Err(anyhow!("expected 1 queue, got {}", queues.len()));
         }
-        let (queue, queue_evt) = queues.remove(0);
+        let queue = queues.remove(0);
+        let queue_evt = queue_evts.remove(0);
 
         let backend = self.backend.take().context("no backend in vtpm")?;
 

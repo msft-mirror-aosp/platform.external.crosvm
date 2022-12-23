@@ -14,11 +14,9 @@ use sync::Mutex;
 
 use crate::pci::pci_configuration::PciCapabilityID;
 use crate::pci::pcie::pci_bridge::PciBridgeBusRange;
+use crate::pci::pcie::pcie_device::PmcConfig;
 use crate::pci::pcie::pcie_host::PcieHostPort;
 use crate::pci::pcie::*;
-use crate::pci::pm::PciDevicePower;
-use crate::pci::pm::PmConfig;
-use crate::pci::pm::PM_CAP_CONTROL_STATE_OFFSET;
 use crate::pci::MsiConfig;
 use crate::pci::PciAddress;
 use crate::pci::PciDeviceError;
@@ -43,7 +41,7 @@ struct PcieRootCap {
 
     control: u16,
     status: u32,
-    pme_pending_requester_id: Option<u16>,
+    pme_pending_request_id: Option<PciAddress>,
 
     msi_config: Option<Arc<Mutex<MsiConfig>>>,
 }
@@ -55,7 +53,7 @@ impl PcieRootCap {
             subordinate_bus_num,
             control: 0,
             status: 0,
-            pme_pending_requester_id: None,
+            pme_pending_request_id: None,
             msi_config: None,
         }
     }
@@ -101,9 +99,9 @@ pub struct PciePort {
     bus_range: PciBridgeBusRange,
     pcie_host: Option<PcieHostPort>,
     pcie_cap_reg_idx: Option<usize>,
-    pm_cap_reg_idx: Option<usize>,
+    pmc_cap_reg_idx: Option<usize>,
     msi_config: Option<Arc<Mutex<MsiConfig>>>,
-    pm_config: PmConfig,
+    pmc_config: PmcConfig,
 
     slot_control: Option<u16>,
     slot_status: u16,
@@ -153,9 +151,9 @@ impl PciePort {
             bus_range,
             pcie_host: None,
             pcie_cap_reg_idx: None,
-            pm_cap_reg_idx: None,
+            pmc_cap_reg_idx: None,
             msi_config: None,
-            pm_config: PmConfig::new(),
+            pmc_config: PmcConfig::new(),
 
             slot_control: if slot_implemented {
                 Some(PCIE_SLTCTL_PIC_OFF | PCIE_SLTCTL_AIC_OFF)
@@ -200,9 +198,9 @@ impl PciePort {
             bus_range,
             pcie_host: Some(pcie_host),
             pcie_cap_reg_idx: None,
-            pm_cap_reg_idx: None,
+            pmc_cap_reg_idx: None,
             msi_config: None,
-            pm_config: PmConfig::new(),
+            pmc_config: PmcConfig::new(),
 
             slot_control: if slot_implemented {
                 Some(PCIE_SLTCTL_PIC_OFF | PCIE_SLTCTL_AIC_OFF)
@@ -222,10 +220,6 @@ impl PciePort {
 
     pub fn get_device_id(&self) -> u16 {
         self.device_id
-    }
-
-    pub fn get_address(&self) -> Option<PciAddress> {
-        self.pci_address
     }
 
     pub fn debug_label(&self) -> String {
@@ -372,12 +366,15 @@ impl PciePort {
                     if self.is_root_port {
                         if *v & PCIE_ROOTSTA_PME_STATUS != 0 {
                             let mut r = self.root_cap.lock();
-                            if let Some(requester_id) = r.pme_pending_requester_id {
+                            if let Some(request_id) = r.pme_pending_request_id {
                                 r.status &= !PCIE_ROOTSTA_PME_PENDING;
+                                let req_id = ((request_id.bus as u32) << 8)
+                                    | ((request_id.dev as u32) << 3)
+                                    | (request_id.func as u32);
                                 r.status &= !PCIE_ROOTSTA_PME_REQ_ID_MASK;
-                                r.status |= requester_id as u32;
+                                r.status |= req_id;
                                 r.status |= PCIE_ROOTSTA_PME_STATUS;
-                                r.pme_pending_requester_id = None;
+                                r.pme_pending_request_id = None;
                                 r.trigger_pme_interrupt();
                             } else {
                                 r.status &= !PCIE_ROOTSTA_PME_STATUS;
@@ -400,9 +397,9 @@ impl PciePort {
                 self.read_pcie_cap(offset, data);
             }
         }
-        if let Some(pm_cap_reg_idx) = self.pm_cap_reg_idx {
-            if reg_idx == pm_cap_reg_idx + PM_CAP_CONTROL_STATE_OFFSET {
-                self.pm_config.read(data);
+        if let Some(pmc_cap_reg_idx) = self.pmc_cap_reg_idx {
+            if reg_idx == pmc_cap_reg_idx + PMC_CAP_CONTROL_STATE_OFFSET {
+                self.pmc_config.read(data);
             }
         }
         if let Some(host) = &self.pcie_host {
@@ -417,11 +414,11 @@ impl PciePort {
                 self.write_pcie_cap(delta, data);
             }
         }
-        if let Some(pm_cap_reg_idx) = self.pm_cap_reg_idx {
-            if reg_idx == pm_cap_reg_idx + PM_CAP_CONTROL_STATE_OFFSET {
-                let old_status = self.pm_config.get_power_status();
-                self.pm_config.write(offset, data);
-                let new_status = self.pm_config.get_power_status();
+        if let Some(pmc_cap_reg_idx) = self.pmc_cap_reg_idx {
+            if reg_idx == pmc_cap_reg_idx + PMC_CAP_CONTROL_STATE_OFFSET {
+                let old_status = self.pmc_config.get_power_status();
+                self.pmc_config.write(offset, data);
+                let new_status = self.pmc_config.get_power_status();
                 if old_status == PciDevicePower::D3
                     && new_status == PciDevicePower::D0
                     && self.prepare_hotplug
@@ -441,7 +438,7 @@ impl PciePort {
     pub fn set_capability_reg_idx(&mut self, id: PciCapabilityID, reg_idx: usize) {
         match id {
             PciCapabilityID::PciExpress => self.pcie_cap_reg_idx = Some(reg_idx),
-            PciCapabilityID::PowerManagement => self.pm_cap_reg_idx = Some(reg_idx),
+            PciCapabilityID::PowerManagement => self.pmc_cap_reg_idx = Some(reg_idx),
             _ => (),
         }
     }
@@ -494,24 +491,28 @@ impl PciePort {
         }
     }
 
-    pub fn inject_pme(&mut self, requester_id: u16) {
+    pub fn inject_pme(&mut self) {
         let mut r = self.root_cap.lock();
         if (r.status & PCIE_ROOTSTA_PME_STATUS) != 0 {
             r.status |= PCIE_ROOTSTA_PME_PENDING;
-            r.pme_pending_requester_id = Some(requester_id);
+            r.pme_pending_request_id = self.pci_address;
         } else {
+            let request_id = self.pci_address.unwrap();
+            let req_id = ((request_id.bus as u32) << 8)
+                | ((request_id.dev as u32) << 3)
+                | (request_id.func as u32);
             r.status &= !PCIE_ROOTSTA_PME_REQ_ID_MASK;
-            r.status |= requester_id as u32;
-            r.pme_pending_requester_id = None;
+            r.status |= req_id;
+            r.pme_pending_request_id = None;
             r.status |= PCIE_ROOTSTA_PME_STATUS;
             r.trigger_pme_interrupt();
         }
     }
 
     pub fn trigger_hp_or_pme_interrupt(&mut self) {
-        if self.pm_config.should_trigger_pme() {
+        if self.pmc_config.should_trigger_pme() {
             self.hp_interrupt_pending = true;
-            self.inject_pme(self.pci_address.unwrap().pme_requester_id());
+            self.inject_pme();
         } else {
             self.trigger_hp_interrupt();
         }
@@ -544,7 +545,7 @@ impl PciePort {
     }
 
     pub fn should_trigger_pme(&mut self) -> bool {
-        self.pm_config.should_trigger_pme()
+        self.pmc_config.should_trigger_pme()
     }
 
     pub fn prepare_hotplug(&mut self) {

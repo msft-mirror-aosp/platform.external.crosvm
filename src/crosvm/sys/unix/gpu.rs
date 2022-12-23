@@ -111,8 +111,7 @@ pub fn create_gpu_device(
         #[cfg(feature = "virgl_renderer_next")]
         render_server_fd,
         event_devices,
-        /*external_blob=*/ cfg.jail_config.is_some(),
-        /*system_blob=*/ false,
+        cfg.jail_config.is_some(),
         virtio::base_features(cfg.protection_type),
         cfg.wayland_socket_paths.clone(),
     );

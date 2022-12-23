@@ -847,16 +847,10 @@ impl RutabagaBuilder {
         self
     }
 
-    /// Sets use external blob in gfxstream + virglrenderer.
+    /// Sets use external blob in virglrenderer.
     pub fn set_use_external_blob(mut self, v: bool) -> RutabagaBuilder {
         self.gfxstream_flags = self.gfxstream_flags.use_external_blob(v);
         self.virglrenderer_flags = self.virglrenderer_flags.use_external_blob(v);
-        self
-    }
-
-    /// Sets use system blob in gfxstream.
-    pub fn set_use_system_blob(mut self, v: bool) -> RutabagaBuilder {
-        self.gfxstream_flags = self.gfxstream_flags.use_system_blob(v);
         self
     }
 

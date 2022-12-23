@@ -80,7 +80,8 @@ fuzz_target!(|bytes| {
     q.set_size(QUEUE_SIZE / 2);
     q.set_ready(true);
 
-    let queue_evt = Event::new().unwrap();
+    let queue_evts: Vec<Event> = vec![Event::new().unwrap()];
+    let queue_evt = queue_evts[0].try_clone().unwrap();
 
     let features = base_features(ProtectionType::Unprotected);
 
@@ -106,7 +107,8 @@ fuzz_target!(|bytes| {
             None,   // msix_config
             0xFFFF, // VIRTIO_MSI_NO_VECTOR
         ),
-        vec![(q, queue_evt.try_clone().unwrap())],
+        vec![q],
+        queue_evts,
     );
 
     queue_evt.signal().unwrap(); // Rings the doorbell

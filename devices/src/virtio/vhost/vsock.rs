@@ -26,14 +26,15 @@ use super::worker::Worker;
 use super::Error;
 use super::Result;
 use crate::virtio::copy_config;
-use crate::virtio::device_constants::vsock::NUM_QUEUES;
-use crate::virtio::device_constants::vsock::QUEUE_SIZES;
 use crate::virtio::DeviceType;
 use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 use crate::virtio::VirtioDevice;
 use crate::Suspendable;
 
+pub const QUEUE_SIZE: u16 = 256;
+const NUM_QUEUES: usize = 3;
+pub const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 static VHOST_VSOCK_DEFAULT_PATH: &str = "/dev/vhost-vsock";
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -181,9 +182,10 @@ impl VirtioDevice for Vsock {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: Vec<(Queue, Event)>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<Event>,
     ) -> anyhow::Result<()> {
-        if queues.len() != NUM_QUEUES {
+        if queues.len() != NUM_QUEUES || queue_evts.len() != NUM_QUEUES {
             return Err(anyhow!(
                 "net: expected {} queues, got {}",
                 NUM_QUEUES,
@@ -198,9 +200,9 @@ impl VirtioDevice for Vsock {
         let cid = self.cid;
         // The third vq is an event-only vq that is not handled by the vhost
         // subsystem (but still needs to exist).  Split it off here.
-        let _event_queue = queues.remove(2);
+        let vhost_queues = queues[..2].to_vec();
         let mut worker = Worker::new(
-            queues,
+            vhost_queues,
             vhost_handle,
             interrupts,
             interrupt,
@@ -215,7 +217,7 @@ impl VirtioDevice for Vsock {
             Ok(())
         };
         worker
-            .init(mem, QUEUE_SIZES, activate_vqs)
+            .init(mem, queue_evts, QUEUE_SIZES, activate_vqs)
             .context("vsock worker init exited with error")?;
         thread::Builder::new()
             .name("vhost_vsock".to_string())

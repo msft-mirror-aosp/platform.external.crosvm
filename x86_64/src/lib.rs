@@ -1258,7 +1258,6 @@ const OSC_STATUS_UNSUPPORT_UUID: u32 = 0x4;
 #[allow(dead_code)]
 const PCI_HB_OSC_CONTROL_PCIE_HP: u32 = 0x1;
 const PCI_HB_OSC_CONTROL_SHPC_HP: u32 = 0x2;
-#[allow(dead_code)]
 const PCI_HB_OSC_CONTROL_PCIE_PME: u32 = 0x4;
 const PCI_HB_OSC_CONTROL_PCIE_AER: u32 = 0x8;
 #[allow(dead_code)]
@@ -1274,7 +1273,7 @@ struct PciRootOSC {}
 //         CreateDWordField (Arg3, 8, CDW3) // control field
 //         if ( 0 == (CDW1 & 0x01))  // Query flag ?
 //         {
-//              CDW3 &= !(SHPC_HP | AER)
+//              CDW3 &= !(SHPC_HP | PME | AER)
 //         }
 //     } Else {
 //         CDW1 |= UNSUPPORT_UUID
@@ -1284,9 +1283,11 @@ struct PciRootOSC {}
 impl Aml for PciRootOSC {
     fn to_aml_bytes(&self, aml: &mut Vec<u8>) {
         let osc_uuid = "33DB4D5B-1FF7-401C-9657-7441C03DD766";
-        // virtual pcie root port supports hotplug, pme, and pcie cap register, clear all
+        // virtual pcie root port supports hotplug and pcie cap register only, clear all
         // the other bits.
-        let mask = !(PCI_HB_OSC_CONTROL_SHPC_HP | PCI_HB_OSC_CONTROL_PCIE_AER);
+        let mask = !(PCI_HB_OSC_CONTROL_SHPC_HP
+            | PCI_HB_OSC_CONTROL_PCIE_PME
+            | PCI_HB_OSC_CONTROL_PCIE_AER);
         aml::Method::new(
             "_OSC".into(),
             4,

@@ -15,7 +15,6 @@ use base::ioctl_iowr_nr;
 
 pub mod vhost;
 pub mod virtio_config;
-pub mod virtio_fs;
 pub mod virtio_ids;
 pub mod virtio_mmio;
 pub mod virtio_net;

@@ -37,6 +37,7 @@ use crate::virtio::snd::common_backend::stream_info::StreamInfo;
 use crate::virtio::snd::common_backend::PcmResponse;
 use crate::virtio::snd::common_backend::SndData;
 use crate::virtio::snd::common_backend::MAX_QUEUE_NUM;
+use crate::virtio::snd::common_backend::MAX_VRING_LEN;
 use crate::virtio::snd::parameters::Parameters;
 use crate::virtio::vhost::user::device::handler::sys::Doorbell;
 use crate::virtio::vhost::user::device::handler::VhostUserBackend;
@@ -112,6 +113,10 @@ impl SndBackend {
 impl VhostUserBackend for SndBackend {
     fn max_queue_num(&self) -> usize {
         MAX_QUEUE_NUM
+    }
+
+    fn max_vring_len(&self) -> u16 {
+        MAX_VRING_LEN
     }
 
     fn features(&self) -> u64 {

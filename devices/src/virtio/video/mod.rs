@@ -206,12 +206,20 @@ impl VirtioDevice for VideoDevice {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: Vec<(virtio::queue::Queue, Event)>,
+        mut queues: Vec<virtio::queue::Queue>,
+        mut queue_evts: Vec<Event>,
     ) -> anyhow::Result<()> {
         if queues.len() != QUEUE_SIZES.len() {
             return Err(anyhow!(
                 "wrong number of queues are passed: expected {}, actual {}",
                 queues.len(),
+                QUEUE_SIZES.len()
+            ));
+        }
+        if queue_evts.len() != QUEUE_SIZES.len() {
+            return Err(anyhow!(
+                "wrong number of events are passed: expected {}, actual {}",
+                queue_evts.len(),
                 QUEUE_SIZES.len()
             ));
         }
@@ -221,8 +229,10 @@ impl VirtioDevice for VideoDevice {
             .context("failed to create kill Event pair")?;
         self.kill_evt = Some(self_kill_evt);
 
-        let (cmd_queue, cmd_evt) = queues.remove(0);
-        let (event_queue, event_evt) = queues.remove(0);
+        let cmd_queue = queues.remove(0);
+        let cmd_evt = queue_evts.remove(0);
+        let event_queue = queues.remove(0);
+        let event_evt = queue_evts.remove(0);
         let backend = self.backend;
         let resource_bridge = self
             .resource_bridge

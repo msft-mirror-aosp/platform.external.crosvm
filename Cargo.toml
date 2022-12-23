@@ -93,7 +93,6 @@ members = [
     "swap",
     "system_api",
     "third_party/vmm_vhost",
-    "tools/impl/catapult_converter",
     "tpm2-sys",
     "tpm2",
     "usb_sys",
@@ -428,6 +427,8 @@ which = "4"
 
 [dev-dependencies]
 base = "*"
+# ANDROID: Not needed, should delete upstream.
+# prebuilts = { path = "prebuilts" }
 
 [patch.crates-io]
 audio_streams = { path = "common/audio_streams" }

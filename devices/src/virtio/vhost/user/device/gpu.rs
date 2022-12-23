@@ -39,6 +39,7 @@ use crate::virtio::SharedMemoryRegion;
 use crate::virtio::VirtioDevice;
 
 const MAX_QUEUE_NUM: usize = gpu::QUEUE_SIZES.len();
+const MAX_VRING_LEN: u16 = gpu::QUEUE_SIZES[0];
 
 #[derive(Clone)]
 struct SharedReader {
@@ -96,6 +97,10 @@ struct GpuBackend {
 impl VhostUserBackend for GpuBackend {
     fn max_queue_num(&self) -> usize {
         MAX_QUEUE_NUM
+    }
+
+    fn max_vring_len(&self) -> u16 {
+        MAX_VRING_LEN
     }
 
     fn features(&self) -> u64 {

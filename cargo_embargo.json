@@ -19,7 +19,6 @@
   "workspace_excludes": [
     "audio_streams_conformance_test",
     "baremetal",
-    "catapult_converter",
     "cros_asyncv2",
     "cros_fuzz",
     "crosvm-fuzz",

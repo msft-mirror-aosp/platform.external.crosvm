@@ -9,6 +9,7 @@ use acpi_tables::aml::Aml;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use acpi_tables::sdt::SDT;
 use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Context;
 use base::error;
 use base::pagesize;
@@ -132,6 +133,10 @@ impl VirtioMmioDevice {
         self.driver_status == DEVICE_RESET as u8
     }
 
+    fn clone_queue_evts(&self) -> Result<Vec<Event>> {
+        self.queue_evts.iter().map(|e| e.try_clone()).collect()
+    }
+
     fn device_type(&self) -> u32 {
         self.device.device_type() as u32
     }
@@ -149,27 +154,32 @@ impl VirtioMmioDevice {
         let interrupt = Interrupt::new_mmio(interrupt_evt, self.async_intr_status);
         self.interrupt = Some(interrupt.clone());
 
-        // Use ready queues and their events.
-        let queues = self
-            .queues
-            .iter()
-            .zip(self.queue_evts.iter())
-            .filter(|(q, _)| q.ready())
-            .map(|(queue, evt)| {
-                Ok((
-                    queue.clone(),
-                    evt.try_clone().context("failed to clone queue_evt")?,
-                ))
-            })
-            .collect::<anyhow::Result<Vec<(Queue, Event)>>>()?;
+        match self.clone_queue_evts() {
+            Ok(queue_evts) => {
+                // Use ready queues and their events.
+                let (queues, queue_evts) = self
+                    .queues
+                    .clone()
+                    .into_iter()
+                    .zip(queue_evts.into_iter())
+                    .filter(|(q, _)| q.ready())
+                    .unzip();
 
-        if let Err(e) = self.device.activate(mem, interrupt, queues) {
-            error!("{} activate failed: {:#}", self.debug_label(), e);
-            self.driver_status |= VIRTIO_CONFIG_S_NEEDS_RESET as u8;
-        } else {
-            self.device_activated = true;
+                if let Err(e) = self.device.activate(mem, interrupt, queues, queue_evts) {
+                    error!("{} activate failed: {:#}", self.debug_label(), e);
+                    self.driver_status |= VIRTIO_CONFIG_S_NEEDS_RESET as u8;
+                } else {
+                    self.device_activated = true;
+                }
+            }
+            Err(e) => {
+                bail!(
+                    "{} not activate due to failed to clone queue_evts: {}",
+                    self.debug_label(),
+                    e
+                );
+            }
         }
-
         Ok(())
     }
 
@@ -502,11 +512,11 @@ impl Suspendable for VirtioMmioDevice {
         self.device.wake()
     }
 
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&self) -> anyhow::Result<String> {
         self.device.snapshot()
     }
 
-    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+    fn restore(&mut self, data: &str) -> anyhow::Result<()> {
         self.device.restore(data)
     }
 }

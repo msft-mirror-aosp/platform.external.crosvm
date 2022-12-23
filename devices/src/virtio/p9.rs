@@ -80,7 +80,6 @@ struct Worker {
     interrupt: Interrupt,
     mem: GuestMemory,
     queue: Queue,
-    queue_evt: Event,
     server: p9::Server,
 }
 
@@ -104,7 +103,7 @@ impl Worker {
         Ok(())
     }
 
-    fn run(&mut self, kill_evt: Event) -> P9Result<()> {
+    fn run(&mut self, queue_evt: Event, kill_evt: Event) -> P9Result<()> {
         #[derive(EventToken)]
         enum Token {
             // A request is ready on the queue.
@@ -115,11 +114,9 @@ impl Worker {
             Kill,
         }
 
-        let wait_ctx: WaitContext<Token> = WaitContext::build_with(&[
-            (&self.queue_evt, Token::QueueReady),
-            (&kill_evt, Token::Kill),
-        ])
-        .map_err(P9Error::CreateWaitContext)?;
+        let wait_ctx: WaitContext<Token> =
+            WaitContext::build_with(&[(&queue_evt, Token::QueueReady), (&kill_evt, Token::Kill)])
+                .map_err(P9Error::CreateWaitContext)?;
         if let Some(resample_evt) = self.interrupt.get_resample_evt() {
             wait_ctx
                 .add(resample_evt, Token::InterruptResample)
@@ -131,7 +128,7 @@ impl Worker {
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
                     Token::QueueReady => {
-                        self.queue_evt.wait().map_err(P9Error::ReadQueueEvent)?;
+                        queue_evt.wait().map_err(P9Error::ReadQueueEvent)?;
                         self.process_queue()?;
                     }
                     Token::InterruptResample => {
@@ -221,13 +218,12 @@ impl VirtioDevice for P9 {
         &mut self,
         guest_mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: Vec<(Queue, Event)>,
+        mut queues: Vec<Queue>,
+        mut queue_evts: Vec<Event>,
     ) -> anyhow::Result<()> {
-        if queues.len() != 1 {
+        if queues.len() != 1 || queue_evts.len() != 1 {
             return Err(anyhow!("expected 1 queue, got {}", queues.len()));
         }
-
-        let (queue, queue_evt) = queues.remove(0);
 
         let (self_kill_evt, kill_evt) = Event::new()
             .and_then(|e| Ok((e.try_clone()?, e)))
@@ -242,12 +238,11 @@ impl VirtioDevice for P9 {
                 let mut worker = Worker {
                     interrupt,
                     mem: guest_mem,
-                    queue,
-                    queue_evt,
+                    queue: queues.remove(0),
                     server,
                 };
 
-                worker.run(kill_evt)
+                worker.run(queue_evts.remove(0), kill_evt)
             })
             .context("failed to spawn virtio_9p worker")?;
         self.worker = Some(worker_thread);

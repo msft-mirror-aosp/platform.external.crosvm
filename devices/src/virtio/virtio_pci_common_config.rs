@@ -266,7 +266,8 @@ mod tests {
             &mut self,
             _mem: GuestMemory,
             _interrupt: Interrupt,
-            _queues: Vec<(Queue, Event)>,
+            _queues: Vec<Queue>,
+            _queue_evts: Vec<Event>,
         ) -> anyhow::Result<()> {
             Ok(())
         }

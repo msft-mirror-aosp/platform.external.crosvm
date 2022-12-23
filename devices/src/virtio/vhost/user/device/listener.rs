@@ -6,6 +6,7 @@ pub mod sys;
 use std::any::Any;
 use std::pin::Pin;
 
+use anyhow::Context;
 use base::RawDescriptor;
 use cros_async::Executor;
 use futures::Future;
@@ -57,10 +58,14 @@ pub trait VhostUserListenerTrait {
 
     /// Start processing requests for a `VhostUserDevice` on `listener`. Returns when the front-end
     /// side disconnects or an error occurs.
-    fn run_device(self, ex: Executor, device: Box<dyn VhostUserDevice>) -> anyhow::Result<()>
+    fn run_device(self, device: Box<dyn VhostUserDevice>) -> anyhow::Result<()>
     where
         Self: Sized,
     {
-        ex.run_until(self.run_backend(device.into_backend(&ex)?, &ex))?
+        let ex = Executor::with_executor_kind(device.executor_kind().unwrap_or_default())
+            .context("Failed to create an Executor")?;
+        let backend = device.into_backend(&ex)?;
+
+        ex.run_until(self.run_backend(backend, &ex))?
     }
 }

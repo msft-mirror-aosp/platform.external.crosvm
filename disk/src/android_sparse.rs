@@ -87,7 +87,7 @@ unsafe impl DataInit for ChunkHeader {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Chunk {
     Raw(u64), // Offset into the file
-    Fill(Vec<u8>),
+    Fill([u8; 4]),
     DontCare,
 }
 
@@ -109,33 +109,36 @@ pub struct AndroidSparse {
     chunks: BTreeMap<u64, ChunkWithSize>,
 }
 
-fn parse_chunk<T: Read + Seek>(
-    mut input: &mut T,
-    chunk_hdr_size: u64,
-    blk_sz: u64,
-) -> Result<Option<ChunkWithSize>> {
+fn parse_chunk<T: Read + Seek>(mut input: &mut T, blk_sz: u64) -> Result<Option<ChunkWithSize>> {
+    const HEADER_SIZE: usize = mem::size_of::<ChunkHeader>();
     let current_offset = input
         .seek(SeekFrom::Current(0))
         .map_err(Error::ReadSpecificationError)?;
     let chunk_header =
         ChunkHeader::from_reader(&mut input).map_err(Error::ReadSpecificationError)?;
+    let chunk_body_size = (chunk_header.total_sz.to_native() as usize)
+        .checked_sub(HEADER_SIZE)
+        .ok_or(Error::InvalidSpecification(format!(
+            "chunk total_sz {} smaller than header size {}",
+            chunk_header.total_sz.to_native(),
+            HEADER_SIZE
+        )))?;
     let chunk = match chunk_header.chunk_type.to_native() {
         CHUNK_TYPE_RAW => {
             input
-                .seek(SeekFrom::Current(
-                    chunk_header.total_sz.to_native() as i64 - chunk_hdr_size as i64,
-                ))
+                .seek(SeekFrom::Current(chunk_body_size as i64))
                 .map_err(Error::ReadSpecificationError)?;
-            Chunk::Raw(current_offset + chunk_hdr_size as u64)
+            Chunk::Raw(current_offset + HEADER_SIZE as u64)
         }
         CHUNK_TYPE_FILL => {
-            if chunk_header.total_sz == chunk_hdr_size as u32 {
-                return Err(Error::InvalidSpecification(
-                    "Fill chunk did not have any data to fill".to_string(),
-                ));
+            let mut fill_bytes = [0u8; 4];
+            if chunk_body_size != fill_bytes.len() {
+                return Err(Error::InvalidSpecification(format!(
+                    "Fill chunk had bad size. Expected {}, was {}",
+                    fill_bytes.len(),
+                    chunk_body_size
+                )));
             }
-            let fill_size = chunk_header.total_sz.to_native() as u64 - chunk_hdr_size as u64;
-            let mut fill_bytes = vec![0u8; fill_size as usize];
             input
                 .read_exact(&mut fill_bytes)
                 .map_err(Error::ReadSpecificationError)?;
@@ -175,19 +178,19 @@ impl AndroidSparse {
                 MAJOR_VERSION,
                 sparse_header.major_version.to_native(),
             )));
-        } else if (sparse_header.chunk_hdr_size.to_native() as usize)
-            < mem::size_of::<ChunkHeader>()
+        } else if sparse_header.chunk_hdr_size.to_native() as usize != mem::size_of::<ChunkHeader>()
         {
+            // The canonical parser for this format allows `chunk_hdr_size >= sizeof(ChunkHeader)`,
+            // but we've chosen to be stricter for simplicity.
             return Err(Error::InvalidSpecification(format!(
-                "Chunk header size does not fit chunk header struct, expected >={}, was {}",
+                "Chunk header size does not match chunk header struct, expected {}, was {}",
                 sparse_header.chunk_hdr_size.to_native(),
                 mem::size_of::<ChunkHeader>()
             )));
         }
-        let header_size = sparse_header.chunk_hdr_size.to_native() as u64;
         let block_size = sparse_header.blk_sz.to_native() as u64;
         let chunks = (0..sparse_header.total_chunks.to_native())
-            .filter_map(|_| parse_chunk(&mut file, header_size, block_size).transpose())
+            .filter_map(|_| parse_chunk(&mut file, block_size).transpose())
             .collect::<Result<Vec<ChunkWithSize>>>()?;
         let total_size =
             sparse_header.total_blks.to_native() as u64 * sparse_header.blk_sz.to_native() as u64;
@@ -215,7 +218,7 @@ impl AndroidSparse {
             total_size: size,
             chunks: chunks_map,
         };
-        let calculated_len = image.get_len().map_err(Error::ReadSpecificationError)?;
+        let calculated_len: u64 = image.chunks.iter().map(|x| x.1.expanded_size).sum();
         if calculated_len != size {
             return Err(Error::InvalidSpecification(format!(
                 "Header promised size {}, chunks added up to {}",
@@ -363,7 +366,7 @@ mod tests {
         chunk_bytes.extend_from_slice(header_bytes);
         chunk_bytes.extend_from_slice(&[0u8; 123]);
         let mut chunk_cursor = Cursor::new(chunk_bytes);
-        let chunk = parse_chunk(&mut chunk_cursor, CHUNK_SIZE as u64, 123)
+        let chunk = parse_chunk(&mut chunk_cursor, 123)
             .expect("Failed to parse")
             .expect("Failed to determine chunk type");
         let expected_chunk = ChunkWithSize {
@@ -383,7 +386,7 @@ mod tests {
         };
         let header_bytes = chunk_raw.as_slice();
         let mut chunk_cursor = Cursor::new(header_bytes);
-        let chunk = parse_chunk(&mut chunk_cursor, CHUNK_SIZE as u64, 123)
+        let chunk = parse_chunk(&mut chunk_cursor, 123)
             .expect("Failed to parse")
             .expect("Failed to determine chunk type");
         let expected_chunk = ChunkWithSize {
@@ -406,11 +409,11 @@ mod tests {
         chunk_bytes.extend_from_slice(header_bytes);
         chunk_bytes.extend_from_slice(&[123u8; 4]);
         let mut chunk_cursor = Cursor::new(chunk_bytes);
-        let chunk = parse_chunk(&mut chunk_cursor, CHUNK_SIZE as u64, 123)
+        let chunk = parse_chunk(&mut chunk_cursor, 123)
             .expect("Failed to parse")
             .expect("Failed to determine chunk type");
         let expected_chunk = ChunkWithSize {
-            chunk: Chunk::Fill(vec![123, 123, 123, 123]),
+            chunk: Chunk::Fill([123, 123, 123, 123]),
             expanded_size: 12300,
         };
         assert_eq!(expected_chunk, chunk);
@@ -429,8 +432,7 @@ mod tests {
         chunk_bytes.extend_from_slice(header_bytes);
         chunk_bytes.extend_from_slice(&[123u8; 4]);
         let mut chunk_cursor = Cursor::new(chunk_bytes);
-        let chunk =
-            parse_chunk(&mut chunk_cursor, CHUNK_SIZE as u64, 123).expect("Failed to parse");
+        let chunk = parse_chunk(&mut chunk_cursor, 123).expect("Failed to parse");
         assert_eq!(None, chunk);
     }
 
@@ -458,7 +460,7 @@ mod tests {
     #[test]
     fn read_fill_simple() {
         let chunks = vec![ChunkWithSize {
-            chunk: Chunk::Fill(vec![10, 20]),
+            chunk: Chunk::Fill([10, 20, 10, 20]),
             expanded_size: 8,
         }];
         let mut image = test_image(chunks);
@@ -473,7 +475,7 @@ mod tests {
     #[test]
     fn read_fill_edges() {
         let chunks = vec![ChunkWithSize {
-            chunk: Chunk::Fill(vec![10, 20, 30]),
+            chunk: Chunk::Fill([10, 20, 30, 40]),
             expanded_size: 8,
         }];
         let mut image = test_image(chunks);
@@ -481,7 +483,7 @@ mod tests {
         image
             .read_exact_at_volatile(VolatileSlice::new(&mut input_memory[..]), 1)
             .expect("Could not read");
-        let expected = [20, 30, 10, 20, 30, 10];
+        let expected = [20, 30, 40, 10, 20, 30];
         assert_eq!(&expected[..], &input_memory[..]);
     }
 
@@ -493,7 +495,7 @@ mod tests {
                 expanded_size: 20,
             },
             ChunkWithSize {
-                chunk: Chunk::Fill(vec![10, 20, 30]),
+                chunk: Chunk::Fill([10, 20, 30, 40]),
                 expanded_size: 100,
             },
         ];
@@ -502,7 +504,7 @@ mod tests {
         image
             .read_exact_at_volatile(VolatileSlice::new(&mut input_memory[..]), 39)
             .expect("Could not read");
-        let expected = [20, 30, 10, 20, 30, 10, 20];
+        let expected = [40, 10, 20, 30, 40, 10, 20];
         assert_eq!(&expected[..], &input_memory[..]);
     }
 
@@ -526,11 +528,11 @@ mod tests {
     fn read_two_fills() {
         let chunks = vec![
             ChunkWithSize {
-                chunk: Chunk::Fill(vec![10, 20]),
+                chunk: Chunk::Fill([10, 20, 10, 20]),
                 expanded_size: 4,
             },
             ChunkWithSize {
-                chunk: Chunk::Fill(vec![30, 40]),
+                chunk: Chunk::Fill([30, 40, 30, 40]),
                 expanded_size: 4,
             },
         ];

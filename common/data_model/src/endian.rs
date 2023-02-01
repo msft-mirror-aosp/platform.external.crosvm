@@ -1,4 +1,4 @@
-// Copyright 2017 The Chromium OS Authors. All rights reserved.
+// Copyright 2017 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -30,10 +30,14 @@
 //!   assert_ne!(b_trans, l_trans);
 //! ```
 
-use std::mem::{align_of, size_of};
+use std::mem::align_of;
+use std::mem::size_of;
 
-use assertions::const_assert;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
+use static_assertions::const_assert;
 
 use crate::DataInit;
 
@@ -122,10 +126,10 @@ endian_type!(isize, SBeSize, to_be, from_be);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::convert::From;
     use std::mem::transmute;
+
+    use super::*;
 
     #[cfg(target_endian = "little")]
     const NATIVE_LITTLE: bool = true;

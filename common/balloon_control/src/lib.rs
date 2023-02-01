@@ -1,8 +1,9 @@
-// Copyright 2022 The Chromium OS Authors. All rights reserved.
+// Copyright 2022 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 // Balloon commands that are send on the balloon command tube.
 #[derive(Serialize, Deserialize, Debug)]
@@ -28,7 +29,7 @@ pub enum BalloonTubeCommand {
 }
 
 // BalloonStats holds stats returned from the stats_queue.
-#[derive(Default, Serialize, Deserialize, Debug)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct BalloonStats {
     pub swap_in: Option<u64>,
     pub swap_out: Option<u64>,

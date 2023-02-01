@@ -1,4 +1,4 @@
-// Copyright 2021 The Chromium OS Authors. All rights reserved.
+// Copyright 2021 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -38,9 +38,8 @@ pub fn enter() -> anyhow::Result<ExecutionGuard> {
 
 #[cfg(test)]
 mod test {
-    use crate::Executor;
-
     use super::NestedExecutionNotSupported;
+    use crate::Executor;
 
     #[test]
     fn nested_execution() {

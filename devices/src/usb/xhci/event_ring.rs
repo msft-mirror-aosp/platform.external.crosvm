@@ -1,13 +1,17 @@
-// Copyright 2018 The Chromium OS Authors. All rights reserved.
+// Copyright 2018 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::mem::size_of;
+use std::sync::atomic::fence;
+use std::sync::atomic::Ordering;
+
 use data_model::DataInit;
 use remain::sorted;
-use std::mem::size_of;
-use std::sync::atomic::{fence, Ordering};
 use thiserror::Error;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError};
+use vm_memory::GuestAddress;
+use vm_memory::GuestMemory;
+use vm_memory::GuestMemoryError;
 
 use super::xhci_abi::*;
 
@@ -206,8 +210,9 @@ impl EventRing {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::mem::size_of;
+
+    use super::*;
 
     #[test]
     fn test_uninited() {

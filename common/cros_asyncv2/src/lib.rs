@@ -1,4 +1,4 @@
-// Copyright 2021 The Chromium OS Authors. All rights reserved.
+// Copyright 2021 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -86,6 +86,8 @@
 //! [`abortable`](futures::future::abortable). However keep in mind that on backends like io_uring,
 //! cancelling the future may not cancel the underlying IO operation.
 
+#![cfg(unix)]
+
 mod blocking;
 mod enter;
 mod event;
@@ -98,11 +100,19 @@ mod timer;
 #[cfg_attr(unix, path = "unix/mod.rs")]
 mod sys;
 
-pub use blocking::{block_on, BlockingPool};
+pub use blocking::block_on;
+pub use blocking::BlockingPool;
 pub use event::Event;
 pub use executor::Executor;
 pub use file::File;
-pub use iobuf::{AsIoBufs, OwnedIoBuf};
+pub use iobuf::AsIoBufs;
+pub use iobuf::OwnedIoBuf;
 #[cfg(unix)]
-pub use sys::{Descriptor, SeqPacket as UnixSeqPacket, SeqPacketListener as UnixSeqPacketListener};
-pub use timer::{with_deadline, TimedOut, Timer};
+pub use sys::Descriptor;
+#[cfg(unix)]
+pub use sys::SeqPacket as UnixSeqPacket;
+#[cfg(unix)]
+pub use sys::SeqPacketListener as UnixSeqPacketListener;
+pub use timer::with_deadline;
+pub use timer::TimedOut;
+pub use timer::Timer;

@@ -1,49 +1,78 @@
-// Copyright 2019 The Chromium OS Authors. All rights reserved.
+// Copyright 2019 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
-    borrow::Cow,
-    cmp,
-    collections::{btree_map, BTreeMap},
-    ffi::{CStr, CString},
-    fs::File,
-    io,
-    mem::{self, size_of, MaybeUninit},
-    os::raw::{c_int, c_long},
-    ptr::{addr_of, addr_of_mut},
-    str::FromStr,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::borrow::Cow;
+use std::cmp;
+use std::collections::btree_map;
+use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::fs::File;
+use std::io;
+use std::mem;
+use std::mem::size_of;
+use std::mem::MaybeUninit;
+use std::os::raw::c_int;
+use std::os::raw::c_long;
+use std::ptr::addr_of;
+use std::ptr::addr_of_mut;
+use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 
-use base::{
-    error, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr, ioctl_with_mut_ptr, ioctl_with_ptr, syscall,
-    AsRawDescriptor, FileFlags, FromRawDescriptor, RawDescriptor,
-};
+use base::error;
+use base::ioctl_ior_nr;
+use base::ioctl_iow_nr;
+use base::ioctl_iowr_nr;
+use base::ioctl_with_mut_ptr;
+use base::ioctl_with_ptr;
+use base::syscall;
+use base::AsRawDescriptor;
+use base::FileFlags;
+use base::FromRawDescriptor;
+use base::RawDescriptor;
 use data_model::DataInit;
-use fuse::filesystem::{
-    Context, DirectoryIterator, Entry, FileSystem, FsOptions, GetxattrReply, IoctlFlags,
-    IoctlReply, ListxattrReply, OpenOptions, RemoveMappingOne, SetattrValid, ZeroCopyReader,
-    ZeroCopyWriter, ROOT_ID,
-};
+use fuse::filesystem::Context;
+use fuse::filesystem::DirectoryIterator;
+use fuse::filesystem::Entry;
+use fuse::filesystem::FileSystem;
+use fuse::filesystem::FsOptions;
+use fuse::filesystem::GetxattrReply;
+use fuse::filesystem::IoctlFlags;
+use fuse::filesystem::IoctlReply;
+use fuse::filesystem::ListxattrReply;
+use fuse::filesystem::OpenOptions;
+use fuse::filesystem::RemoveMappingOne;
+use fuse::filesystem::SetattrValid;
+use fuse::filesystem::ZeroCopyReader;
+use fuse::filesystem::ZeroCopyWriter;
+use fuse::filesystem::ROOT_ID;
 use fuse::sys::WRITE_KILL_PRIV;
 use fuse::Mapper;
+#[cfg(feature = "arc_quota")]
+use protobuf::Message;
+use serde::Deserialize;
+use serde::Serialize;
 use sync::Mutex;
+#[cfg(feature = "arc_quota")]
+use system_api::client::OrgChromiumArcQuota;
+#[cfg(feature = "arc_quota")]
+use system_api::UserDataAuth::SetMediaRWDataFileProjectIdReply;
+#[cfg(feature = "arc_quota")]
+use system_api::UserDataAuth::SetMediaRWDataFileProjectIdRequest;
+#[cfg(feature = "arc_quota")]
+use system_api::UserDataAuth::SetMediaRWDataFileProjectInheritanceFlagReply;
+#[cfg(feature = "arc_quota")]
+use system_api::UserDataAuth::SetMediaRWDataFileProjectInheritanceFlagRequest;
 
-#[cfg(feature = "chromeos")]
-use {
-    protobuf::Message,
-    system_api::client::OrgChromiumArcQuota,
-    system_api::UserDataAuth::{
-        SetMediaRWDataFileProjectIdReply, SetMediaRWDataFileProjectIdRequest,
-    },
-};
-
-use crate::virtio::fs::caps::{Capability, Caps, Set as CapSet, Value as CapValue};
+use crate::virtio::fs::caps::Capability;
+use crate::virtio::fs::caps::Caps;
+use crate::virtio::fs::caps::Set as CapSet;
+use crate::virtio::fs::caps::Value as CapValue;
 use crate::virtio::fs::multikey::MultikeyBTreeMap;
 use crate::virtio::fs::read_dir::ReadDir;
 
@@ -58,8 +87,11 @@ const SELINUX_XATTR: &[u8] = b"security.selinux";
 const FSCRYPT_KEY_DESCRIPTOR_SIZE: usize = 8;
 const FSCRYPT_KEY_IDENTIFIER_SIZE: usize = 16;
 
+#[cfg(feature = "arc_quota")]
+const FS_PROJINHERIT_FL: c_int = 0x20000000;
+
 // 25 seconds is the default timeout for dbus-send.
-#[cfg(feature = "chromeos")]
+#[cfg(feature = "arc_quota")]
 const DEFAULT_DBUS_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[repr(C)]
@@ -396,7 +428,7 @@ fn statat<D: AsRawDescriptor>(dir: &D, name: &CStr) -> io::Result<libc::stat64> 
 /// The caching policy that the file system should report to the FUSE client. By default the FUSE
 /// protocol uses close-to-open consistency. This means that any cached contents of the file are
 /// invalidated the next time that file is opened.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CachePolicy {
     /// The client should never cache file data and all I/O should be directly forwarded to the
     /// server. This policy must be selected when file contents may change without the knowledge of
@@ -434,7 +466,7 @@ impl Default for CachePolicy {
 }
 
 /// Options that configure the behavior of the file system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// How long the FUSE client should consider directory entries to be valid. If the contents of a
     /// directory can only be modified by the FUSE client (i.e., the file system has exclusive
@@ -487,7 +519,7 @@ pub struct Config {
     // check so we consult this list when the VM tries to set the project quota and the process uid
     // doesn't match the owner uid. In that case, all uids in this list are treated as if they have
     // CAP_FOWNER.
-    #[cfg(feature = "chromeos")]
+    #[cfg(feature = "arc_quota")]
     pub privileged_quota_uids: Vec<libc::uid_t>,
 
     /// Use DAX for shared files.
@@ -519,7 +551,7 @@ impl Default for Config {
             writeback: false,
             rewrite_security_xattrs: false,
             ascii_casefold: false,
-            #[cfg(feature = "chromeos")]
+            #[cfg(feature = "arc_quota")]
             privileged_quota_uids: Default::default(),
             use_dax: false,
             posix_acl: true,
@@ -533,6 +565,9 @@ impl Default for Config {
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
 pub struct PassthroughFs {
+    // Mutex that must be acquired before executing a process-wide operation such as fchdir.
+    process_lock: Mutex<()>,
+
     // File descriptors for various points in the file system tree.
     inodes: Mutex<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
     next_inode: AtomicU64,
@@ -559,9 +594,9 @@ pub struct PassthroughFs {
     zero_message_opendir: AtomicBool,
 
     // Used to communicate with other processes using D-Bus.
-    #[cfg(feature = "chromeos")]
+    #[cfg(feature = "arc_quota")]
     dbus_connection: Option<Mutex<dbus::blocking::Connection>>,
-    #[cfg(feature = "chromeos")]
+    #[cfg(feature = "arc_quota")]
     dbus_fd: Option<std::os::unix::io::RawFd>,
 
     cfg: Config,
@@ -582,7 +617,7 @@ impl PassthroughFs {
         })?;
 
         // Privileged UIDs can use D-Bus to perform some operations.
-        #[cfg(feature = "chromeos")]
+        #[cfg(feature = "arc_quota")]
         let (dbus_connection, dbus_fd) = if cfg.privileged_quota_uids.is_empty() {
             (None, None)
         } else {
@@ -601,6 +636,7 @@ impl PassthroughFs {
         let proc = unsafe { File::from_raw_descriptor(raw_descriptor) };
 
         Ok(PassthroughFs {
+            process_lock: Mutex::new(()),
             inodes: Mutex::new(MultikeyBTreeMap::new()),
             next_inode: AtomicU64::new(ROOT_ID + 1),
 
@@ -613,9 +649,9 @@ impl PassthroughFs {
             zero_message_open: AtomicBool::new(false),
             zero_message_opendir: AtomicBool::new(false),
 
-            #[cfg(feature = "chromeos")]
+            #[cfg(feature = "arc_quota")]
             dbus_connection,
-            #[cfg(feature = "chromeos")]
+            #[cfg(feature = "arc_quota")]
             dbus_fd,
 
             cfg,
@@ -627,9 +663,9 @@ impl PassthroughFs {
     }
 
     pub fn keep_rds(&self) -> Vec<RawDescriptor> {
-        #[cfg_attr(not(feature = "chromeos"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "arc_quota"), allow(unused_mut))]
         let mut keep_rds = vec![self.proc.as_raw_descriptor()];
-        #[cfg(feature = "chromeos")]
+        #[cfg(feature = "arc_quota")]
         if let Some(fd) = self.dbus_fd {
             keep_rds.push(fd);
         }
@@ -715,29 +751,31 @@ impl PassthroughFs {
         self.open_fd(inode.as_raw_descriptor(), flags)
     }
 
+    // Increases the inode refcount and returns the inode.
+    fn increase_inode_refcount(&self, inode_data: &InodeData) -> Inode {
+        // Matches with the release store in `forget`.
+        inode_data.refcount.fetch_add(1, Ordering::Acquire);
+        inode_data.inode
+    }
+
     // Creates a new entry for `f` or increases the refcount of the existing entry for `f`.
+    // The inodes mutex lock must not be already taken by the same thread otherwise this
+    // will deadlock.
     fn add_entry(&self, f: File, st: libc::stat64, open_flags: libc::c_int) -> Entry {
+        let mut inodes = self.inodes.lock();
+
         let altkey = InodeAltKey {
             ino: st.st_ino,
             dev: st.st_dev,
         };
-        let data = self.inodes.lock().get_alt(&altkey).map(Arc::clone);
 
-        let inode = if let Some(data) = data {
-            // Matches with the release store in `forget`.
-            data.refcount.fetch_add(1, Ordering::Acquire);
-            data.inode
+        let inode = if let Some(data) = inodes.get_alt(&altkey) {
+            self.increase_inode_refcount(data)
         } else {
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
             let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            self.inodes.lock().insert(
+            inodes.insert(
                 inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                },
+                altkey,
                 Arc::new(InodeData {
                     inode,
                     file: Mutex::new((f, open_flags)),
@@ -781,22 +819,70 @@ impl PassthroughFs {
     fn do_lookup(&self, parent: &InodeData, name: &CStr) -> io::Result<Entry> {
         let st = statat(parent, name)?;
 
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+        };
+
+        // Check if we already have an entry before opening a new file.
+        if let Some(data) = self.inodes.lock().get_alt(&altkey) {
+            // Return the same inode with the reference counter increased.
+            return Ok(Entry {
+                inode: self.increase_inode_refcount(data),
+                generation: 0,
+                attr: st,
+                attr_timeout: self.cfg.attr_timeout,
+                entry_timeout: self.cfg.entry_timeout,
+            });
+        }
+
+        // Open a regular file with O_RDONLY to store in `InodeData` so explicit open requests can
+        // be skipped later if the ZERO_MESSAGE_{OPEN,OPENDIR} features are enabled.
+        // If the crosvm process doesn't have a read permission, fall back to O_PATH below.
         let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         match FileType::from(st.st_mode) {
             FileType::Regular => {}
             FileType::Directory => flags |= libc::O_DIRECTORY,
             FileType::Other => flags |= libc::O_PATH,
-        }
+        };
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let f = unsafe {
-            File::from_raw_descriptor(syscall!(libc::openat64(
+        let fd = match unsafe {
+            syscall!(libc::openat64(
                 parent.as_raw_descriptor(),
                 name.as_ptr(),
                 flags
-            ))?)
+            ))
+        } {
+            Ok(fd) => fd,
+            Err(e) if e.errno() == libc::EACCES => {
+                // If O_RDONLY is unavailable, fall back to O_PATH to get an FD to store in
+                // `InodeData`.
+                // Note that some operations which should be allowed without read permissions
+                // require syscalls that don't support O_PATH fds. For those syscalls, we will
+                // need to fall back to their path-based equivalents with /self/fd/${FD}.
+                // e.g. `fgetxattr()` for an O_PATH FD fails while `getxaattr()` for /self/fd/${FD}
+                // works.
+                flags |= libc::O_PATH;
+                // Safe because this doesn't modify any memory and we check the return value.
+                unsafe {
+                    syscall!(libc::openat64(
+                        parent.as_raw_descriptor(),
+                        name.as_ptr(),
+                        flags
+                    ))
+                }?
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
         };
 
+        // Safe because we own the fd.
+        let f = unsafe { File::from_raw_descriptor(fd) };
+        // We made sure the lock acquired for `self.inodes` is released automatically when
+        // the if block above is exited, so a call to `self.add_entry()` should not cause a deadlock
+        // here. This would not be the case if this were executed in an else block instead.
         Ok(self.add_entry(f, st, flags))
     }
 
@@ -874,12 +960,17 @@ impl PassthroughFs {
     // directory. This effectively emulates an *at syscall starting at /proc, which is useful when
     // there is no *at syscall available. Panics if any of the fchdir calls fail or if there is no
     // root inode.
+    //
+    // NOTE: this method acquires an `self`-wide lock. If any locks are acquired in `f`, care must
+    // be taken to avoid the risk of deadlocks.
     fn with_proc_chdir<F, T>(&self, f: F) -> T
     where
         F: FnOnce() -> T,
     {
         let root = self.find_inode(ROOT_ID).expect("failed to find root inode");
 
+        // Acquire a lock for `fchdir`.
+        let _proc_lock = self.process_lock.lock();
         // Safe because this doesn't modify any memory and we check the return value. Since the
         // fchdir should never fail we just use debug_asserts.
         let proc_cwd = unsafe { libc::fchdir(self.proc.as_raw_descriptor()) };
@@ -906,11 +997,13 @@ impl PassthroughFs {
     }
 
     fn do_getxattr(&self, inode: &InodeData, name: &CStr, value: &mut [u8]) -> io::Result<usize> {
-        let res = if inode.filetype == FileType::Other {
-            // For non-regular files and directories, we cannot open the fd normally. Instead we
+        let file = inode.file.lock();
+        let o_path_file = (file.1 & libc::O_PATH) != 0;
+        let res = if o_path_file {
+            // For FDs opened with `O_PATH`, we cannot call `fgetxattr` normally. Instead we
             // emulate an _at syscall by changing the CWD to /proc, running the path based syscall,
-            // and then setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", inode.as_raw_descriptor()))
+            //  and then setting the CWD back to the root directory.
+            let path = CString::new(format!("self/fd/{}", file.0.as_raw_descriptor()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             // Safe because this will only modify `value` and we check the return value.
@@ -927,7 +1020,7 @@ impl PassthroughFs {
             // only write to `value` and we check the return value.
             unsafe {
                 libc::fgetxattr(
-                    inode.as_raw_descriptor(),
+                    file.0.as_raw_descriptor(),
                     name.as_ptr(),
                     value.as_mut_ptr() as *mut libc::c_void,
                     value.len() as libc::size_t,
@@ -994,7 +1087,7 @@ impl PassthroughFs {
 
     fn set_fsxattr<R: io::Read>(
         &self,
-        #[cfg_attr(not(feature = "chromeos"), allow(unused_variables))] ctx: Context,
+        #[cfg_attr(not(feature = "arc_quota"), allow(unused_variables))] ctx: Context,
         inode: Inode,
         handle: Handle,
         r: R,
@@ -1007,12 +1100,12 @@ impl PassthroughFs {
 
         let in_attr = fsxattr::from_reader(r)?;
 
-        #[cfg(feature = "chromeos")]
+        #[cfg(feature = "arc_quota")]
         let st = stat(&*data)?;
 
         // Changing quota project ID requires CAP_FOWNER or being file owner.
         // Here we use privileged_quota_uids because we cannot perform a CAP_FOWNER check.
-        #[cfg(feature = "chromeos")]
+        #[cfg(feature = "arc_quota")]
         if ctx.uid == st.st_uid || self.cfg.privileged_quota_uids.contains(&ctx.uid) {
             // Get the current fsxattr.
             let mut buf = MaybeUninit::<fsxattr>::zeroed();
@@ -1039,7 +1132,7 @@ impl PassthroughFs {
                 let fd = unsafe { dbus::arg::OwnedFd::new(base::clone_descriptor(&*data)?) };
                 match proxy.set_media_rwdata_file_project_id(fd, proto.write_to_bytes().unwrap()) {
                     Ok(r) => {
-                        let r = protobuf::parse_from_bytes::<SetMediaRWDataFileProjectIdReply>(&r)
+                        let r = SetMediaRWDataFileProjectIdReply::parse_from_bytes(&r)
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                         if !r.success {
                             return Ok(IoctlReply::Done(Err(io::Error::from_raw_os_error(
@@ -1082,7 +1175,13 @@ impl PassthroughFs {
         }
     }
 
-    fn set_flags<R: io::Read>(&self, inode: Inode, handle: Handle, r: R) -> io::Result<IoctlReply> {
+    fn set_flags<R: io::Read>(
+        &self,
+        #[cfg_attr(not(feature = "arc_quota"), allow(unused_variables))] ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        r: R,
+    ) -> io::Result<IoctlReply> {
         let data: Arc<dyn AsRawDescriptor> = if self.zero_message_open.load(Ordering::Relaxed) {
             self.find_inode(inode)?
         } else {
@@ -1090,10 +1189,61 @@ impl PassthroughFs {
         };
 
         // The ioctl encoding is a long but the parameter is actually an int.
-        let flags = c_int::from_reader(r)?;
+        let in_flags = c_int::from_reader(r)?;
+
+        #[cfg(feature = "arc_quota")]
+        let st = stat(&*data)?;
+
+        // Only privleged uid can perform FS_IOC_SETFLAGS through cryptohome.
+        #[cfg(feature = "arc_quota")]
+        if ctx.uid == st.st_uid || self.cfg.privileged_quota_uids.contains(&ctx.uid) {
+            // Get the current flag.
+            let mut buf = MaybeUninit::<c_int>::zeroed();
+            // Safe because the kernel will only write to `buf` and we check the return value.
+            let res = unsafe { ioctl_with_mut_ptr(&*data, FS_IOC_GETFLAGS(), buf.as_mut_ptr()) };
+            if res < 0 {
+                return Ok(IoctlReply::Done(Err(io::Error::last_os_error())));
+            }
+            // Safe because the kernel guarantees that the policy is now initialized.
+            let current_flags = unsafe { buf.assume_init() };
+
+            // Project inheritance flag cannot be changed inside a user namespace.
+            // Use UserDataAuth to avoid this restriction.
+            if (in_flags & FS_PROJINHERIT_FL) != (current_flags & FS_PROJINHERIT_FL) {
+                let connection = self.dbus_connection.as_ref().unwrap().lock();
+                let proxy = connection.with_proxy(
+                    "org.chromium.UserDataAuth",
+                    "/org/chromium/UserDataAuth",
+                    DEFAULT_DBUS_TIMEOUT,
+                );
+                let mut proto: SetMediaRWDataFileProjectInheritanceFlagRequest = Message::new();
+                // If the input flags contain FS_PROJINHERIT_FL, then it is a set. Otherwise it is a
+                // reset.
+                proto.enable = (in_flags & FS_PROJINHERIT_FL) == FS_PROJINHERIT_FL;
+                // Safe because data is a valid file descriptor.
+                let fd = unsafe { dbus::arg::OwnedFd::new(base::clone_descriptor(&*data)?) };
+                match proxy.set_media_rwdata_file_project_inheritance_flag(
+                    fd,
+                    proto.write_to_bytes().unwrap(),
+                ) {
+                    Ok(r) => {
+                        let r = SetMediaRWDataFileProjectInheritanceFlagReply::parse_from_bytes(&r)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        if !r.success {
+                            return Ok(IoctlReply::Done(Err(io::Error::from_raw_os_error(
+                                r.error,
+                            ))));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(io::Error::new(io::ErrorKind::Other, e));
+                    }
+                };
+            }
+        }
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { ioctl_with_ptr(&*data, FS_IOC_SETFLAGS(), &flags) };
+        let res = unsafe { ioctl_with_ptr(&*data, FS_IOC_SETFLAGS(), &in_flags) };
         if res < 0 {
             Ok(IoctlReply::Done(Err(io::Error::last_os_error())))
         } else {
@@ -2100,12 +2250,13 @@ impl FileSystem for PassthroughFs {
 
         let data = self.find_inode(inode)?;
         let name = self.rewrite_xattr_name(name);
-
-        if data.filetype == FileType::Other {
-            // For non-regular files and directories, we cannot open the fd normally. Instead we
-            // emulate an _at syscall by changing the CWD to /proc, running the path based syscall,
-            // and then setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", data.as_raw_descriptor()))
+        let file = data.file.lock();
+        let o_path_file = (file.1 & libc::O_PATH) != 0;
+        if o_path_file {
+            // For FDs opened with `O_PATH`, we cannot call `fsetxattr` normally. Instead we emulate
+            // an _at syscall by changing the CWD to /proc, running the path based syscall, and then
+            // setting the CWD back to the root directory.
+            let path = CString::new(format!("self/fd/{}", file.0.as_raw_descriptor()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             // Safe because this doesn't modify any memory and we check the return value.
@@ -2125,7 +2276,7 @@ impl FileSystem for PassthroughFs {
             // doesn't modify any memory and we check the return value.
             syscall!(unsafe {
                 libc::fsetxattr(
-                    data.as_raw_descriptor(),
+                    file.0.as_raw_descriptor(),
                     name.as_ptr(),
                     value.as_ptr() as *const libc::c_void,
                     value.len() as libc::size_t,
@@ -2169,11 +2320,13 @@ impl FileSystem for PassthroughFs {
 
         let mut buf = vec![0u8; size as usize];
 
-        let res = if data.filetype == FileType::Other {
-            // For non-regular files and directories, we cannot open the fd normally. Instead we
+        let file = data.file.lock();
+        let o_path_file = (file.1 & libc::O_PATH) != 0;
+        let res = if o_path_file {
+            // For FDs opened with `O_PATH`, we cannot call `flistxattr` normally. Instead we
             // emulate an _at syscall by changing the CWD to /proc, running the path based syscall,
             // and then setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", data.as_raw_descriptor()))
+            let path = CString::new(format!("self/fd/{}", file.0.as_raw_descriptor()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             // Safe because this will only modify `buf` and we check the return value.
@@ -2189,7 +2342,7 @@ impl FileSystem for PassthroughFs {
             // write to `buf` and we check the return value.
             syscall!(unsafe {
                 libc::flistxattr(
-                    data.as_raw_descriptor(),
+                    file.0.as_raw_descriptor(),
                     buf.as_mut_ptr() as *mut libc::c_char,
                     buf.len() as libc::size_t,
                 )
@@ -2218,11 +2371,13 @@ impl FileSystem for PassthroughFs {
         let data = self.find_inode(inode)?;
         let name = self.rewrite_xattr_name(name);
 
-        if data.filetype == FileType::Other {
-            // For non-regular files and directories, we cannot open the fd normally. Instead we
+        let file = data.file.lock();
+        let o_path_file = (file.1 & libc::O_PATH) != 0;
+        if o_path_file {
+            // For files opened with `O_PATH`, we cannot call `fremovexattr` normally. Instead we
             // emulate an _at syscall by changing the CWD to /proc, running the path based syscall,
             // and then setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", data.as_raw_descriptor()))
+            let path = CString::new(format!("self/fd/{}", file.0.as_raw_descriptor()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             // Safe because this doesn't modify any memory and we check the return value.
@@ -2232,7 +2387,7 @@ impl FileSystem for PassthroughFs {
         } else {
             // For regular files and directories, we can just use fremovexattr. Safe because this
             // doesn't modify any memory and we check the return value.
-            syscall!(unsafe { libc::fremovexattr(data.as_raw_descriptor(), name.as_ptr()) })?;
+            syscall!(unsafe { libc::fremovexattr(file.0.as_raw_descriptor(), name.as_ptr()) })?;
         }
 
         Ok(())
@@ -2336,7 +2491,7 @@ impl FileSystem for PassthroughFs {
                 if in_size < size_of::<c_int>() as u32 {
                     Err(io::Error::from_raw_os_error(libc::ENOMEM))
                 } else {
-                    self.set_flags(inode, handle, r)
+                    self.set_flags(ctx, inode, handle, r)
                 }
             }
             ENABLE_VERITY => {

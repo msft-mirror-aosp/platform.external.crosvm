@@ -1,11 +1,15 @@
-// Copyright 2021 The Chromium OS Authors. All rights reserved.
+// Copyright 2021 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{convert::TryFrom, io, mem::size_of, sync::Arc};
+use std::convert::TryFrom;
+use std::io;
+use std::mem::size_of;
+use std::sync::Arc;
 
-use anyhow::{ensure, Context};
-use sys_util::{EventFd, SafeDescriptor};
+use anyhow::ensure;
+use anyhow::Context;
+use base::SafeDescriptor;
 
 use super::io_driver;
 
@@ -16,7 +20,7 @@ pub struct Event {
 
 impl Event {
     pub fn new() -> anyhow::Result<Event> {
-        EventFd::new()
+        base::Event::new()
             .map_err(io::Error::from)
             .context("failed to create eventfd")
             .and_then(Event::try_from)
@@ -55,10 +59,10 @@ impl Event {
     }
 }
 
-impl TryFrom<EventFd> for Event {
+impl TryFrom<base::Event> for Event {
     type Error = anyhow::Error;
 
-    fn try_from(evt: EventFd) -> anyhow::Result<Event> {
+    fn try_from(evt: base::Event) -> anyhow::Result<Event> {
         io_driver::prepare(&evt)?;
         Ok(Event {
             fd: Arc::new(SafeDescriptor::from(evt)),

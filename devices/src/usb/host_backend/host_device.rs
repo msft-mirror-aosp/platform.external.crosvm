@@ -1,30 +1,43 @@
-// Copyright 2019 The Chromium OS Authors. All rights reserved.
+// Copyright 2019 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::HashMap;
+use std::mem;
 use std::mem::drop;
 use std::sync::Arc;
 
+use base::error;
+use base::warn;
+use data_model::DataInit;
+use sync::Mutex;
+use usb_util::ConfigDescriptorTree;
+use usb_util::ControlRequestDataPhaseTransferDirection;
+use usb_util::ControlRequestRecipient;
+use usb_util::DescriptorHeader;
+use usb_util::DescriptorType;
+use usb_util::Device;
+use usb_util::InterfaceDescriptor;
+use usb_util::StandardControlRequest;
+use usb_util::Transfer;
+use usb_util::TransferStatus;
+use usb_util::UsbRequestSetup;
+
 use super::error::*;
 use super::usb_endpoint::UsbEndpoint;
-use super::utils::{submit_transfer, update_transfer_state};
+use super::utils::submit_transfer;
+use super::utils::update_transfer_state;
 use crate::usb::xhci::scatter_gather_buffer::ScatterGatherBuffer;
-use crate::usb::xhci::xhci_backend_device::{BackendType, UsbDeviceAddress, XhciBackendDevice};
-use crate::usb::xhci::xhci_transfer::{XhciTransfer, XhciTransferState, XhciTransferType};
+use crate::usb::xhci::xhci_backend_device::BackendType;
+use crate::usb::xhci::xhci_backend_device::UsbDeviceAddress;
+use crate::usb::xhci::xhci_backend_device::XhciBackendDevice;
+use crate::usb::xhci::xhci_transfer::XhciTransfer;
+use crate::usb::xhci::xhci_transfer::XhciTransferState;
+use crate::usb::xhci::xhci_transfer::XhciTransferType;
 use crate::utils::AsyncJobQueue;
 use crate::utils::FailHandle;
-use base::{error, warn};
-use data_model::DataInit;
-use std::collections::HashMap;
-use std::mem;
-use sync::Mutex;
-use usb_util::{
-    ConfigDescriptorTree, ControlRequestDataPhaseTransferDirection, ControlRequestRecipient,
-    DescriptorHeader, DescriptorType, Device, InterfaceDescriptor, StandardControlRequest,
-    Transfer, TransferStatus, UsbRequestSetup,
-};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum ControlEndpointState {
     /// Control endpoint should receive setup stage next.
     SetupStage,
@@ -46,6 +59,7 @@ pub struct HostDevice {
     claimed_interfaces: Vec<u8>,
     control_request_setup: UsbRequestSetup,
     executed: bool,
+    initialized: bool,
     job_queue: Arc<AsyncJobQueue>,
 }
 
@@ -71,6 +85,7 @@ impl HostDevice {
             claimed_interfaces: vec![],
             control_request_setup: UsbRequestSetup::new(0, 0, 0, 0, 0),
             executed: false,
+            initialized: false,
             job_queue,
         };
 
@@ -352,7 +367,14 @@ impl HostDevice {
                 None
             }
         };
-        if Some(config) != cur_config {
+
+        let mut need_set_config = true;
+        if !self.initialized {
+            need_set_config = Some(config) != cur_config;
+            self.initialized = true;
+        }
+
+        if need_set_config {
             self.device
                 .lock()
                 .set_active_configuration(config)

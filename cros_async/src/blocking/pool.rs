@@ -1,24 +1,25 @@
-// Copyright 2021 The Chromium OS Authors. All rights reserved.
+// Copyright 2021 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
-    collections::VecDeque,
-    mem,
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc,
-    },
-    thread::{
-        JoinHandle, {self},
-    },
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
+use std::mem;
+use std::sync::mpsc::channel;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::time::Instant;
 
-use async_task::{Runnable, Task};
-use base::{error, warn};
+use async_task::Runnable;
+use async_task::Task;
+use base::error;
+use base::warn;
 use slab::Slab;
-use sync::{Condvar, Mutex};
+use sync::Condvar;
+use sync::Mutex;
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -134,6 +135,24 @@ impl Inner {
             state.num_notified += 1;
             self.condvar.notify_one();
         }
+    }
+
+    pub fn spawn<F, R>(self: &Arc<Self>, f: F) -> Task<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let raw = Arc::downgrade(self);
+        let schedule = move |runnable| {
+            if let Some(i) = raw.upgrade() {
+                i.schedule(runnable);
+            }
+        };
+
+        let (runnable, task) = async_task::spawn(async move { f() }, schedule);
+        runnable.schedule();
+
+        task
     }
 }
 
@@ -253,17 +272,7 @@ impl BlockingPool {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let raw = Arc::downgrade(&self.inner);
-        let schedule = move |runnable| {
-            if let Some(i) = raw.upgrade() {
-                i.schedule(runnable);
-            }
-        };
-
-        let (runnable, task) = async_task::spawn(async move { f() }, schedule);
-        runnable.schedule();
-
-        task
+        self.inner.spawn(f)
     }
 
     /// Shut down the `BlockingPool`.
@@ -316,6 +325,11 @@ impl BlockingPool {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.inner.state.lock().shutting_down
+    }
 }
 
 impl Default for BlockingPool {
@@ -334,16 +348,19 @@ impl Drop for BlockingPool {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        sync::{Arc, Barrier},
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Duration;
+    use std::time::Instant;
 
-    use futures::{stream::FuturesUnordered, StreamExt};
-    use sync::{Condvar, Mutex};
+    use futures::executor::block_on;
+    use futures::stream::FuturesUnordered;
+    use futures::StreamExt;
+    use sync::Condvar;
+    use sync::Mutex;
 
-    use super::super::super::{block_on, BlockingPool};
+    use super::super::super::BlockingPool;
 
     #[test]
     fn blocking_sleep() {

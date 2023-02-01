@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 The Chromium OS Authors. All rights reserved.
+ * Copyright 2021 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -69,11 +69,11 @@ extern "C" {
  */
 #define RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD 0x1
 #define RUTABAGA_MEM_HANDLE_TYPE_DMABUF 0x2
-#define RUTABAGE_MEM_HANDLE_TYPE_OPAQUE_WIN32 0x3
+#define RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_WIN32 0x3
 #define RUTABAGA_MEM_HANDLE_TYPE_SHM 0x4
 #define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD 0x10
 #define RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD 0x11
-#define RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x12
+#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x12
 
 struct rutabaga;
 
@@ -178,7 +178,13 @@ int32_t rutabaga_get_capset_info(struct rutabaga *ptr, uint32_t capset_index, ui
 int32_t rutabaga_get_capset(struct rutabaga *ptr, uint32_t capset_id, uint32_t version,
 			    uint8_t *capset, uint32_t capset_size);
 
-int32_t rutabaga_context_create(struct rutabaga *ptr, uint32_t ctx_id, uint32_t context_init);
+/**
+ * # Safety
+ * - `context_name` must either be NULL or a valid pointer to an array of at least
+ *   `context_name_len` bytes encoding a UTF-8 string.
+ */
+int32_t rutabaga_context_create(struct rutabaga *ptr, uint32_t ctx_id, uint32_t context_init,
+				const char *context_name, uint32_t context_name_len);
 
 int32_t rutabaga_context_destroy(struct rutabaga *ptr, uint32_t ctx_id);
 

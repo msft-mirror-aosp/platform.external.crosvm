@@ -1,22 +1,25 @@
-// Copyright 2019 The Chromium OS Authors. All rights reserved.
+// Copyright 2019 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 // Loader for bzImage-format Linux kernels as described in
 // https://www.kernel.org/doc/Documentation/x86/boot.txt
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 
 use base::AsRawDescriptor;
 use data_model::DataInit;
 use remain::sorted;
 use thiserror::Error;
-use vm_memory::{GuestAddress, GuestMemory};
+use vm_memory::GuestAddress;
+use vm_memory::GuestMemory;
 
 use crate::bootparam::boot_params;
 
 #[sorted]
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum Error {
     #[error("bad kernel header signature")]
     BadSignature,

@@ -1,22 +1,34 @@
-// Copyright 2018 The Chromium OS Authors. All rights reserved.
+// Copyright 2018 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::io::{self, Read, Write};
+use std::io;
+use std::io::Read;
+use std::io::Write;
 use std::ops::BitOrAssign;
-use std::sync::Arc;
 use std::thread;
 
-use base::{error, Event, PollToken, RawDescriptor, WaitContext};
+use anyhow::anyhow;
+use anyhow::Context;
+use base::error;
+use base::Event;
+use base::EventToken;
+use base::RawDescriptor;
+use base::WaitContext;
 use remain::sorted;
-use sync::Mutex;
 use thiserror::Error;
 use vm_memory::GuestMemory;
 
-use super::{
-    DescriptorChain, DescriptorError, Interrupt, Queue, Reader, SignalableInterrupt, VirtioDevice,
-    Writer, TYPE_TPM,
-};
+use super::DescriptorChain;
+use super::DescriptorError;
+use super::DeviceType;
+use super::Interrupt;
+use super::Queue;
+use super::Reader;
+use super::SignalableInterrupt;
+use super::VirtioDevice;
+use super::Writer;
+use crate::Suspendable;
 
 // A single queue of size 2. The guest kernel driver will enqueue a single
 // descriptor chain containing one command buffer and one response buffer at a
@@ -35,7 +47,7 @@ struct Worker {
     mem: GuestMemory,
     queue_evt: Event,
     kill_evt: Event,
-    backend: Arc<Mutex<dyn TpmBackend>>,
+    backend: Box<dyn TpmBackend>,
 }
 
 pub trait TpmBackend: Send {
@@ -57,9 +69,7 @@ impl Worker {
         let mut command = vec![0u8; available_bytes];
         reader.read_exact(&mut command).map_err(Error::Read)?;
 
-        let mut backend = self.backend.lock();
-
-        let response = backend.execute_command(&command);
+        let response = self.backend.execute_command(&command);
 
         if response.len() > TPM_BUFSIZE {
             return Err(Error::ResponseTooLong {
@@ -101,7 +111,7 @@ impl Worker {
     }
 
     fn run(mut self) {
-        #[derive(PollToken, Debug)]
+        #[derive(EventToken, Debug)]
         enum Token {
             // A request is ready on the queue.
             QueueAvailable,
@@ -132,7 +142,7 @@ impl Worker {
             let events = match wait_ctx.wait() {
                 Ok(v) => v,
                 Err(e) => {
-                    error!("vtpm failed polling for events: {}", e);
+                    error!("vtpm failed waiting for events: {}", e);
                     break;
                 }
             };
@@ -141,7 +151,7 @@ impl Worker {
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
                     Token::QueueAvailable => {
-                        if let Err(e) = self.queue_evt.read() {
+                        if let Err(e) = self.queue_evt.wait() {
                             error!("vtpm failed reading queue Event: {}", e);
                             break 'wait;
                         }
@@ -162,17 +172,19 @@ impl Worker {
 
 /// Virtio vTPM device.
 pub struct Tpm {
-    backend: Arc<Mutex<dyn TpmBackend>>,
+    backend: Option<Box<dyn TpmBackend>>,
     kill_evt: Option<Event>,
     worker_thread: Option<thread::JoinHandle<()>>,
+    features: u64,
 }
 
 impl Tpm {
-    pub fn new(backend: Arc<Mutex<dyn TpmBackend>>) -> Tpm {
+    pub fn new(backend: Box<dyn TpmBackend>, base_features: u64) -> Tpm {
         Tpm {
-            backend,
+            backend: Some(backend),
             kill_evt: None,
             worker_thread: None,
+            features: base_features,
         }
     }
 }
@@ -180,7 +192,7 @@ impl Tpm {
 impl Drop for Tpm {
     fn drop(&mut self) {
         if let Some(kill_evt) = self.kill_evt.take() {
-            let _ = kill_evt.write(1);
+            let _ = kill_evt.signal();
         }
 
         if let Some(worker_thread) = self.worker_thread.take() {
@@ -194,36 +206,34 @@ impl VirtioDevice for Tpm {
         Vec::new()
     }
 
-    fn device_type(&self) -> u32 {
-        TYPE_TPM
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Tpm
     }
 
     fn queue_max_sizes(&self) -> &[u16] {
         QUEUE_SIZES
     }
 
+    fn features(&self) -> u64 {
+        self.features
+    }
+
     fn activate(
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: Vec<Queue>,
-        mut queue_evts: Vec<Event>,
-    ) {
-        if queues.len() != 1 || queue_evts.len() != 1 {
-            return;
+        mut queues: Vec<(Queue, Event)>,
+    ) -> anyhow::Result<()> {
+        if queues.len() != 1 {
+            return Err(anyhow!("expected 1 queue, got {}", queues.len()));
         }
-        let queue = queues.remove(0);
-        let queue_evt = queue_evts.remove(0);
+        let (queue, queue_evt) = queues.remove(0);
 
-        let backend = self.backend.clone();
+        let backend = self.backend.take().context("no backend in vtpm")?;
 
-        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
-            Ok(v) => v,
-            Err(err) => {
-                error!("vtpm failed to create kill Event pair: {}", err);
-                return;
-            }
-        };
+        let (self_kill_evt, kill_evt) = Event::new()
+            .and_then(|e| Ok((e.try_clone()?, e)))
+            .context("vtpm failed to create kill Event pair")?;
         self.kill_evt = Some(self_kill_evt);
 
         let worker = Worker {
@@ -235,20 +245,16 @@ impl VirtioDevice for Tpm {
             backend,
         };
 
-        let worker_result = thread::Builder::new()
-            .name("virtio_tpm".to_string())
-            .spawn(|| worker.run());
-
-        match worker_result {
-            Err(e) => {
-                error!("vtpm failed to spawn virtio_tpm worker: {}", e);
-            }
-            Ok(join_handle) => {
-                self.worker_thread = Some(join_handle);
-            }
-        }
+        let worker_thread = thread::Builder::new()
+            .name("v_tpm".to_string())
+            .spawn(|| worker.run())
+            .context("vtpm failed to spawn virtio_vtpm worker")?;
+        self.worker_thread = Some(worker_thread);
+        Ok(())
     }
 }
+
+impl Suspendable for Tpm {}
 
 #[derive(PartialEq)]
 enum NeedsInterrupt {

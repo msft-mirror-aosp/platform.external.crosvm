@@ -1,24 +1,34 @@
-// Copyright 2019 The Chromium OS Authors. All rights reserved.
+// Copyright 2019 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cmp::{max, min};
+use std::cmp::max;
+use std::cmp::min;
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
-use std::mem::{size_of, MaybeUninit};
+use std::mem::size_of;
+use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
-use base::{error, pagesize};
+use base::error;
+use base::pagesize;
 use data_model::DataInit;
 
-use crate::filesystem::{
-    Context, DirEntry, DirectoryIterator, Entry, FileSystem, GetxattrReply, IoctlReply,
-    ListxattrReply, ZeroCopyReader, ZeroCopyWriter,
-};
+use crate::filesystem::Context;
+use crate::filesystem::DirEntry;
+use crate::filesystem::DirectoryIterator;
+use crate::filesystem::Entry;
+use crate::filesystem::FileSystem;
+use crate::filesystem::GetxattrReply;
+use crate::filesystem::IoctlReply;
+use crate::filesystem::ListxattrReply;
+use crate::filesystem::ZeroCopyReader;
+use crate::filesystem::ZeroCopyWriter;
 use crate::sys::*;
-use crate::{Error, Result};
+use crate::Error;
+use crate::Result;
 
 const DIRENT_PADDING: [u8; 8] = [0; 8];
 
@@ -1060,7 +1070,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     let mut total_written = 0;
                     while let Some(dirent) = entries.next() {
                         let remaining = (size as usize).saturating_sub(total_written);
-                        match add_dirent(cursor, remaining, dirent, None) {
+                        match add_dirent(cursor, remaining, &dirent, None) {
                             // No more space left in the buffer.
                             Ok(0) => break,
                             Ok(bytes_written) => {
@@ -1081,11 +1091,11 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn handle_dirent<'d>(
+    fn lookup_dirent_attribute<'d>(
         &self,
         in_header: &InHeader,
-        dir_entry: DirEntry<'d>,
-    ) -> io::Result<(DirEntry<'d>, Entry)> {
+        dir_entry: &DirEntry<'d>,
+    ) -> io::Result<Entry> {
         let parent = in_header.nodeid.into();
         let name = dir_entry.name.to_bytes();
         let entry = if name == b"." || name == b".." {
@@ -1108,7 +1118,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 .lookup(Context::from(*in_header), parent, dir_entry.name)?
         };
 
-        Ok((dir_entry, entry))
+        Ok(entry)
     }
 
     fn readdirplus<R: Reader, W: Writer>(
@@ -1151,11 +1161,13 @@ impl<F: FileSystem + Sync> Server<F> {
                     let mut total_written = 0;
                     while let Some(dirent) = entries.next() {
                         let mut entry_inode = None;
-                        match self.handle_dirent(&in_header, dirent).and_then(|(d, e)| {
-                            entry_inode = Some(e.inode);
-                            let remaining = (size as usize).saturating_sub(total_written);
-                            add_dirent(cursor, remaining, d, Some(e))
-                        }) {
+                        match self
+                            .lookup_dirent_attribute(&in_header, &dirent)
+                            .and_then(|e| {
+                                entry_inode = Some(e.inode);
+                                let remaining = (size as usize).saturating_sub(total_written);
+                                add_dirent(cursor, remaining, &dirent, Some(e))
+                            }) {
                             Ok(0) => {
                                 // No more space left in the buffer but we need to undo the lookup
                                 // that created the Entry or we will end up with mismatched lookup
@@ -1753,7 +1765,7 @@ fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
 fn add_dirent<W: Writer>(
     cursor: &mut W,
     max: usize,
-    d: DirEntry,
+    d: &DirEntry,
     entry: Option<Entry>,
 ) -> io::Result<usize> {
     // Strip the trailing '\0'.

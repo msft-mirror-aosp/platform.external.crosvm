@@ -1,4 +1,4 @@
-// Copyright 2022 The Chromium OS Authors. All rights reserved.
+// Copyright 2022 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -9,45 +9,80 @@
 //! so it can only be used for the TRUSTED passthrough devices.
 //!
 //! CoIOMMU is presented at KVM forum 2020:
-//! https://kvmforum2020.sched.com/event/eE2z/a-virtual-iommu-with-cooperative
-//! -dma-buffer-tracking-yu-zhang-intel
+//! <https://kvmforum2020.sched.com/event/eE2z/a-virtual-iommu-with-cooperative-dma-buffer-tracking-yu-zhang-intel>
 //!
 //! Also presented at usenix ATC20:
-//! https://www.usenix.org/conference/atc20/presentation/tian
+//! <https://www.usenix.org/conference/atc20/presentation/tian>
 
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::default::Default;
+use std::fmt;
+use std::mem;
 use std::panic;
-use std::str::FromStr;
-use std::sync::atomic::{fence, AtomicU32, Ordering};
+use std::sync::atomic::fence;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
-use std::{fmt, mem, thread};
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use base::{
-    error, info, AsRawDescriptor, Event, MemoryMapping, MemoryMappingBuilder, PollToken,
-    RawDescriptor, SafeDescriptor, SharedMemory, Timer, Tube, TubeError, WaitContext,
-};
+use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::ensure;
+use anyhow::Context;
+use anyhow::Result;
+use base::error;
+use base::info;
+use base::AsRawDescriptor;
+use base::Event;
+use base::EventToken;
+use base::MemoryMapping;
+use base::MemoryMappingBuilder;
+use base::Protection;
+use base::RawDescriptor;
+use base::SafeDescriptor;
+use base::SharedMemory;
+use base::Timer;
+use base::Tube;
+use base::TubeError;
+use base::WaitContext;
 use data_model::DataInit;
 use hypervisor::Datamatch;
-use resources::{Alloc, MmioType, SystemAllocator};
-use serde::{Deserialize, Serialize};
+use resources::Alloc;
+use resources::AllocOptions;
+use resources::SystemAllocator;
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde_keyvalue::FromKeyValues;
 use sync::Mutex;
 use thiserror::Error as ThisError;
+use vm_control::VmMemoryDestination;
+use vm_control::VmMemoryRequest;
+use vm_control::VmMemoryResponse;
+use vm_control::VmMemorySource;
+use vm_memory::GuestAddress;
+use vm_memory::GuestMemory;
 
-use vm_control::{VmMemoryDestination, VmMemoryRequest, VmMemoryResponse, VmMemorySource};
-use vm_memory::{GuestAddress, GuestMemory};
-
-use crate::pci::pci_configuration::{
-    PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration,
-    PciHeaderType, PciOtherSubclass, COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK,
-};
-use crate::pci::pci_device::{BarRange, PciDevice, Result as PciResult};
-use crate::pci::{PciAddress, PciDeviceError};
+use crate::pci::pci_configuration::PciBarConfiguration;
+use crate::pci::pci_configuration::PciBarPrefetchable;
+use crate::pci::pci_configuration::PciBarRegionType;
+use crate::pci::pci_configuration::PciClassCode;
+use crate::pci::pci_configuration::PciConfiguration;
+use crate::pci::pci_configuration::PciHeaderType;
+use crate::pci::pci_configuration::PciOtherSubclass;
+use crate::pci::pci_configuration::COMMAND_REG;
+use crate::pci::pci_configuration::COMMAND_REG_MEMORY_SPACE_MASK;
+use crate::pci::pci_device::BarRange;
+use crate::pci::pci_device::PciDevice;
+use crate::pci::pci_device::Result as PciResult;
+use crate::pci::PciAddress;
+use crate::pci::PciDeviceError;
 use crate::vfio::VfioContainer;
-use crate::{UnpinRequest, UnpinResponse};
+use crate::Suspendable;
+use crate::UnpinRequest;
+use crate::UnpinResponse;
 
 const PCI_VENDOR_ID_COIOMMU: u16 = 0x1234;
 const PCI_DEVICE_ID_COIOMMU: u16 = 0xabcd;
@@ -85,24 +120,16 @@ enum Error {
 const UNPIN_DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 const UNPIN_GEN_DEFAULT_THRES: u64 = 10;
 /// Holds the coiommu unpin policy
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CoIommuUnpinPolicy {
     Off,
     Lru,
 }
 
-impl FromStr for CoIommuUnpinPolicy {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "off" => Ok(CoIommuUnpinPolicy::Off),
-            "lru" => Ok(CoIommuUnpinPolicy::Lru),
-            _ => Err(anyhow!(
-                "CoIommu doesn't have such unpin policy: {}",
-                s.to_string()
-            )),
-        }
+impl Default for CoIommuUnpinPolicy {
+    fn default() -> Self {
+        CoIommuUnpinPolicy::Off
     }
 }
 
@@ -117,14 +144,51 @@ impl fmt::Display for CoIommuUnpinPolicy {
     }
 }
 
+fn deserialize_unpin_interval<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Duration, D::Error> {
+    let secs = u64::deserialize(deserializer)?;
+
+    Ok(Duration::from_secs(secs))
+}
+
+fn deserialize_unpin_limit<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let limit = u64::deserialize(deserializer)?;
+
+    match limit {
+        0 => Err(serde::de::Error::custom(
+            "Please use non-zero unpin_limit value",
+        )),
+        limit => Ok(Some(limit)),
+    }
+}
+
+fn unpin_interval_default() -> Duration {
+    UNPIN_DEFAULT_INTERVAL
+}
+
+fn unpin_gen_threshold_default() -> u64 {
+    UNPIN_GEN_DEFAULT_THRES
+}
+
 /// Holds the parameters for a coiommu device
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields)]
 pub struct CoIommuParameters {
+    #[serde(default)]
     pub unpin_policy: CoIommuUnpinPolicy,
+    #[serde(
+        deserialize_with = "deserialize_unpin_interval",
+        default = "unpin_interval_default"
+    )]
     pub unpin_interval: Duration,
+    #[serde(deserialize_with = "deserialize_unpin_limit", default)]
     pub unpin_limit: Option<u64>,
     // Number of unpin intervals a pinned page must be busy for to be aged into the
     // older, less frequently checked generation.
+    #[serde(default = "unpin_gen_threshold_default")]
     pub unpin_gen_threshold: u64,
 }
 
@@ -495,7 +559,7 @@ impl PinWorker {
     }
 
     fn run(&mut self, kill_evt: Event) {
-        #[derive(PollToken)]
+        #[derive(EventToken)]
         enum Token {
             Kill,
             Pin { index: usize },
@@ -540,7 +604,7 @@ impl PinWorker {
                     Token::Pin { index } => {
                         let offset = index * mem::size_of::<u64>() as usize;
                         if let Some(event) = self.ioevents.get(index) {
-                            if let Err(e) = event.read() {
+                            if let Err(e) = event.wait() {
                                 error!(
                                     "{}: failed reading event {}: {}",
                                     self.debug_label(),
@@ -651,7 +715,7 @@ impl UnpinWorker {
     }
 
     fn run(&mut self, kill_evt: Event) {
-        #[derive(PollToken)]
+        #[derive(EventToken)]
         enum Token {
             UnpinTimer,
             UnpinReq,
@@ -722,7 +786,7 @@ impl UnpinWorker {
                     Token::UnpinTimer => {
                         self.unpin_pages();
                         if let Some(timer) = &mut unpin_timer {
-                            if let Err(e) = timer.wait() {
+                            if let Err(e) = timer.mark_waited() {
                                 error!(
                                     "{}: failed to clear unpin timer: {}",
                                     self.debug_label(),
@@ -975,7 +1039,7 @@ impl CoIommuDev {
         mem: GuestMemory,
         vfio_container: Arc<Mutex<VfioContainer>>,
         device_tube: Tube,
-        unpin_tube: Tube,
+        unpin_tube: Option<Tube>,
         endpoints: Vec<u16>,
         vcpu_count: u64,
         params: CoIommuParameters,
@@ -993,7 +1057,7 @@ impl CoIommuDev {
         );
 
         // notifymap_mem is used as Bar2 for Guest to check if request is completed by coIOMMU.
-        let notifymap_mem = SharedMemory::named("coiommu_notifymap", COIOMMU_NOTIFYMAP_SIZE as u64)
+        let notifymap_mem = SharedMemory::new("coiommu_notifymap", COIOMMU_NOTIFYMAP_SIZE as u64)
             .context(Error::CreateSharedMemory)?;
         let notifymap_mmap = Arc::new(
             MemoryMappingBuilder::new(COIOMMU_NOTIFYMAP_SIZE)
@@ -1004,7 +1068,7 @@ impl CoIommuDev {
 
         // topologymap_mem is used as Bar4 for Guest to check which device is on top of coIOMMU.
         let topologymap_mem =
-            SharedMemory::named("coiommu_topologymap", COIOMMU_TOPOLOGYMAP_SIZE as u64)
+            SharedMemory::new("coiommu_topologymap", COIOMMU_TOPOLOGYMAP_SIZE as u64)
                 .context(Error::CreateSharedMemory)?;
         let topologymap_mmap = Arc::new(
             MemoryMappingBuilder::new(COIOMMU_TOPOLOGYMAP_SIZE)
@@ -1044,7 +1108,7 @@ impl CoIommuDev {
             pin_kill_evt: None,
             unpin_thread: None,
             unpin_kill_evt: None,
-            unpin_tube: Some(unpin_tube),
+            unpin_tube,
             ioevents,
             vfio_container,
             pinstate: Arc::new(Mutex::new(CoIommuPinState {
@@ -1073,7 +1137,7 @@ impl CoIommuDev {
         size: usize,
         offset: u64,
         gpa: u64,
-        read_only: bool,
+        prot: Protection,
     ) -> Result<()> {
         let request = VmMemoryRequest::RegisterMemory {
             source: VmMemorySource::Descriptor {
@@ -1082,7 +1146,7 @@ impl CoIommuDev {
                 size: size as u64,
             },
             dest: VmMemoryDestination::GuestPhysicalAddress(gpa),
-            read_only,
+            prot,
         };
         self.send_msg(&request)
     }
@@ -1098,7 +1162,7 @@ impl CoIommuDev {
                 COIOMMU_NOTIFYMAP_SIZE,
                 0,
                 gpa,
-                false,
+                Protection::read_write(),
             ) {
                 Ok(_) => {}
                 Err(e) => {
@@ -1113,7 +1177,7 @@ impl CoIommuDev {
                 COIOMMU_TOPOLOGYMAP_SIZE,
                 0,
                 gpa,
-                true,
+                Protection::read(),
             ) {
                 Ok(_) => {}
                 Err(e) => {
@@ -1254,8 +1318,7 @@ impl CoIommuDev {
         name: &str,
     ) -> PciResult<u64> {
         let addr = resources
-            .mmio_allocator(MmioType::High)
-            .allocate_with_align(
+            .allocate_mmio(
                 size,
                 Alloc::PciBar {
                     bus: address.bus,
@@ -1264,7 +1327,7 @@ impl CoIommuDev {
                     bar: bar_num,
                 },
                 name.to_string(),
-                size,
+                AllocOptions::new().prefetchable(true).align(size),
             )
             .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))?;
 
@@ -1519,7 +1582,7 @@ impl PciDevice for CoIommuDev {
             self.mmap();
         }
 
-        (&mut self.config_regs).write_reg(reg_idx, offset, data);
+        self.config_regs.write_reg(reg_idx, offset, data);
     }
 
     fn keep_rds(&self) -> Vec<RawDescriptor> {
@@ -1592,7 +1655,7 @@ impl Drop for CoIommuDev {
     fn drop(&mut self) {
         if let Some(kill_evt) = self.pin_kill_evt.take() {
             // Ignore the result because there is nothing we can do about it.
-            if kill_evt.write(1).is_ok() {
+            if kill_evt.signal().is_ok() {
                 if let Some(worker_thread) = self.pin_thread.take() {
                     let _ = worker_thread.join();
                 }
@@ -1603,7 +1666,7 @@ impl Drop for CoIommuDev {
 
         if let Some(kill_evt) = self.unpin_kill_evt.take() {
             // Ignore the result because there is nothing we can do about it.
-            if kill_evt.write(1).is_ok() {
+            if kill_evt.signal().is_ok() {
                 if let Some(worker_thread) = self.unpin_thread.take() {
                     let _ = worker_thread.join();
                 }
@@ -1613,3 +1676,5 @@ impl Drop for CoIommuDev {
         }
     }
 }
+
+impl Suspendable for CoIommuDev {}

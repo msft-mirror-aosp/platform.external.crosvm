@@ -1,12 +1,14 @@
-// Copyright 2018 The Chromium OS Authors. All rights reserved.
+// Copyright 2018 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
+
+use std::fmt;
+use std::fmt::Display;
 
 use bit_field::Error as BitFieldError;
 use bit_field::*;
 use data_model::DataInit;
 use remain::sorted;
-use std::fmt::{self, Display};
 use thiserror::Error;
 use vm_memory::GuestAddress;
 
@@ -30,7 +32,7 @@ const SEGMENT_TABLE_SIZE: usize = 16;
 /// All kinds of trb.
 #[bitfield]
 #[bits = 6]
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum TrbType {
     Reserved = 0,
     Normal = 1,
@@ -59,7 +61,7 @@ pub enum TrbType {
 /// Completion code of trb types.
 #[bitfield]
 #[bits = 8]
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum TrbCompletionCode {
     Success = 1,
     TransactionError = 4,
@@ -73,7 +75,7 @@ pub enum TrbCompletionCode {
 /// State of device slot.
 #[bitfield]
 #[bits = 5]
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum DeviceSlotState {
     // The same value (0) is used for both the enabled and disabled states. See
     // xhci spec table 60.
@@ -86,7 +88,7 @@ pub enum DeviceSlotState {
 /// State of endpoint.
 #[bitfield]
 #[bits = 3]
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum EndpointState {
     Disabled = 0,
     Running = 1,
@@ -94,7 +96,7 @@ pub enum EndpointState {
 
 #[bitfield]
 #[bits = 60]
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct DequeuePtr(u64);
 
 impl DequeuePtr {
@@ -110,7 +112,7 @@ impl DequeuePtr {
 
 // Generic TRB struct containing only fields common to all types.
 #[bitfield]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Trb {
     parameter: B64,
     status: B32,
@@ -862,7 +864,7 @@ pub struct DeviceContext {
 /// POD struct associates a TRB with its address in guest memory.  This is
 /// useful because transfer and command completion event TRBs must contain
 /// pointers to the original TRB that generated the event.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddressedTrb {
     pub trb: Trb,
     pub gpa: u64,

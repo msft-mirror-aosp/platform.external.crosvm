@@ -1,4 +1,4 @@
-// Copyright 2019 The Chromium OS Authors. All rights reserved.
+// Copyright 2019 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,22 +7,43 @@ use std::mem;
 use std::sync::Arc;
 use std::thread;
 
-use base::{error, warn, AsRawDescriptor, Error as SysError, Event, RawDescriptor, Tube};
-use data_model::{DataInit, Le32};
+use anyhow::anyhow;
+use anyhow::Context;
+use base::error;
+use base::warn;
+use base::AsRawDescriptor;
+use base::Error as SysError;
+use base::Event;
+use base::RawDescriptor;
+use base::Tube;
+use data_model::DataInit;
+use data_model::Le32;
 use remain::sorted;
 use resources::Alloc;
 use sync::Mutex;
 use thiserror::Error;
-use vm_control::{FsMappingRequest, VmResponse};
+use virtio_sys::virtio_fs::virtio_fs_config;
+use virtio_sys::virtio_fs::VIRTIO_FS_SHMCAP_ID_CACHE;
+use vm_control::FsMappingRequest;
+use vm_control::VmResponse;
 use vm_memory::GuestMemory;
 
-use crate::pci::{
-    PciAddress, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,
-};
-use crate::virtio::{
-    copy_config, DescriptorError, Interrupt, PciCapabilityType, Queue, VirtioDevice,
-    VirtioPciShmCap, TYPE_FS,
-};
+use crate::pci::PciAddress;
+use crate::pci::PciBarConfiguration;
+use crate::pci::PciBarPrefetchable;
+use crate::pci::PciBarRegionType;
+use crate::pci::PciCapability;
+use crate::virtio::copy_config;
+use crate::virtio::device_constants::fs::FS_MAX_TAG_LEN;
+use crate::virtio::device_constants::fs::QUEUE_SIZE;
+use crate::virtio::DescriptorError;
+use crate::virtio::DeviceType;
+use crate::virtio::Interrupt;
+use crate::virtio::PciCapabilityType;
+use crate::virtio::Queue;
+use crate::virtio::VirtioDevice;
+use crate::virtio::VirtioPciShmCap;
+use crate::Suspendable;
 
 mod caps;
 mod multikey;
@@ -32,35 +53,12 @@ mod worker;
 
 use fuse::Server;
 use passthrough::PassthroughFs;
-use worker::Worker;
-
 pub use worker::process_fs_queue;
-
-// The fs device does not have a fixed number of queues.
-pub const QUEUE_SIZE: u16 = 1024;
+use worker::Worker;
 
 const FS_BAR_NUM: u8 = 4;
 const FS_BAR_OFFSET: u64 = 0;
 const FS_BAR_SIZE: u64 = 1 << 33;
-
-/// Defined in kernel/include/uapi/linux/virtio_fs.h.
-const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
-
-/// The maximum allowable length of the tag used to identify a specific virtio-fs device.
-pub const FS_MAX_TAG_LEN: usize = 36;
-
-/// kernel/include/uapi/linux/virtio_fs.h
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct virtio_fs_config {
-    /// Filesystem name (UTF-8, not NUL-terminated, padded with NULs)
-    pub tag: [u8; FS_MAX_TAG_LEN],
-    /// Number of request queues
-    pub num_request_queues: Le32,
-}
-
-// Safe because all members are plain old data and any value is valid.
-unsafe impl DataInit for virtio_fs_config {}
 
 /// Errors that may occur during the creation or operation of an Fs device.
 #[sorted]
@@ -117,6 +115,7 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 
 pub struct Fs {
     cfg: virtio_fs_config,
+    tag: String,
     fs: Option<PassthroughFs>,
     queue_sizes: Box<[u16]>,
     avail_features: u64,
@@ -153,6 +152,7 @@ impl Fs {
 
         Ok(Fs {
             cfg,
+            tag: tag.to_string(),
             fs: Some(fs),
             queue_sizes: vec![QUEUE_SIZE; num_queues].into_boxed_slice(),
             avail_features: base_features,
@@ -165,7 +165,7 @@ impl Fs {
 
     fn stop_workers(&mut self) {
         for (kill_evt, handle) in mem::take(&mut self.workers) {
-            if let Err(e) = kill_evt.write(1) {
+            if let Err(e) = kill_evt.signal() {
                 error!("failed to kill virtio-fs worker thread: {}", e);
                 continue;
             }
@@ -197,8 +197,8 @@ impl VirtioDevice for Fs {
         fds
     }
 
-    fn device_type(&self) -> u32 {
-        TYPE_FS
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Fs
     }
 
     fn queue_max_sizes(&self) -> &[u16] {
@@ -229,18 +229,20 @@ impl VirtioDevice for Fs {
         &mut self,
         guest_mem: GuestMemory,
         interrupt: Interrupt,
-        queues: Vec<Queue>,
-        queue_evts: Vec<Event>,
-    ) {
-        if queues.len() != self.queue_sizes.len() || queue_evts.len() != self.queue_sizes.len() {
-            return;
+        queues: Vec<(Queue, Event)>,
+    ) -> anyhow::Result<()> {
+        if queues.len() != self.queue_sizes.len() {
+            return Err(anyhow!(
+                "expected {} queues, got {}",
+                self.queue_sizes.len(),
+                queues.len()
+            ));
         }
 
         let fs = self.fs.take().expect("missing file system implementation");
         let use_dax = fs.cfg().use_dax;
 
         let server = Arc::new(Server::new(fs));
-        let irq = Arc::new(interrupt);
         let socket = self.tube.take().expect("missing mapping socket");
         let mut slot = 0;
 
@@ -266,24 +268,23 @@ impl VirtioDevice for Fs {
 
         let socket = Arc::new(Mutex::new(socket));
         let mut watch_resample_event = true;
-        for (idx, (queue, evt)) in queues.into_iter().zip(queue_evts.into_iter()).enumerate() {
+        for (idx, (queue, evt)) in queues.into_iter().enumerate() {
             let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e)))
             {
                 Ok(v) => v,
                 Err(e) => {
-                    error!("fs: failed creating kill Event pair: {}", e);
                     self.stop_workers();
-                    return;
+                    return Err(e).context("failed creating kill Event pair");
                 }
             };
 
             let mem = guest_mem.clone();
             let server = server.clone();
-            let irq = irq.clone();
+            let irq = interrupt.clone();
             let socket = Arc::clone(&socket);
 
             let worker_result = thread::Builder::new()
-                .name(format!("virtio-fs worker {}", idx))
+                .name(format!("v_fs:{}:{}", self.tag, idx))
                 .spawn(move || {
                     let mut worker = Worker::new(mem, queue, server, irq, socket, slot);
                     worker.run(evt, kill_evt, watch_resample_event)
@@ -296,12 +297,12 @@ impl VirtioDevice for Fs {
             match worker_result {
                 Ok(worker) => self.workers.push((self_kill_evt, worker)),
                 Err(e) => {
-                    error!("fs: failed to spawn virtio_fs worker: {}", e);
                     self.stop_workers();
-                    return;
+                    return Err(e).context("failed to spawn virtio_fs worker");
                 }
             }
         }
+        Ok(())
     }
 
     fn get_device_bars(&mut self, address: PciAddress) -> Vec<PciBarConfiguration> {
@@ -320,7 +321,7 @@ impl VirtioDevice for Fs {
             FS_BAR_NUM as usize,
             FS_BAR_SIZE,
             PciBarRegionType::Memory64BitRegion,
-            PciBarPrefetchable::NotPrefetchable,
+            PciBarPrefetchable::Prefetchable,
         )]
     }
 
@@ -334,10 +335,12 @@ impl VirtioDevice for Fs {
             FS_BAR_NUM,
             FS_BAR_OFFSET,
             FS_BAR_SIZE,
-            VIRTIO_FS_SHMCAP_ID_CACHE,
+            VIRTIO_FS_SHMCAP_ID_CACHE as u8,
         ))]
     }
 }
+
+impl Suspendable for Fs {}
 
 impl Drop for Fs {
     fn drop(&mut self) {

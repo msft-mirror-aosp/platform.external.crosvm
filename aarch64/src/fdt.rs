@@ -1,19 +1,28 @@
-// Copyright 2018 The Chromium OS Authors. All rights reserved.
+// Copyright 2018 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
+use std::path::PathBuf;
 
-use arch::fdt::{Error, FdtWriter, Result};
+use arch::CpuSet;
 use arch::SERIAL_ADDR;
-use devices::{PciAddress, PciInterruptPin};
-use hypervisor::{PsciVersion, PSCI_0_2, PSCI_1_0};
-use vm_memory::{GuestAddress, GuestMemory};
-
-// This is the start of DRAM in the physical address space.
-use crate::AARCH64_PHYS_MEM_START;
+use cros_fdt::Error;
+use cros_fdt::FdtWriter;
+use cros_fdt::Result;
+// This is a Battery related constant
+use devices::bat::GOLDFISHBAT_MMIO_LEN;
+use devices::pl030::PL030_AMBA_ID;
+use devices::PciAddress;
+use devices::PciInterruptPin;
+use hypervisor::PsciVersion;
+use hypervisor::PSCI_0_2;
+use hypervisor::PSCI_1_0;
+use rand::rngs::OsRng;
+use rand::RngCore;
+use vm_memory::GuestAddress;
+use vm_memory::GuestMemory;
 
 // These are GIC address-space location constants.
 use crate::AARCH64_GIC_CPUI_BASE;
@@ -21,20 +30,17 @@ use crate::AARCH64_GIC_CPUI_SIZE;
 use crate::AARCH64_GIC_DIST_BASE;
 use crate::AARCH64_GIC_DIST_SIZE;
 use crate::AARCH64_GIC_REDIST_SIZE;
-
+use crate::AARCH64_PMU_IRQ;
+use crate::AARCH64_PROTECTED_VM_FW_START;
 // These are RTC related constants
 use crate::AARCH64_RTC_ADDR;
 use crate::AARCH64_RTC_IRQ;
 use crate::AARCH64_RTC_SIZE;
-use devices::pl030::PL030_AMBA_ID;
-
 // These are serial device related constants.
 use crate::AARCH64_SERIAL_1_3_IRQ;
 use crate::AARCH64_SERIAL_2_4_IRQ;
 use crate::AARCH64_SERIAL_SIZE;
 use crate::AARCH64_SERIAL_SPEED;
-
-use crate::AARCH64_PMU_IRQ;
 
 // This is an arbitrary number to specify the node for the GIC.
 // If we had a more complex interrupt architecture, then we'd need an enum for
@@ -56,13 +62,20 @@ const IRQ_TYPE_LEVEL_HIGH: u32 = 0x00000004;
 const IRQ_TYPE_LEVEL_LOW: u32 = 0x00000008;
 
 fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemory) -> Result<()> {
-    let mem_size = guest_mem.memory_size();
-    let mem_reg_prop = [AARCH64_PHYS_MEM_START, mem_size];
+    let mut mem_reg_prop = Vec::new();
+    for region in guest_mem.guest_memory_regions() {
+        if region.0.offset() == AARCH64_PROTECTED_VM_FW_START {
+            continue;
+        }
+        mem_reg_prop.push(region.0.offset());
+        mem_reg_prop.push(region.1 as u64);
+    }
 
     let memory_node = fdt.begin_node("memory")?;
     fdt.property_string("device_type", "memory")?;
     fdt.property_array_u64("reg", &mem_reg_prop)?;
     fdt.end_node(memory_node)?;
+
     Ok(())
 }
 
@@ -90,7 +103,7 @@ fn create_resv_memory_node(fdt: &mut FdtWriter, resv_size: Option<u64>) -> Resul
 fn create_cpu_nodes(
     fdt: &mut FdtWriter,
     num_cpus: u32,
-    cpu_clusters: Vec<Vec<usize>>,
+    cpu_clusters: Vec<CpuSet>,
     cpu_capacity: BTreeMap<usize, u32>,
 ) -> Result<()> {
     let cpus_node = fdt.begin_node("cpus")?;
@@ -264,18 +277,13 @@ fn create_chosen_node(
     // Used by android bootloader for boot console output
     fdt.property_string("stdout-path", &format!("/U6_16550A@{:x}", SERIAL_ADDR[0]))?;
 
-    let mut random_file = File::open("/dev/urandom").map_err(Error::FdtIoError)?;
     let mut kaslr_seed_bytes = [0u8; 8];
-    random_file
-        .read_exact(&mut kaslr_seed_bytes)
-        .map_err(Error::FdtIoError)?;
+    OsRng.fill_bytes(&mut kaslr_seed_bytes);
     let kaslr_seed = u64::from_le_bytes(kaslr_seed_bytes);
     fdt.property_u64("kaslr-seed", kaslr_seed)?;
 
     let mut rng_seed_bytes = [0u8; 256];
-    random_file
-        .read_exact(&mut rng_seed_bytes)
-        .map_err(Error::FdtIoError)?;
+    OsRng.fill_bytes(&mut rng_seed_bytes);
     fdt.property("rng-seed", &rng_seed_bytes)?;
 
     if let Some((initrd_addr, initrd_size)) = initrd {
@@ -285,6 +293,21 @@ fn create_chosen_node(
         fdt.property_u32("linux,initrd-end", initrd_end)?;
     }
     fdt.end_node(chosen_node)?;
+
+    Ok(())
+}
+
+fn create_config_node(fdt: &mut FdtWriter, (addr, size): (GuestAddress, usize)) -> Result<()> {
+    let addr = addr
+        .offset()
+        .try_into()
+        .map_err(|_| Error::PropertyValueTooLarge)?;
+    let size = size.try_into().map_err(|_| Error::PropertyValueTooLarge)?;
+
+    let config_node = fdt.begin_node("config")?;
+    fdt.property_u32("kernel-address", addr)?;
+    fdt.property_u32("kernel-size", size)?;
+    fdt.end_node(config_node)?;
 
     Ok(())
 }
@@ -326,6 +349,19 @@ pub struct PciConfigRegion {
     pub base: u64,
     /// Size of the PCI configuration region in bytes.
     pub size: u64,
+}
+
+/// Location of memory-mapped vm watchdog
+#[derive(Copy, Clone)]
+pub struct VmWdtConfig {
+    /// Physical address of the base of the memory-mapped vm watchdog region.
+    pub base: u64,
+    /// Size of the vm watchdog region in bytes.
+    pub size: u64,
+    /// The internal clock frequency of the watchdog.
+    pub clock_hz: u32,
+    /// The expiration timeout measured in seconds.
+    pub timeout_sec: u32,
 }
 
 fn create_pci_nodes(
@@ -441,6 +477,36 @@ fn create_rtc_node(fdt: &mut FdtWriter) -> Result<()> {
     Ok(())
 }
 
+/// Create a flattened device tree node for Goldfish Battery device.
+///
+/// # Arguments
+///
+/// * `fdt` - A FdtWriter in which the node is created
+/// * `mmio_base` - The MMIO base address of the battery
+/// * `irq` - The IRQ number of the battery
+fn create_battery_node(fdt: &mut FdtWriter, mmio_base: u64, irq: u32) -> Result<()> {
+    let reg = [mmio_base, GOLDFISHBAT_MMIO_LEN];
+    let irqs = [GIC_FDT_IRQ_TYPE_SPI, irq, IRQ_TYPE_LEVEL_HIGH];
+    let bat_node = fdt.begin_node("goldfish_battery")?;
+    fdt.property_string("compatible", "google,goldfish-battery")?;
+    fdt.property_array_u64("reg", &reg)?;
+    fdt.property_array_u32("interrupts", &irqs)?;
+    fdt.end_node(bat_node)?;
+    Ok(())
+}
+
+fn create_vmwdt_node(fdt: &mut FdtWriter, vmwdt_cfg: VmWdtConfig) -> Result<()> {
+    let vmwdt_name = format!("vmwdt@{:x}", vmwdt_cfg.base);
+    let reg = [vmwdt_cfg.base, vmwdt_cfg.size];
+    let vmwdt_node = fdt.begin_node(&vmwdt_name)?;
+    fdt.property_string("compatible", "qemu,vcpu-stall-detector")?;
+    fdt.property_array_u64("reg", &reg)?;
+    fdt.property_u32("clock-frequency", vmwdt_cfg.clock_hz)?;
+    fdt.property_u32("timeout-sec", vmwdt_cfg.timeout_sec)?;
+    fdt.end_node(vmwdt_node)?;
+    Ok(())
+}
+
 /// Creates a flattened device tree containing all of the parameters for the
 /// kernel and loads it into the guest memory at the specified offset.
 ///
@@ -452,12 +518,16 @@ fn create_rtc_node(fdt: &mut FdtWriter) -> Result<()> {
 /// * `pci_cfg` - Location of the memory-mapped PCI configuration space.
 /// * `pci_ranges` - Memory ranges accessible via the PCI host controller.
 /// * `num_cpus` - Number of virtual CPUs the guest will have
-/// * `fdt_load_offset` - The offset into physical memory for the device tree
+/// * `fdt_address` - The offset into physical memory for the device tree
 /// * `cmdline` - The kernel commandline
 /// * `initrd` - An optional tuple of initrd guest physical address and size
 /// * `android_fstab` - An optional file holding Android fstab entries
 /// * `is_gicv3` - True if gicv3, false if v2
 /// * `psci_version` - the current PSCI version
+/// * `swiotlb` - Reserve a memory pool for DMA
+/// * `bat_mmio_base_and_irq` - The battery base address and irq number
+/// * `vmwdt_cfg` - The virtual watchdog configuration
+/// * `dump_device_tree_blob` - Option path to write DTB to
 pub fn create_fdt(
     fdt_max_size: usize,
     guest_mem: &GuestMemory,
@@ -465,16 +535,20 @@ pub fn create_fdt(
     pci_cfg: PciConfigRegion,
     pci_ranges: &[PciRange],
     num_cpus: u32,
-    cpu_clusters: Vec<Vec<usize>>,
+    cpu_clusters: Vec<CpuSet>,
     cpu_capacity: BTreeMap<usize, u32>,
-    fdt_load_offset: u64,
+    fdt_address: GuestAddress,
     cmdline: &str,
+    image: (GuestAddress, usize),
     initrd: Option<(GuestAddress, usize)>,
     android_fstab: Option<File>,
     is_gicv3: bool,
     use_pmu: bool,
     psci_version: PsciVersion,
     swiotlb: Option<u64>,
+    bat_mmio_base_and_irq: Option<(u64, u32)>,
+    vmwdt_cfg: VmWdtConfig,
+    dump_device_tree_blob: Option<PathBuf>,
 ) -> Result<()> {
     let mut fdt = FdtWriter::new(&[]);
 
@@ -488,6 +562,7 @@ pub fn create_fdt(
         arch::android::create_android_fdt(&mut fdt, android_fstab)?;
     }
     create_chosen_node(&mut fdt, cmdline, initrd)?;
+    create_config_node(&mut fdt, image)?;
     create_memory_node(&mut fdt, guest_mem)?;
     let dma_pool_phandle = create_resv_memory_node(&mut fdt, swiotlb)?;
     create_cpu_nodes(&mut fdt, num_cpus, cpu_clusters, cpu_capacity)?;
@@ -500,18 +575,27 @@ pub fn create_fdt(
     create_psci_node(&mut fdt, &psci_version)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges, dma_pool_phandle)?;
     create_rtc_node(&mut fdt)?;
+    if let Some((bat_mmio_base, bat_irq)) = bat_mmio_base_and_irq {
+        create_battery_node(&mut fdt, bat_mmio_base, bat_irq)?;
+    }
+    create_vmwdt_node(&mut fdt, vmwdt_cfg)?;
     // End giant node
     fdt.end_node(root_node)?;
 
     let fdt_final = fdt.finish(fdt_max_size)?;
 
-    let fdt_address = GuestAddress(AARCH64_PHYS_MEM_START + fdt_load_offset);
     let written = guest_mem
         .write_at_addr(fdt_final.as_slice(), fdt_address)
         .map_err(|_| Error::FdtGuestMemoryWriteError)?;
     if written < fdt_max_size {
         return Err(Error::FdtGuestMemoryWriteError);
     }
+
+    if let Some(file_path) = dump_device_tree_blob {
+        std::fs::write(&file_path, &fdt_final)
+            .map_err(|e| Error::FdtDumpIoError(e, file_path.clone()))?;
+    }
+
     Ok(())
 }
 

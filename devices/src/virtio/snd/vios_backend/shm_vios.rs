@@ -1,30 +1,50 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2020 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::virtio::snd::constants::*;
-use crate::virtio::snd::layout::*;
-
-use base::{
-    error, AsRawDescriptor, Error as BaseError, Event, FromRawDescriptor, IntoRawDescriptor,
-    MemoryMapping, MemoryMappingBuilder, MmapError, PollToken, SafeDescriptor, ScmSocket,
-    UnixSeqpacket, WaitContext,
-};
-use data_model::{DataInit, VolatileMemory, VolatileMemoryError, VolatileSlice};
-
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Error as IOError, ErrorKind as IOErrorKind, IoSliceMut, Seek, SeekFrom};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::io::Error as IOError;
+use std::io::ErrorKind as IOErrorKind;
+use std::io::IoSliceMut;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::os::unix::io::RawFd;
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, RecvError, Sender};
+use std::path::PathBuf;
+use std::sync::mpsc::channel;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::RecvError;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use sync::Mutex;
-
+use base::error;
+use base::AsRawDescriptor;
+use base::Error as BaseError;
+use base::Event;
+use base::EventToken;
+use base::FromRawDescriptor;
+use base::IntoRawDescriptor;
+use base::MemoryMapping;
+use base::MemoryMappingBuilder;
+use base::MmapError;
+use base::RawDescriptor;
+use base::SafeDescriptor;
+use base::ScmSocket;
+use base::UnixSeqpacket;
+use base::WaitContext;
+use data_model::DataInit;
+use data_model::VolatileMemory;
+use data_model::VolatileMemoryError;
+use data_model::VolatileSlice;
 use remain::sorted;
+use sync::Mutex;
 use thiserror::Error as ThisError;
+
+use crate::virtio::snd::constants::*;
+use crate::virtio::snd::layout::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -63,8 +83,8 @@ pub enum Error {
     PlatformNotSupported,
     #[error("{0}")]
     ProtocolError(ProtocolErrorKind),
-    #[error("Failed to connect to VioS server: {0:?}")]
-    ServerConnectionError(IOError),
+    #[error("Failed to connect to VioS server {1}: {0:?}")]
+    ServerConnectionError(IOError, PathBuf),
     #[error("Failed to communicate with VioS server: {0:?}")]
     ServerError(BaseError),
     #[error("Failed to communicate with VioS server: {0:?}")]
@@ -131,7 +151,8 @@ pub struct VioSClient {
 impl VioSClient {
     /// Create a new client given the path to the audio server's socket.
     pub fn try_new<P: AsRef<Path>>(server: P) -> Result<VioSClient> {
-        let client_socket = UnixSeqpacket::connect(server).map_err(Error::ServerConnectionError)?;
+        let client_socket = UnixSeqpacket::connect(server.as_ref())
+            .map_err(|e| Error::ServerConnectionError(e, server.as_ref().into()))?;
         let mut config: VioSConfig = Default::default();
         let mut fds: Vec<RawFd> = Vec::new();
         const NUM_FDS: usize = 5;
@@ -163,14 +184,14 @@ impl VioSClient {
             )));
         }
 
-        fn pop<T: FromRawFd>(
+        fn pop<T: FromRawDescriptor>(
             safe_fds: &mut Vec<SafeDescriptor>,
             expected: usize,
             received: usize,
         ) -> Result<T> {
             unsafe {
                 // Safe because we transfer ownership from the SafeDescriptor to T
-                Ok(T::from_raw_fd(
+                Ok(T::from_raw_descriptor(
                     safe_fds
                         .pop()
                         .ok_or(Error::ProtocolError(
@@ -298,9 +319,7 @@ impl VioSClient {
             return Ok(());
         }
         self.recv_thread_state.lock().running = false;
-        self.recv_event
-            .write(1u64)
-            .map_err(Error::EventWriteError)?;
+        self.recv_event.signal().map_err(Error::EventWriteError)?;
         if let Some(handle) = self.recv_thread.lock().take() {
             return match handle.join() {
                 Ok(r) => r,
@@ -345,7 +364,7 @@ impl VioSClient {
             sequence: sequence.into(),
         };
         let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, msg)
+        send_cmd(&control_socket_lock, msg)
     }
 
     /// Configures a stream with the given parameters.
@@ -355,7 +374,7 @@ impl VioSClient {
             .ok_or(Error::InvalidStreamId(stream_id))?;
         let raw_params: virtio_snd_pcm_set_params = (stream_id, params).into();
         let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, raw_params)
+        send_cmd(&control_socket_lock, raw_params)
     }
 
     /// Configures a stream with the given parameters.
@@ -365,7 +384,7 @@ impl VioSClient {
             .get(stream_id as usize)
             .ok_or(Error::InvalidStreamId(stream_id))?;
         let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, raw_params)
+        send_cmd(&control_socket_lock, raw_params)
     }
 
     /// Send the PREPARE_STREAM command to the server.
@@ -447,14 +466,14 @@ impl VioSClient {
     }
 
     /// Get a list of file descriptors used by the implementation.
-    pub fn keep_fds(&self) -> Vec<RawFd> {
-        let control_fd = self.control_socket.lock().as_raw_fd();
-        let event_fd = self.event_socket.as_raw_fd();
+    pub fn keep_rds(&self) -> Vec<RawDescriptor> {
+        let control_desc = self.control_socket.lock().as_raw_descriptor();
+        let event_desc = self.event_socket.as_raw_descriptor();
         let recv_event = self.recv_event.as_raw_descriptor();
         let event_notifier = self.event_notifier.as_raw_descriptor();
-        let mut ret = vec![control_fd, event_fd, recv_event, event_notifier];
-        ret.append(&mut self.tx.keep_fds());
-        ret.append(&mut self.rx.keep_fds());
+        let mut ret = vec![control_desc, event_desc, recv_event, event_notifier];
+        ret.append(&mut self.tx.keep_rds());
+        ret.append(&mut self.rx.keep_rds());
         ret
     }
 
@@ -467,7 +486,7 @@ impl VioSClient {
             stream_id: stream_id.into(),
         };
         let control_socket_lock = self.control_socket.lock();
-        send_cmd(&*control_socket_lock, msg)
+        send_cmd(&control_socket_lock, msg)
     }
 
     fn request_and_cache_info(&mut self) -> Result<()> {
@@ -493,7 +512,7 @@ impl VioSClient {
             size: (std::mem::size_of::<virtio_snd_query_info>() as u32).into(),
         };
         let control_socket_lock = self.control_socket.lock();
-        seq_socket_send(&*control_socket_lock, req)?;
+        seq_socket_send(&control_socket_lock, req)?;
         let reply = control_socket_lock
             .recv_as_vec()
             .map_err(Error::ServerIOError)?;
@@ -563,7 +582,7 @@ struct ThreadFlags {
     reporting_events: bool,
 }
 
-#[derive(PollToken)]
+#[derive(EventToken)]
 enum Token {
     Notification,
     TxBufferMsg,
@@ -659,13 +678,13 @@ fn spawn_recv_thread(
                         let state_cpy = *state.lock();
                         if state_cpy.reporting_events {
                             event_queue.lock().push_back(evt);
-                            event_notifier.write(1).map_err(Error::EventWriteError)?;
+                            event_notifier.signal().map_err(Error::EventWriteError)?;
                         } // else just drop the events
                     }
                     Token::Notification => {
                         // Just consume the notification and check for termination on the next
                         // iteration
-                        if let Err(e) = event.read() {
+                        if let Err(e) = event.wait() {
                             error!("Failed to consume notification from recv thread: {:?}", e);
                         }
                     }
@@ -747,8 +766,11 @@ impl IoBufferQueue {
         seq_socket_send(&self.socket, msg)
     }
 
-    fn keep_fds(&self) -> Vec<RawFd> {
-        vec![self.file.as_raw_fd(), self.socket.as_raw_fd()]
+    fn keep_rds(&self) -> Vec<RawDescriptor> {
+        vec![
+            self.file.as_raw_descriptor(),
+            self.socket.as_raw_descriptor(),
+        ]
     }
 }
 

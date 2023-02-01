@@ -1,15 +1,17 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2020 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 use std::ffi::CStr;
 use std::io;
 use std::mem::size_of;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
+use std::ops::DerefMut;
 
 use base::AsRawDescriptor;
 use data_model::DataInit;
-use fuse::filesystem::{DirEntry, DirectoryIterator};
+use fuse::filesystem::DirEntry;
+use fuse::filesystem::DirectoryIterator;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]

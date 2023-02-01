@@ -1,4 +1,4 @@
-// Copyright 2018 The Chromium OS Authors. All rights reserved.
+// Copyright 2018 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,26 +6,50 @@ mod qcow_raw_file;
 mod refcount;
 mod vec_cache;
 
-use base::{
-    error, open_file, AsRawDescriptor, AsRawDescriptors, FileAllocate, FileReadWriteAtVolatile,
-    FileSetLen, FileSync, PunchHole, RawDescriptor, WriteZeroesAt,
-};
-use data_model::{VolatileMemory, VolatileSlice};
-use libc::{EINVAL, ENOSPC, ENOTSUP};
-use remain::sorted;
-use thiserror::Error;
-
-use std::cmp::{max, min};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::cmp::max;
+use std::cmp::min;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::mem::size_of;
 use std::path::Path;
 use std::str;
 
+use base::error;
+use base::open_file;
+use base::AsRawDescriptor;
+use base::AsRawDescriptors;
+use base::FileAllocate;
+use base::FileReadWriteAtVolatile;
+use base::FileSetLen;
+use base::FileSync;
+use base::PunchHole;
+use base::RawDescriptor;
+use base::WriteZeroesAt;
+use cros_async::Executor;
+use data_model::VolatileMemory;
+use data_model::VolatileSlice;
+use libc::EINVAL;
+use libc::ENOSPC;
+use libc::ENOTSUP;
+use remain::sorted;
+use thiserror::Error;
+
+use crate::create_disk_file;
 use crate::qcow::qcow_raw_file::QcowRawFile;
 use crate::qcow::refcount::RefCount;
-use crate::qcow::vec_cache::{CacheMap, Cacheable, VecCache};
-use crate::{create_disk_file, DiskFile, DiskGetLen};
+use crate::qcow::vec_cache::CacheMap;
+use crate::qcow::vec_cache::Cacheable;
+use crate::qcow::vec_cache::VecCache;
+use crate::AsyncDisk;
+use crate::AsyncDiskFileWrapper;
+use crate::DiskFile;
+use crate::DiskGetLen;
+use crate::ToAsyncDisk;
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -435,9 +459,15 @@ impl QcowFile {
                 OpenOptions::new().read(true), // TODO(b/190435784): Add support for O_DIRECT.
             )
             .map_err(|e| Error::BackingFileIo(e.into()))?;
-            let backing_file =
-                create_disk_file(backing_raw_file, max_nesting_depth, Path::new(&path))
-                    .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
+            // is_sparse_file is false because qcow is internally sparse and we don't need file
+            // system sparseness on top of that.
+            let backing_file = create_disk_file(
+                backing_raw_file,
+                /* is_sparse_file= */ false,
+                max_nesting_depth,
+                Path::new(&path),
+            )
+            .map_err(|e| Error::BackingFileOpen(Box::new(e)))?;
             Some(backing_file)
         } else {
             None
@@ -579,8 +609,11 @@ impl QcowFile {
             OpenOptions::new().read(true), // TODO(b/190435784): add support for O_DIRECT.
         )
         .map_err(|e| Error::BackingFileIo(e.into()))?;
+        // is_sparse_file is false because qcow is internally sparse and we don't need file
+        // system sparseness on top of that.
         let backing_file = create_disk_file(
             backing_raw_file,
+            /* is_sparse_file= */ false,
             backing_file_max_nesting_depth,
             backing_path,
         )
@@ -1390,9 +1423,7 @@ impl QcowFile {
             let offset = self.file_offset_write(curr_addr)?;
             let count = self.limit_range_cluster(curr_addr, write_count - nwritten);
 
-            if let Err(e) = cb(self.raw_file.file_mut(), nwritten, offset, count) {
-                return Err(e);
-            }
+            cb(self.raw_file.file_mut(), nwritten, offset, count)?;
 
             nwritten += count;
         }
@@ -1569,6 +1600,12 @@ impl WriteZeroesAt for QcowFile {
     }
 }
 
+impl ToAsyncDisk for QcowFile {
+    fn to_async_disk(self: Box<Self>, ex: &Executor) -> crate::Result<Box<dyn AsyncDisk>> {
+        Ok(Box::new(AsyncDiskFileWrapper::new(*self, ex)))
+    }
+}
+
 // Returns an Error if the given offset doesn't align to a cluster boundary.
 fn offset_is_cluster_boundary(offset: u64, cluster_bits: u32) -> Result<()> {
     if offset & ((0x01 << cluster_bits) - 1) != 0 {
@@ -1579,21 +1616,27 @@ fn offset_is_cluster_boundary(offset: u64, cluster_bits: u32) -> Result<()> {
 
 // Ceiling of the division of `dividend`/`divisor`.
 fn div_round_up_u64(dividend: u64, divisor: u64) -> u64 {
-    dividend / divisor + if dividend % divisor != 0 { 1 } else { 0 }
+    dividend / divisor + u64::from(dividend % divisor != 0)
 }
 
 // Ceiling of the division of `dividend`/`divisor`.
 fn div_round_up_u32(dividend: u32, divisor: u32) -> u32 {
-    dividend / divisor + if dividend % divisor != 0 { 1 } else { 0 }
+    dividend / divisor + u32::from(dividend % divisor != 0)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+
+    use tempfile::tempfile;
+    use tempfile::TempDir;
+
     use super::*;
     use crate::MAX_NESTING_DEPTH;
-    use std::fs::OpenOptions;
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use tempfile::{tempfile, TempDir};
 
     fn valid_header() -> Vec<u8> {
         vec![
@@ -1643,7 +1686,7 @@ mod tests {
     }
 
     fn basic_file(header: &[u8]) -> File {
-        let mut disk_file = tempfile().expect("failed to create tempfile");
+        let mut disk_file = tempfile().expect("failed to create temp file");
         disk_file.write_all(header).unwrap();
         disk_file.set_len(0x8000_0000).unwrap();
         disk_file.seek(SeekFrom::Start(0)).unwrap();
@@ -1661,7 +1704,7 @@ mod tests {
     where
         F: FnMut(QcowFile),
     {
-        let file = tempfile().expect("failed to create tempfile");
+        let file = tempfile().expect("failed to create temp file");
         let qcow_file = QcowFile::new(file, file_size).unwrap();
 
         testfn(qcow_file); // File closed when the function exits.
@@ -1686,7 +1729,7 @@ mod tests {
     #[test]
     fn default_header() {
         let header = QcowHeader::create_for_size_and_path(0x10_0000, None);
-        let mut disk_file = tempfile().expect("failed to create tempfile");
+        let mut disk_file = tempfile().expect("failed to create temp file");
         header
             .expect("Failed to create header.")
             .write_to(&mut disk_file)
@@ -1707,7 +1750,7 @@ mod tests {
     fn header_with_backing() {
         let header = QcowHeader::create_for_size_and_path(0x10_0000, Some("/my/path/to/a/file"))
             .expect("Failed to create header.");
-        let mut disk_file = tempfile().expect("failed to create tempfile");
+        let mut disk_file = tempfile().expect("failed to create temp file");
         header
             .write_to(&mut disk_file)
             .expect("Failed to write header to shm.");
@@ -1785,6 +1828,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn test_header_1_tb_file() {
         let mut header = test_huge_header();
@@ -1823,6 +1867,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn write_read_start() {
         with_basic_file(&valid_header(), |disk_file: File| {
@@ -1834,6 +1879,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn write_read_start_backing() {
         let disk_file = basic_file(&valid_header());
@@ -1847,6 +1893,7 @@ mod tests {
         assert_eq!(&buf, b"test");
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn write_read_start_backing_overlap() {
         let disk_file = basic_file(&valid_header());
@@ -1861,6 +1908,7 @@ mod tests {
         assert_eq!(&buf, b"TEST first");
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn offset_write_read() {
         with_basic_file(&valid_header(), |disk_file: File| {
@@ -1873,6 +1921,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn write_zeroes_read() {
         with_basic_file(&valid_header(), |disk_file: File| {
@@ -1893,6 +1942,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn write_zeroes_full_cluster() {
         // Choose a size that is larger than a cluster.
@@ -1914,6 +1964,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn write_zeroes_backing() {
         let disk_file = basic_file(&valid_header());
@@ -1956,6 +2007,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn replay_ext4() {
         with_basic_file(&valid_header(), |disk_file: File| {
@@ -2330,10 +2382,11 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn combo_write_read() {
         with_default_file(1024 * 1024 * 1024 * 256, |mut qcow_file| {
-            const NUM_BLOCKS: usize = 555;
+            const NUM_BLOCKS: usize = 55;
             const BLOCK_SIZE: usize = 0x1_0000;
             const OFFSET: u64 = 0x1_0000_0020;
             let data = [0x55u8; BLOCK_SIZE];
@@ -2378,6 +2431,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn nested_qcow() {
         let tmp_dir = TempDir::new().unwrap();

@@ -1,9 +1,11 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2020 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Result};
+use std::io::ErrorKind;
+use std::io::Read;
+use std::io::Result;
 use std::path::Path;
 
 use data_model::DataInit;
@@ -124,9 +126,11 @@ impl SDT {
 
 #[cfg(test)]
 mod tests {
-    use super::SDT;
     use std::io::Write;
+
     use tempfile::NamedTempFile;
+
+    use super::SDT;
 
     #[test]
     fn test_sdt() {

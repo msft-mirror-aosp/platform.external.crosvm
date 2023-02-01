@@ -1,15 +1,26 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2020 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
-use base::{Error, Result};
+use base::Error;
+use base::Result;
 use downcast_rs::impl_downcast;
+#[cfg(feature = "gdb")]
+use gdbstub::arch::Arch;
+#[cfg(feature = "gdb")]
+use gdbstub_arch::aarch64::AArch64 as GdbArch;
 use libc::EINVAL;
 use vm_memory::GuestAddress;
 
-use crate::{Hypervisor, IrqRoute, IrqSource, IrqSourceChip, Vcpu, Vm};
+use crate::Hypervisor;
+use crate::IrqRoute;
+use crate::IrqSource;
+use crate::IrqSourceChip;
+use crate::Vcpu;
+use crate::Vm;
 
 /// Represents a version of Power State Coordination Interface (PSCI).
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
@@ -39,6 +50,14 @@ impl TryFrom<u32> for PsciVersion {
 pub const PSCI_0_2: PsciVersion = PsciVersion { major: 0, minor: 2 };
 pub const PSCI_1_0: PsciVersion = PsciVersion { major: 1, minor: 0 };
 
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub enum VcpuRegAArch64 {
+    X(u8),
+    Sp,
+    Pc,
+    Pstate,
+}
+
 /// A wrapper for using a VM on aarch64 and getting/setting its state.
 pub trait VmAArch64: Vm {
     /// Gets the `Hypervisor` that created this VM.
@@ -46,7 +65,7 @@ pub trait VmAArch64: Vm {
 
     /// Load pVM firmware for the VM, creating a memslot for it as needed.
     ///
-    /// Only works on protected VMs (i.e. those  that support `VmCap::Protected`).
+    /// Only works on protected VMs (i.e. those that support `VmCap::Protected`).
     fn load_protected_vm_firmware(&mut self, fw_addr: GuestAddress, fw_max_size: u64)
         -> Result<()>;
 
@@ -72,19 +91,52 @@ pub trait VcpuAArch64: Vcpu {
     /// structure as `pvtime_ipa`.
     fn init_pvtime(&self, pvtime_ipa: u64) -> Result<()>;
 
-    /// Sets the value of a register on this VCPU.  `reg_id` is the register ID, as specified in the
-    /// KVM API documentation for KVM_SET_ONE_REG.
-    fn set_one_reg(&self, reg_id: u64, data: u64) -> Result<()>;
+    /// Sets the value of a register on this VCPU.
+    fn set_one_reg(&self, reg_id: VcpuRegAArch64, data: u64) -> Result<()>;
 
-    /// Gets the value of a register on this VCPU.  `reg_id` is the register ID, as specified in the
-    /// KVM API documentation for KVM_GET_ONE_REG.
-    fn get_one_reg(&self, reg_id: u64) -> Result<u64>;
+    /// Gets the value of a register on this VCPU.
+    fn get_one_reg(&self, reg_id: VcpuRegAArch64) -> Result<u64>;
 
     /// Gets the current PSCI version.
     fn get_psci_version(&self) -> Result<PsciVersion>;
+
+    #[cfg(feature = "gdb")]
+    /// Sets up debug registers and configure vcpu for handling guest debug events.
+    fn set_guest_debug(&self, addrs: &[GuestAddress], enable_singlestep: bool) -> Result<()>;
+
+    #[cfg(feature = "gdb")]
+    /// Sets the VCPU general registers used by GDB 'G' packets.
+    fn set_gdb_registers(&self, regs: &<GdbArch as Arch>::Registers) -> Result<()>;
+
+    #[cfg(feature = "gdb")]
+    /// Gets the VCPU general registers used by GDB 'g' packets.
+    fn get_gdb_registers(&self, regs: &mut <GdbArch as Arch>::Registers) -> Result<()>;
+
+    #[cfg(feature = "gdb")]
+    /// Gets the max number of hardware breakpoints.
+    fn get_max_hw_bps(&self) -> Result<usize>;
+
+    #[cfg(feature = "gdb")]
+    /// Sets the value of a single register on this VCPU.
+    fn set_gdb_register(&self, reg: <GdbArch as Arch>::RegId, data: &[u8]) -> Result<()>;
+
+    #[cfg(feature = "gdb")]
+    /// Gets the value of a single register on this VCPU.
+    fn get_gdb_register(&self, reg: <GdbArch as Arch>::RegId, data: &mut [u8]) -> Result<usize>;
 }
 
 impl_downcast!(VcpuAArch64);
+
+/// Initial register state for AArch64 VCPUs.
+#[derive(Clone, Default)]
+pub struct VcpuInitAArch64 {
+    /// Initial register state as a map of register name to value pairs. Registers that do not have
+    /// a value specified in this map will retain the original value provided by the hypervisor.
+    pub regs: BTreeMap<VcpuRegAArch64, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuConfigAArch64 {}
 
 // Convenience constructors for IrqRoutes
 impl IrqRoute {

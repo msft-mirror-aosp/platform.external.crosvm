@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
-# Copyright 2021 The Chromium OS Authors. All rights reserved.
+# Copyright 2021 The ChromiumOS Authors
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
 import argparse
+import fnmatch
 import functools
 import json
 import os
@@ -12,43 +12,36 @@ import subprocess
 import sys
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Dict, Iterable, List, NamedTuple
-import typing
+from typing import Dict, Iterable, List, NamedTuple, Optional
 
-import test_target
-from test_target import TestTarget
-import testvm
-from test_config import CRATE_OPTIONS, TestOption, BUILD_FEATURES
-from check_code_hygiene import (
-    has_platform_dependent_code,
-    has_crlf_line_endings,
-)
+from . import test_target, testvm
+from .common import all_tracked_files, very_verbose
+from .test_config import CRATE_OPTIONS, TestOption
+from .test_target import TestTarget, Triple
 
 USAGE = """\
 Runs tests for crosvm locally, in a vm or on a remote device.
 
 To build and run all tests locally:
 
-    $ ./tools/run_tests --target=host
+    $ ./tools/run_tests
 
-To cross-compile tests for aarch64 and run them on a built-in VM:
+Unit tests will be executed directly on the host, while integration tests will be executed inside
+a built-in VM.
 
-    $ ./tools/run_tests --target=vm:aarch64
+To cross-compile tests for aarch64, armhf or windows you can use:
 
-The VM will be automatically set up and booted. It will remain running between
-test runs and can be managed with `./tools/aarch64vm`.
+    $ ./tools/run_tests --platform=aarch64
+    $ ./tools/run_tests --platform=armhf
+    $ ./tools/run_tests --platform=mingw64
 
-Tests can also be run on a remote device via SSH. However it is your
-responsiblity that runtime dependencies of crosvm are provided.
-
-    $ ./tools/run_tests --target=ssh:hostname
+The built-in VMs will be automatically set up and booted. They will remain running between
+test runs and can be managed with `./tools/aarch64vm` or `./tools/x86vmm`.
 
 The default test target can be managed with `./tools/set_test_target`
 
 To see full build and test output, add the `-v` or `--verbose` flag.
 """
-
-Arch = test_target.Arch
 
 # Print debug info. Overriden by -v
 VERBOSE = False
@@ -71,10 +64,21 @@ COMMON_ROOT = CROSVM_ROOT / "common"
 class ExecutableResults(object):
     """Container for results of a test executable."""
 
-    def __init__(self, name: str, success: bool, test_log: str):
+    def __init__(
+        self,
+        name: str,
+        binary_file: Path,
+        success: bool,
+        test_log: str,
+        previous_attempts: List["ExecutableResults"],
+        profile_files: List[Path],
+    ):
         self.name = name
+        self.binary_file = binary_file
         self.success = success
         self.test_log = test_log
+        self.previous_attempts = previous_attempts
+        self.profile_files = profile_files
 
 
 class Executable(NamedTuple):
@@ -86,7 +90,6 @@ class Executable(NamedTuple):
     kind: str
     is_test: bool
     is_fresh: bool
-    arch: Arch
 
     @property
     def name(self):
@@ -100,48 +103,67 @@ class Crate(NamedTuple):
     path: Path
 
 
-def get_workspace_excludes(target_arch: Arch):
+def get_workspace_excludes(build_triple: Triple):
+    arch = build_triple.arch
+    sys = build_triple.sys
     for crate, options in CRATE_OPTIONS.items():
         if TestOption.DO_NOT_BUILD in options:
             yield crate
-        elif TestOption.DO_NOT_BUILD_X86_64 in options and target_arch == "x86_64":
+        elif TestOption.DO_NOT_BUILD_X86_64 in options and arch == "x86_64":
             yield crate
-        elif TestOption.DO_NOT_BUILD_AARCH64 in options and target_arch == "aarch64":
+        elif TestOption.DO_NOT_BUILD_AARCH64 in options and arch == "aarch64":
             yield crate
-        elif TestOption.DO_NOT_BUILD_ARMHF in options and target_arch == "armhf":
+        elif TestOption.DO_NOT_BUILD_ARMHF in options and arch == "armv7":
             yield crate
-        elif TestOption.DO_NOT_BUILD_WIN64 in options and target_arch == "win64":
+        elif TestOption.DO_NOT_BUILD_WIN64 in options and sys == "windows":
             yield crate
 
 
-def should_run_executable(executable: Executable, target_arch: Arch):
+def should_run_executable(
+    executable: Executable, target: TestTarget, test_names: List[str], execute_as_root: bool
+):
+    arch = target.build_triple.arch
+    sys = target.build_triple.sys
     options = CRATE_OPTIONS.get(executable.crate_name, [])
     if TestOption.DO_NOT_RUN in options:
         return False
-    if TestOption.DO_NOT_RUN_X86_64 in options and target_arch == "x86_64":
+    if TestOption.DO_NOT_RUN_X86_64 in options and arch == "x86_64":
         return False
-    if TestOption.DO_NOT_RUN_AARCH64 in options and target_arch == "aarch64":
+    if TestOption.DO_NOT_RUN_AARCH64 in options and arch == "aarch64":
         return False
-    if TestOption.DO_NOT_RUN_ARMHF in options and target_arch == "armhf":
+    if TestOption.DO_NOT_RUN_ARMHF in options and arch == "armv7":
         return False
-    if TestOption.DO_NOT_RUN_ON_FOREIGN_KERNEL in options and target_arch != executable.arch:
+    if TestOption.DO_NOT_RUN_WIN64 in options and sys == "windows":
+        return False
+    if TestOption.DO_NOT_RUN_ON_FOREIGN_KERNEL in options and not target.is_native:
+        return False
+    if TestOption.REQUIRES_ROOT in options and not execute_as_root:
+        return False
+    if test_names:
+        for name in test_names:
+            if fnmatch.fnmatch(executable.name, name):
+                return True
         return False
     return True
 
 
-def list_common_crates(target_arch: Arch):
-    excluded_crates = list(get_workspace_excludes(target_arch))
+def list_common_crates(build_triple: Triple):
+    excluded_crates = list(get_workspace_excludes(build_triple))
     for path in COMMON_ROOT.glob("**/Cargo.toml"):
-        if not path.parent.name in excluded_crates:
+        # TODO(b/213147081): remove this once common/cros_async is gone.
+        if not path.parent.name in excluded_crates and path.parent.name != "cros_async":
             yield Crate(name=path.parent.name, path=path.parent)
 
 
-def exclude_crosvm(target_arch: Arch):
-    return "crosvm" in get_workspace_excludes(target_arch)
+def exclude_crosvm(build_triple: Triple):
+    return "crosvm" in get_workspace_excludes(build_triple)
 
 
 def cargo(
-    cargo_command: str, cwd: Path, flags: list[str], env: dict[str, str], build_arch: Arch
+    cargo_command: str,
+    cwd: Path,
+    flags: List[str],
+    env: Dict[str, str],
 ) -> Iterable[Executable]:
     """
     Executes a cargo command and returns the list of test binaries generated.
@@ -151,10 +173,11 @@ def cargo(
 
     Note: Exits the program if the build fails.
     """
+    message_format = "json-diagnostic-rendered-ansi" if sys.stdout.isatty() else "json"
     cmd = [
         "cargo",
         cargo_command,
-        "--message-format=json-diagnostic-rendered-ansi",
+        f"--message-format={message_format}",
         *flags,
     ]
     if VERBOSE:
@@ -197,7 +220,6 @@ def cargo(
                 kind=json_line.get("target").get("kind")[0],
                 is_test=json_line.get("profile", {}).get("test", False),
                 is_fresh=json_line.get("fresh", False),
-                arch=build_arch,
             )
 
     if process.wait() != 0:
@@ -208,70 +230,68 @@ def cargo(
 
 
 def cargo_build_executables(
-    flags: list[str],
-    build_arch: Arch,
+    flags: List[str],
     cwd: Path = Path("."),
     env: Dict[str, str] = {},
 ) -> Iterable[Executable]:
     """Build all test binaries for the given list of crates."""
     # Run build first, to make sure compiler errors of building non-test
     # binaries are caught.
-    yield from cargo("build", cwd, flags, env, build_arch)
+    yield from cargo("build", cwd, flags, env)
 
     # Build all tests and return the collected executables
-    yield from cargo("test", cwd, ["--no-run", *flags], env, build_arch)
+    yield from cargo("test", cwd, ["--no-run", *flags], env)
 
 
-def build_common_crate(build_env: dict[str, str], build_arch: Arch, crate: Crate):
-    print(f"Building tests for: common/{crate.name}")
-    return list(cargo_build_executables([], build_arch, env=build_env, cwd=crate.path))
-
-
-def build_all_binaries(target: TestTarget, build_arch: Arch):
+def build_all_binaries(target: TestTarget, crosvm_direct: bool, instrument_coverage: bool):
     """Discover all crates and build them."""
     build_env = os.environ.copy()
-    build_env.update(test_target.get_cargo_env(target, build_arch))
+    build_env.update(test_target.get_cargo_env(target))
+
+    build_env.setdefault("RUSTFLAGS", "")
+    build_env["RUSTFLAGS"] += " -D warnings"
+    if instrument_coverage:
+        build_env["RUSTFLAGS"] += " -C instrument-coverage"
 
     print("Building crosvm workspace")
+    features = target.build_triple.feature_flag
+    extra_args: List[str] = []
+    if crosvm_direct:
+        features += ",direct"
+        extra_args.append("--no-default-features")
+
+    cargo_args = [
+        "--features=" + features,
+        f"--target={target.build_triple}",
+        "--workspace",
+        *[f"--exclude={crate}" for crate in get_workspace_excludes(target.build_triple)],
+    ]
+    if very_verbose():
+        cargo_args.append("--verbose")
+    cargo_args.extend(extra_args)
+
     yield from cargo_build_executables(
-        [
-            "--features=" + BUILD_FEATURES[build_arch],
-            "--verbose",
-            "--workspace",
-            *[f"--exclude={crate}" for crate in get_workspace_excludes(build_arch)],
-        ],
-        build_arch,
+        cargo_args,
         cwd=CROSVM_ROOT,
         env=build_env,
     )
-
-    with Pool(PARALLELISM) as pool:
-        for executables in pool.imap(
-            functools.partial(build_common_crate, build_env, build_arch),
-            list_common_crates(build_arch),
-        ):
-            yield from executables
-
-
-def is_emulated(target: TestTarget, executable: Executable) -> bool:
-    if target.is_host:
-        # User-space emulation can run foreing-arch executables on the host.
-        return executable.arch != target.arch
-    elif target.vm:
-        return target.vm == "aarch64"
-    return False
 
 
 def get_test_timeout(target: TestTarget, executable: Executable):
     large = TestOption.LARGE in CRATE_OPTIONS.get(executable.crate_name, [])
     timeout = LARGE_TEST_TIMEOUT_SECS if large else TEST_TIMEOUT_SECS
-    if is_emulated(target, executable):
-        return timeout * EMULATION_TIMEOUT_MULTIPLIER
-    else:
+    if target.is_native:
         return timeout
+    else:
+        return timeout * EMULATION_TIMEOUT_MULTIPLIER
 
 
-def execute_test(target: TestTarget, executable: Executable):
+def execute_test(
+    target: TestTarget,
+    attempts: int,
+    collect_coverage: bool,
+    executable: Executable,
+):
     """
     Executes a single test on the given test targed
 
@@ -280,82 +300,249 @@ def execute_test(target: TestTarget, executable: Executable):
     Test output is hidden unless the test fails or VERBOSE mode is enabled.
     """
     options = CRATE_OPTIONS.get(executable.crate_name, [])
-    args: list[str] = []
+    args: List[str] = []
     if TestOption.SINGLE_THREADED in options:
         args += ["--test-threads=1"]
 
     binary_path = executable.binary_path
 
-    if executable.arch == "win64" and executable.kind != "proc-macro" and os.name != "nt":
-        args.insert(0, binary_path)
-        binary_path = "wine64"
-
-
     # proc-macros and their tests are executed on the host.
     if executable.kind == "proc-macro":
         target = TestTarget("host")
 
-    if VERBOSE:
-        print(f"Running test {executable.name} on {target}...")
-    try:
-        # Pipe stdout/err to be printed in the main process if needed.
-        test_process = test_target.exec_file_on_target(
-            target,
-            binary_path,
-            args=args,
-            timeout=get_test_timeout(target, executable),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        return ExecutableResults(
-            executable.name,
-            test_process.returncode == 0,
-            test_process.stdout,
-        )
-    except subprocess.TimeoutExpired as e:
-        # Append a note about the timeout to the stdout of the process.
-        msg = f"\n\nProcess timed out after {e.timeout}s\n"
-        return ExecutableResults(
-            executable.name,
-            False,
-            e.stdout.decode("utf-8") + msg,
-        )
+    previous_attempts: List[ExecutableResults] = []
+    for i in range(1, attempts + 1):
+        if VERBOSE:
+            print(f"Running test {executable.name} on {target}... (attempt {i}/{attempts})")
+
+        try:
+            # Pipe stdout/err to be printed in the main process if needed.
+            test_process = test_target.exec_file_on_target(
+                target,
+                binary_path,
+                args=args,
+                timeout=get_test_timeout(target, executable),
+                generate_profile=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            profile_files: List[Path] = []
+            if collect_coverage:
+                profile_files = [*test_target.list_profile_files(binary_path)]
+                if not profile_files:
+                    print()
+                    print(f"Warning: Running {binary_path} did not produce a profile file.")
+
+            result = ExecutableResults(
+                executable.name,
+                binary_path,
+                test_process.returncode == 0,
+                test_process.stdout,
+                previous_attempts,
+                profile_files,
+            )
+        except subprocess.TimeoutExpired as e:
+            # Append a note about the timeout to the stdout of the process.
+            msg = f"\n\nProcess timed out after {e.timeout}s\n"
+            result = ExecutableResults(
+                executable.name,
+                binary_path,
+                False,
+                e.stdout.decode("utf-8") if e.stdout else "" + msg,
+                previous_attempts,
+                [],
+            )
+        if result.success:
+            break
+        else:
+            previous_attempts.append(result)
+
+    return result  # type: ignore
+
+
+def execute_integration_test(
+    target: TestTarget,
+    attempts: int,
+    collect_coverage: bool,
+    executable: Executable,
+):
+    """
+    Executes a single integration test on the given test targed
+
+    Test output is hidden unless the test fails or VERBOSE mode is enabled.
+    """
+    args: List[str] = ["--test-threads=1"]
+    binary_path = executable.binary_path
+    options = CRATE_OPTIONS.get(executable.crate_name, [])
+    execute_as_root = TestOption.REQUIRES_ROOT in options
+
+    previous_attempts: List[ExecutableResults] = []
+    for i in range(1, attempts + 1):
+        print(f"Running integration test {executable.name} on {target}... (attempt {i}/{attempts})")
+
+        try:
+            test_process = test_target.exec_file_on_target(
+                target,
+                binary_path,
+                args=args,
+                timeout=get_test_timeout(target, executable),
+                generate_profile=True,
+                stdout=None if VERBOSE else subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                execute_as_root=execute_as_root,
+            )
+            profile_files: List[Path] = []
+            if collect_coverage:
+                profile_files = [*test_target.list_profile_files(binary_path)]
+                if not profile_files:
+                    print()
+                    print(f"Warning: Running {binary_path} did not produce a profile file.")
+
+            result = ExecutableResults(
+                executable.name,
+                binary_path,
+                test_process.returncode == 0,
+                test_process.stdout,
+                previous_attempts,
+                profile_files,
+            )
+        except subprocess.TimeoutExpired as e:
+            # Append a note about the timeout to the stdout of the process.
+            msg = f"\n\nProcess timed out after {e.timeout}s\n"
+            result = ExecutableResults(
+                executable.name,
+                binary_path,
+                False,
+                e.stdout.decode("utf-8") + msg if e.stdout else msg,
+                previous_attempts,
+                [],
+            )
+        if result.success:
+            break
+        else:
+            previous_attempts.append(result)
+
+    return result  # type: ignore
+
+
+def print_test_progress(result: ExecutableResults):
+    if not result.success or result.previous_attempts or VERBOSE:
+        if result.success:
+            msg = "is flaky" if result.previous_attempts else "passed"
+        else:
+            msg = "failed"
+        print()
+        print("--------------------------------")
+        print("-", result.name, msg)
+        print("--------------------------------")
+        print(result.test_log)
+        if result.success:
+            for i, attempt in enumerate(result.previous_attempts):
+                print()
+                print(f"- Previous attempt {i}")
+                print(attempt.test_log)
+    else:
+        sys.stdout.write(".")
+        sys.stdout.flush()
 
 
 def execute_all(
-    executables: list[Executable],
-    target: test_target.TestTarget,
-    repeat: int,
+    executables: List[Executable],
+    unit_test_target: Optional[test_target.TestTarget],
+    integration_test_target: Optional[test_target.TestTarget],
+    attempts: int,
+    collect_coverage: bool,
 ):
     """Executes all tests in the `executables` list in parallel."""
-    executables = [e for e in executables if should_run_executable(e, target.arch)]
-    if repeat > 1:
-        executables = executables * repeat
-        random.shuffle(executables)
 
-    sys.stdout.write(f"Running {len(executables)} test binaries on {target}")
-    sys.stdout.flush()
-    with Pool(PARALLELISM) as pool:
-        for result in pool.imap(functools.partial(execute_test, target), executables):
-            if not result.success or VERBOSE:
-                msg = "passed" if result.success else "failed"
-                print()
-                print("--------------------------------")
-                print("-", result.name, msg)
-                print("--------------------------------")
+    def is_integration_test(executable: Executable):
+        options = CRATE_OPTIONS.get(executable.crate_name, [])
+        return executable.kind == "test" or TestOption.UNIT_AS_INTEGRATION_TEST in options
+
+    unit_tests = [e for e in executables if not is_integration_test(e)]
+    if unit_test_target:
+        sys.stdout.write(f"Running {len(unit_tests)} unit tests on {unit_test_target}")
+        sys.stdout.flush()
+        with Pool(PARALLELISM) as pool:
+            for result in pool.imap(
+                functools.partial(execute_test, unit_test_target, attempts, collect_coverage),
+                unit_tests,
+            ):
+                print_test_progress(result)
+                yield result
+        print()
+    else:
+        print("Not running unit tests as requested.")
+
+    if integration_test_target:
+        integration_tests = [e for e in executables if is_integration_test(e)]
+        sys.stdout.write(
+            f"Running {len(integration_tests)} integration tests on {integration_test_target}"
+        )
+        sys.stdout.flush()
+        for executable in integration_tests:
+            result = execute_integration_test(
+                integration_test_target, attempts, collect_coverage, executable
+            )
+            if not result.success:
                 print(result.test_log)
-            else:
-                sys.stdout.write(".")
-                sys.stdout.flush()
             yield result
-    print()
+        print()
+
+    else:
+        print("Not running integration tests as requested.")
 
 
-def find_crosvm_binary(executables: list[Executable]):
+def find_crosvm_binary(executables: List[Executable]):
     for executable in executables:
         if not executable.is_test and executable.cargo_target == "crosvm":
             return executable
     raise Exception("Cannot find crosvm executable")
+
+
+def generate_lcov(
+    results: List[ExecutableResults], crosvm_binary: Path, lcov_file: str, print_report: bool
+):
+    print("Merging profiles")
+    merged_file = testvm.cargo_target_dir() / "merged.profraw"
+    profiles = [str(p) for r in results if r.profile_files for p in r.profile_files]
+    subprocess.check_call(["rust-profdata", "merge", "-sparse", *profiles, "-o", str(merged_file)])
+
+    print("Generating lcov")
+    all_rust_src = [f for f in all_tracked_files() if f.suffix == ".rs"]
+    lcov_data = subprocess.check_output(
+        [
+            "rust-cov",
+            "export",
+            "--format=lcov",
+            f"--instr-profile={merged_file}",
+            *(f"--object={r.binary_file}" for r in results),
+            str(crosvm_binary),
+            *all_rust_src,
+        ],
+        text=True,
+    )
+    open(lcov_file, "w").write(lcov_data)
+    if print_report:
+        subprocess.check_call(
+            [
+                "rust-cov",
+                "report",
+                "-show-region-summary=False",
+                "-show-branch-summary=False",
+                f"-instr-profile={merged_file}",
+                *(f"-object={r.binary_file}" for r in results),
+                str(crosvm_binary),
+                *all_rust_src,
+            ]
+        )
+
+
+def sudo_is_passwordless():
+    # Run with --askpass but no askpass set, succeeds only if passwordless sudo
+    # is available.
+    (ret, _) = subprocess.getstatusoutput("SUDO_ASKPASS=false sudo --askpass true")
+    return ret == 0
 
 
 def main():
@@ -372,13 +559,49 @@ def main():
         help="Execute tests on the selected target. See ./tools/set_test_target",
     )
     parser.add_argument(
-        "--arch",
-        choices=typing.get_args(Arch),
-        help="Target architecture to build for.",
+        "--build-target",
+        "--platform",
+        "-p",
+        help=(
+            "Override the cargo triple to build. Shorthands are available: (x86_64, armhf, "
+            + "aarch64, mingw64, msvc64)."
+        ),
+    )
+    parser.add_argument(
+        "--emulator",
+        help=(
+            "Specify a command wrapper to run non-native test binaries (e.g. wine64, "
+            + "qemu-aarch64-static, ...)."
+        ),
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Clean any compilation artifacts and rebuild test VM.",
     )
     parser.add_argument(
         "--build-only",
         action="store_true",
+    )
+    parser.add_argument("--unit-tests", action="store_true")
+    parser.add_argument("--integration-tests", action="store_true")
+    parser.add_argument(
+        "--cov",
+        action="store_true",
+        help="Generates lcov.info and prints coverage report.",
+    )
+    parser.add_argument(
+        "--generate-lcov",
+        help="Generate an lcov code coverage profile",
+    )
+    parser.add_argument(
+        "--crosvm-direct",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-root",
+        action="store_true",
+        help="Disables tests that require to be run as root.",
     )
     parser.add_argument(
         "--repeat",
@@ -386,38 +609,104 @@ def main():
         default=1,
         help="Repeat each test N times to check for flakes.",
     )
+    parser.add_argument(
+        "--retry",
+        type=int,
+        default=0,
+        help="Retry a test N times if it has failed.",
+    )
+    parser.add_argument(
+        "--arch",
+        help="Deprecated. Please use --build-target instead.",
+    )
+    parser.add_argument(
+        "test_names",
+        nargs="*",
+        default=[],
+        help=(
+            "Names (crate_name:binary_name) of test binaries to run "
+            + "(e.g. integration_tests:boot). Globs are supported (e.g. crosvm:*)"
+        ),
+    )
     args = parser.parse_args()
 
     global VERBOSE
     VERBOSE = args.verbose  # type: ignore
     os.environ["RUST_BACKTRACE"] = "1"
 
-    target = (
-        test_target.TestTarget(args.target) if args.target else test_target.TestTarget.default()
-    )
-    print("Test target:", target)
+    if args.arch:
+        print("WARNING!")
+        print("--arch is deprecated. Please use --build-target instead.")
+        print()
+        build_target = Triple.from_shorthand(args.arch)
 
-    build_arch = args.arch or target.arch
-    print("Building for architecture:", build_arch)
+    if args.cov:
+        args.generate_lcov = "lcov.info"
+    collect_coverage = bool(args.generate_lcov)
+    emulator_cmd = args.emulator.split(" ") if args.emulator else None
+    build_target = Triple.from_shorthand(args.build_target) if args.build_target else None
+
+    if args.target:
+        print("Warning: Setting --target for running crosvm tests is deprecated.")
+        print()
+        print("  Use --platform instead to specify which platform to test for. For example:")
+        print("  `./tools/run_tests --platform=aarch64` (or armhf, or mingw64)")
+        print()
+        print("  Using --platform will run unit tests directly on the host and integration tests")
+        print("  in a test VM. This is the behavior used by Luci as well.")
+        print("  Setting --target will force both unit and integration tests to run on the")
+        print("  specified target instead.")
+        target = test_target.TestTarget(args.target, build_target, emulator_cmd)
+        unit_test_target = target
+        integration_test_target = target
+    else:
+        build_target = build_target or Triple.host_default()
+        unit_test_target = test_target.TestTarget("host", build_target)
+        if str(build_target) == "x86_64-unknown-linux-gnu" and os.name == "posix":
+            print("Note: x86 tests are temporarily all run on the host until we improve the")
+            print("      performance of the built-in VM. See http://b/247139912")
+            print("")
+            integration_test_target = unit_test_target
+        elif str(build_target) == "aarch64-unknown-linux-gnu":
+            integration_test_target = test_target.TestTarget("vm:aarch64", build_target)
+        elif str(build_target) == "x86_64-pc-windows-gnu" and os.name == "nt":
+            integration_test_target = unit_test_target
+            args.no_root = True
+        else:
+            # Do not run integration tests in unrecognized scenarios.
+            integration_test_target = None
+
+    if args.unit_tests and not args.integration_tests:
+        integration_test_target = None
+    elif args.integration_tests and not args.unit_tests:
+        unit_test_target = None
+
+    print("Unit Test target:", unit_test_target or "skip")
+    print("Integration Test target:", integration_test_target or "skip")
+
+    if not args.no_root and integration_test_target and integration_test_target.is_host:
+        if not sudo_is_passwordless():
+            print()
+            print("Prompting for sudo password to execute privileged tests.")
+            print("If you'd like to prevent this, use the --no-root option.")
+            subprocess.check_call(["sudo", "true"])
+            print()
+
+    main_target = integration_test_target or unit_test_target
+    if not main_target:
+        return
+
+    if args.clean:
+        if main_target.vm:
+            testvm.clean(main_target.vm)
+        subprocess.check_call(["cargo", "clean"])
 
     # Start booting VM while we build
-    if target.vm:
-        testvm.build_if_needed(target.vm)
-        testvm.up(target.vm)
+    if main_target.vm:
+        testvm.build_if_needed(main_target.vm)
+        testvm.up(main_target.vm)
 
-    hygiene, error = has_platform_dependent_code(Path("common/sys_util_core"))
-    if not hygiene:
-        print("Error: Platform dependent code not allowed in sys_util_core crate.")
-        print("Offending line: " + error)
-        sys.exit(-1)
-
-    crlf_endings = has_crlf_line_endings()
-    if crlf_endings:
-        print("Error: Following files have crlf(dos) line encodings")
-        print(*crlf_endings)
-        sys.exit(-1)
-
-    executables = list(build_all_binaries(target, build_arch))
+    executables = list(build_all_binaries(main_target, args.crosvm_direct, collect_coverage))
 
     if args.build_only:
         print("Not running tests as requested.")
@@ -425,16 +714,45 @@ def main():
 
     # Upload dependencies plus the main crosvm binary for integration tests if the
     # crosvm binary is not excluded from testing.
-    extra_files = (
-        [find_crosvm_binary(executables).binary_path] if not exclude_crosvm(build_arch) else []
-    )
+    crosvm_binary = find_crosvm_binary(executables).binary_path
+    extra_files = [crosvm_binary] if not exclude_crosvm(main_target.build_triple) else []
 
-    test_target.prepare_target(target, extra_files=extra_files)
+    test_target.prepare_target(main_target, extra_files=extra_files)
 
     # Execute all test binaries
-    test_executables = [e for e in executables if e.is_test]
-    all_results = list(execute_all(test_executables, target, repeat=args.repeat))
+    test_executables = [
+        e
+        for e in executables
+        if e.is_test and should_run_executable(e, main_target, args.test_names, not args.no_root)
+    ]
 
+    all_results: List[ExecutableResults] = []
+    for i in range(args.repeat):
+        if args.repeat > 1:
+            print()
+            print(f"Round {i+1}/{args.repeat}:")
+        results = [
+            *execute_all(
+                test_executables,
+                unit_test_target,
+                integration_test_target,
+                args.retry + 1,
+                collect_coverage,
+            )
+        ]
+        if args.generate_lcov and i == args.repeat - 1:
+            generate_lcov(results, crosvm_binary, args.generate_lcov, args.cov)
+        all_results.extend(results)
+        random.shuffle(test_executables)
+
+    flakes = [r for r in all_results if r.previous_attempts and r.success]
+    if flakes:
+        print()
+        print(f"There are {len(flakes)} flaky tests")
+        for result in flakes:
+            print(f"  {result.name}")
+
+    print()
     failed = [r for r in all_results if not r.success]
     if len(failed) == 0:
         print("All tests passed.")
@@ -443,14 +761,4 @@ def main():
         print(f"{len(failed)} of {len(all_results)} tests failed:")
         for result in failed:
             print(f"  {result.name}")
-        sys.exit(-1)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except subprocess.CalledProcessError as e:
-        print("Command failed:", e.cmd)
-        print(e.stdout)
-        print(e.stderr)
         sys.exit(-1)

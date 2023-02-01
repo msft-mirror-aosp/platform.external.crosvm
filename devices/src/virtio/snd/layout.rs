@@ -1,19 +1,12 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2020 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::virtio::snd::constants::VIRTIO_SND_CHMAP_MAX_SIZE;
-use data_model::{DataInit, Le32, Le64};
+use data_model::DataInit;
+use data_model::Le32;
+use data_model::Le64;
 
-#[derive(Copy, Clone, Default)]
-#[repr(C, packed)]
-pub struct virtio_snd_config {
-    pub jacks: Le32,
-    pub streams: Le32,
-    pub chmaps: Le32,
-}
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for virtio_snd_config {}
+use crate::virtio::snd::constants::VIRTIO_SND_CHMAP_MAX_SIZE;
 
 #[derive(Copy, Clone, Default)]
 #[repr(C)]

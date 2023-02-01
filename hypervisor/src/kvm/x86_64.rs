@@ -1,32 +1,66 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2020 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::arch::x86_64::__cpuid;
+use std::arch::x86_64::CpuidResult;
 
+use base::errno_result;
+use base::error;
+use base::ioctl;
+use base::ioctl_with_mut_ptr;
+use base::ioctl_with_mut_ref;
+use base::ioctl_with_ptr;
+use base::ioctl_with_ref;
+use base::ioctl_with_val;
+use base::AsRawDescriptor;
+use base::Error;
 use base::IoctlNr;
-
-use libc::E2BIG;
-
-use base::{
-    errno_result, error, ioctl, ioctl_with_mut_ptr, ioctl_with_mut_ref, ioctl_with_ptr,
-    ioctl_with_ref, ioctl_with_val, AsRawDescriptor, Error, MappedRegion, Result,
-};
+use base::MappedRegion;
+use base::Result;
 use data_model::vec_with_array_field;
 use kvm_sys::*;
+use libc::E2BIG;
+use libc::ENXIO;
 use vm_memory::GuestAddress;
 
-use super::{Kvm, KvmVcpu, KvmVm};
-use crate::{
-    ClockState, CpuId, CpuIdEntry, DebugRegs, DescriptorTable, DeviceKind, Fpu, HypervisorX86_64,
-    IoapicRedirectionTableEntry, IoapicState, IrqSourceChip, LapicState, PicSelect, PicState,
-    PitChannelState, PitState, ProtectionType, Register, Regs, Segment, Sregs, VcpuExit,
-    VcpuX86_64, VmCap, VmX86_64, MAX_IOAPIC_PINS, NUM_IOAPIC_PINS,
-};
+use super::Config;
+use super::Kvm;
+use super::KvmVcpu;
+use super::KvmVm;
+use crate::get_tsc_offset_from_msr;
+use crate::host_phys_addr_bits;
+use crate::set_tsc_offset_via_msr;
+use crate::ClockState;
+use crate::CpuId;
+use crate::CpuIdEntry;
+use crate::DebugRegs;
+use crate::DescriptorTable;
+use crate::DeviceKind;
+use crate::Fpu;
+use crate::HypervisorX86_64;
+use crate::IoapicRedirectionTableEntry;
+use crate::IoapicState;
+use crate::IrqSourceChip;
+use crate::LapicState;
+use crate::PicSelect;
+use crate::PicState;
+use crate::PitChannelState;
+use crate::PitState;
+use crate::ProtectionType;
+use crate::Register;
+use crate::Regs;
+use crate::Segment;
+use crate::Sregs;
+use crate::VcpuExit;
+use crate::VcpuX86_64;
+use crate::VmCap;
+use crate::VmX86_64;
+use crate::MAX_IOAPIC_PINS;
+use crate::NUM_IOAPIC_PINS;
 
 type KvmCpuId = kvm::CpuId;
 
-fn get_cpuid_with_initial_capacity<T: AsRawDescriptor>(
+pub fn get_cpuid_with_initial_capacity<T: AsRawDescriptor>(
     descriptor: &T,
     kind: IoctlNr,
     initial_capacity: usize,
@@ -79,16 +113,8 @@ impl Kvm {
 
     /// Get the size of guest physical addresses in bits.
     pub fn get_guest_phys_addr_bits(&self) -> u8 {
-        // Get host cpu max physical address bits.
         // Assume the guest physical address size is the same as the host.
-        let highest_ext_function = unsafe { __cpuid(0x80000000) };
-        if highest_ext_function.eax >= 0x80000008 {
-            let addr_size = unsafe { __cpuid(0x80000008) };
-            // Low 8 bits of 0x80000008 leaf: host physical address size in bits.
-            addr_size.eax as u8
-        } else {
-            36
-        }
+        host_phys_addr_bits()
     }
 }
 
@@ -133,6 +159,11 @@ impl HypervisorX86_64 for Kvm {
 }
 
 impl KvmVm {
+    /// Does platform specific initialization for the KvmVm.
+    pub fn init_arch(&self, _cfg: &Config) -> Result<()> {
+        Ok(())
+    }
+
     /// Checks if a particular `VmCap` is available, or returns None if arch-independent
     /// Vm.check_capability() should handle the check.
     pub fn check_capability_arch(&self, c: VmCap) -> Option<bool> {
@@ -324,13 +355,95 @@ impl KvmVm {
         cap.args[0] = (KVM_MSR_EXIT_REASON_UNKNOWN
             | KVM_MSR_EXIT_REASON_INVAL
             | KVM_MSR_EXIT_REASON_FILTER) as u64;
-        // TODO(b/215297064): Filter only the ones we care about with ioctl
-        // KVM_X86_SET_MSR_FILTER
 
         // Safe because we know that our file is a VM fd, we know that the
         // kernel will only read correct amount of memory from our pointer, and
         // we verify the return result.
         let ret = unsafe { ioctl_with_ref(self, KVM_ENABLE_CAP(), &cap) };
+        if ret < 0 {
+            errno_result()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set MSR_PLATFORM_INFO read access.
+    pub fn set_platform_info_read_access(&self, allow_read: bool) -> Result<()> {
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_MSR_PLATFORM_INFO,
+            ..Default::default()
+        };
+        cap.args[0] = allow_read as u64;
+
+        // Safe because we know that our file is a VM fd, we know that the
+        // kernel will only read correct amount of memory from our pointer, and
+        // we verify the return result.
+        let ret = unsafe { ioctl_with_ref(self, KVM_ENABLE_CAP(), &cap) };
+        if ret < 0 {
+            errno_result()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set msr filter.
+    pub fn set_msr_filter(&self, msr_list: (Vec<u32>, Vec<u32>)) -> Result<()> {
+        let mut rd_nmsrs: u32 = 0;
+        let mut wr_nmsrs: u32 = 0;
+        let mut rd_msr_bitmap: [u8; KVM_MSR_FILTER_RANGE_MAX_BYTES] =
+            [0xff; KVM_MSR_FILTER_RANGE_MAX_BYTES];
+        let mut wr_msr_bitmap: [u8; KVM_MSR_FILTER_RANGE_MAX_BYTES] =
+            [0xff; KVM_MSR_FILTER_RANGE_MAX_BYTES];
+        let (rd_msrs, wr_msrs) = msr_list;
+
+        for index in rd_msrs {
+            // currently we only consider the MSR lower than
+            // KVM_MSR_FILTER_RANGE_MAX_BITS
+            if index >= (KVM_MSR_FILTER_RANGE_MAX_BITS as u32) {
+                continue;
+            }
+            rd_nmsrs += 1;
+            rd_msr_bitmap[(index / 8) as usize] &= !(1 << (index & 0x7));
+        }
+        for index in wr_msrs {
+            // currently we only consider the MSR lower than
+            // KVM_MSR_FILTER_RANGE_MAX_BITS
+            if index >= (KVM_MSR_FILTER_RANGE_MAX_BITS as u32) {
+                continue;
+            }
+            wr_nmsrs += 1;
+            wr_msr_bitmap[(index / 8) as usize] &= !(1 << (index & 0x7));
+        }
+
+        let mut msr_filter = kvm_msr_filter {
+            flags: KVM_MSR_FILTER_DEFAULT_ALLOW,
+            ..Default::default()
+        };
+
+        let mut count = 0;
+        if rd_nmsrs > 0 {
+            msr_filter.ranges[count].flags = KVM_MSR_FILTER_READ;
+            msr_filter.ranges[count].nmsrs = KVM_MSR_FILTER_RANGE_MAX_BITS as u32;
+            msr_filter.ranges[count].base = 0x0;
+            msr_filter.ranges[count].bitmap = rd_msr_bitmap.as_mut_ptr();
+            count += 1;
+        }
+        if wr_nmsrs > 0 {
+            msr_filter.ranges[count].flags = KVM_MSR_FILTER_WRITE;
+            msr_filter.ranges[count].nmsrs = KVM_MSR_FILTER_RANGE_MAX_BITS as u32;
+            msr_filter.ranges[count].base = 0x0;
+            msr_filter.ranges[count].bitmap = wr_msr_bitmap.as_mut_ptr();
+            count += 1;
+        }
+
+        let mut ret = 0;
+        if count > 0 {
+            // Safe because we know that our file is a VM fd, we know that the
+            // kernel will only read correct amount of memory from our pointer, and
+            // we verify the return result.
+            ret = unsafe { ioctl_with_ref(self, KVM_X86_SET_MSR_FILTER(), &msr_filter) };
+        }
+
         if ret < 0 {
             errno_result()
         } else {
@@ -364,7 +477,7 @@ impl VmX86_64 for KvmVm {
     fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuX86_64>> {
         // create_vcpu is declared separately in VmAArch64 and VmX86, so it can return VcpuAArch64
         // or VcpuX86.  But both use the same implementation in KvmVm::create_vcpu.
-        Ok(Box::new(KvmVm::create_vcpu(self, id)?))
+        Ok(Box::new(KvmVm::create_kvm_vcpu(self, id)?))
     }
 
     /// Sets the address of the three-page region in the VM's address space.
@@ -423,7 +536,7 @@ impl VcpuX86_64 for KvmVcpu {
         // kernel told us how large it was. The pointer is page aligned so casting to a different
         // type is well defined, hence the clippy allow attribute.
         let run = unsafe { &mut *(self.run_mmap.as_ptr() as *mut kvm_run) };
-        run.request_interrupt_window = if requested { 1 } else { 0 };
+        run.request_interrupt_window = requested.into();
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -498,10 +611,36 @@ impl VcpuX86_64 for KvmVcpu {
     }
 
     fn set_sregs(&self, sregs: &Sregs) -> Result<()> {
-        let sregs = kvm_sregs::from(sregs);
+        // Get the current `kvm_sregs` so we can use its `apic_base` and `interrupt_bitmap`, which
+        // are not present in `Sregs`.
+        // Safe because we know that our file is a VCPU fd, we know the kernel will only write the
+        // correct amount of memory to our pointer, and we verify the return result.
+        let mut kvm_sregs: kvm_sregs = Default::default();
+        let ret = unsafe { ioctl_with_mut_ref(self, KVM_GET_SREGS(), &mut kvm_sregs) };
+        if ret != 0 {
+            return errno_result();
+        }
+
+        kvm_sregs.cs = kvm_segment::from(&sregs.cs);
+        kvm_sregs.ds = kvm_segment::from(&sregs.ds);
+        kvm_sregs.es = kvm_segment::from(&sregs.es);
+        kvm_sregs.fs = kvm_segment::from(&sregs.fs);
+        kvm_sregs.gs = kvm_segment::from(&sregs.gs);
+        kvm_sregs.ss = kvm_segment::from(&sregs.ss);
+        kvm_sregs.tr = kvm_segment::from(&sregs.tr);
+        kvm_sregs.ldt = kvm_segment::from(&sregs.ldt);
+        kvm_sregs.gdt = kvm_dtable::from(&sregs.gdt);
+        kvm_sregs.idt = kvm_dtable::from(&sregs.idt);
+        kvm_sregs.cr0 = sregs.cr0;
+        kvm_sregs.cr2 = sregs.cr2;
+        kvm_sregs.cr3 = sregs.cr3;
+        kvm_sregs.cr4 = sregs.cr4;
+        kvm_sregs.cr8 = sregs.cr8;
+        kvm_sregs.efer = sregs.efer;
+
         // Safe because we know that our file is a VCPU fd, we know the kernel will only read the
         // correct amount of memory from our pointer, and we verify the return result.
-        let ret = unsafe { ioctl_with_ref(self, KVM_SET_SREGS(), &sregs) };
+        let ret = unsafe { ioctl_with_ref(self, KVM_SET_SREGS(), &kvm_sregs) };
         if ret == 0 {
             Ok(())
         } else {
@@ -678,6 +817,21 @@ impl VcpuX86_64 for KvmVcpu {
             errno_result()
         }
     }
+
+    /// KVM does not support the VcpuExit::Cpuid exit type.
+    fn handle_cpuid(&mut self, _entry: &CpuIdEntry) -> Result<()> {
+        Err(Error::new(ENXIO))
+    }
+
+    fn get_tsc_offset(&self) -> Result<u64> {
+        // Use the default MSR-based implementation
+        get_tsc_offset_from_msr(self)
+    }
+
+    fn set_tsc_offset(&self, offset: u64) -> Result<()> {
+        // Use the default MSR-based implementation
+        set_tsc_offset_via_msr(self, offset)
+    }
 }
 
 impl KvmVcpu {
@@ -723,10 +877,12 @@ impl<'a> From<&'a KvmCpuId> for CpuId {
                 function: entry.function,
                 index: entry.index,
                 flags: entry.flags,
-                eax: entry.eax,
-                ebx: entry.ebx,
-                ecx: entry.ecx,
-                edx: entry.edx,
+                cpuid: CpuidResult {
+                    eax: entry.eax,
+                    ebx: entry.ebx,
+                    ecx: entry.ecx,
+                    edx: entry.edx,
+                },
             };
             cpu_id_entries.push(cpu_id_entry)
         }
@@ -743,10 +899,10 @@ impl From<&CpuId> for KvmCpuId {
                 function: e.function,
                 index: e.index,
                 flags: e.flags,
-                eax: e.eax,
-                ebx: e.ebx,
-                ecx: e.ecx,
-                edx: e.edx,
+                eax: e.cpuid.eax,
+                ebx: e.cpuid.ebx,
+                ecx: e.cpuid.ecx,
+                edx: e.cpuid.edx,
                 ..Default::default()
             };
         }
@@ -1123,33 +1279,6 @@ impl From<&kvm_sregs> for Sregs {
             cr4: r.cr4,
             cr8: r.cr8,
             efer: r.efer,
-            apic_base: r.apic_base,
-            interrupt_bitmap: r.interrupt_bitmap,
-        }
-    }
-}
-
-impl From<&Sregs> for kvm_sregs {
-    fn from(r: &Sregs) -> Self {
-        kvm_sregs {
-            cs: kvm_segment::from(&r.cs),
-            ds: kvm_segment::from(&r.ds),
-            es: kvm_segment::from(&r.es),
-            fs: kvm_segment::from(&r.fs),
-            gs: kvm_segment::from(&r.gs),
-            ss: kvm_segment::from(&r.ss),
-            tr: kvm_segment::from(&r.tr),
-            ldt: kvm_segment::from(&r.ldt),
-            gdt: kvm_dtable::from(&r.gdt),
-            idt: kvm_dtable::from(&r.idt),
-            cr0: r.cr0,
-            cr2: r.cr2,
-            cr3: r.cr3,
-            cr4: r.cr4,
-            cr8: r.cr8,
-            efer: r.efer,
-            apic_base: r.apic_base,
-            interrupt_bitmap: r.interrupt_bitmap,
         }
     }
 }
@@ -1252,407 +1381,4 @@ fn to_kvm_msrs(vec: &[Register]) -> Vec<kvm_msrs> {
     }
     msrs[0].nmsrs = vec.len() as u32;
     msrs
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        DeliveryMode, DeliveryStatus, DestinationMode, Hypervisor, HypervisorCap, HypervisorX86_64,
-        IoapicRedirectionTableEntry, IoapicState, IrqRoute, IrqSource, IrqSourceChip, LapicState,
-        PicInitState, PicState, PitChannelState, PitRWMode, PitRWState, PitState, TriggerMode,
-        Vcpu, Vm,
-    };
-    use libc::EINVAL;
-    use vm_memory::{GuestAddress, GuestMemory};
-
-    #[test]
-    fn get_supported_cpuid() {
-        let hypervisor = Kvm::new().unwrap();
-        let cpuid = hypervisor.get_supported_cpuid().unwrap();
-        assert!(cpuid.cpu_id_entries.len() > 0);
-    }
-
-    #[test]
-    fn get_emulated_cpuid() {
-        let hypervisor = Kvm::new().unwrap();
-        let cpuid = hypervisor.get_emulated_cpuid().unwrap();
-        assert!(cpuid.cpu_id_entries.len() > 0);
-    }
-
-    #[test]
-    fn get_msr_index_list() {
-        let kvm = Kvm::new().unwrap();
-        let msr_list = kvm.get_msr_index_list().unwrap();
-        assert!(msr_list.len() >= 2);
-    }
-
-    #[test]
-    fn entries_double_on_error() {
-        let hypervisor = Kvm::new().unwrap();
-        let cpuid =
-            get_cpuid_with_initial_capacity(&hypervisor, KVM_GET_SUPPORTED_CPUID(), 4).unwrap();
-        assert!(cpuid.cpu_id_entries.len() > 4);
-    }
-
-    #[test]
-    fn check_vm_arch_capability() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        assert!(vm.check_capability(VmCap::PvClock));
-    }
-
-    #[test]
-    fn pic_state() {
-        let state = PicState {
-            last_irr: 0b00000001,
-            irr: 0b00000010,
-            imr: 0b00000100,
-            isr: 0b00001000,
-            priority_add: 0b00010000,
-            irq_base: 0b00100000,
-            read_reg_select: false,
-            poll: true,
-            special_mask: true,
-            init_state: PicInitState::Icw3,
-            auto_eoi: true,
-            rotate_on_auto_eoi: false,
-            special_fully_nested_mode: true,
-            use_4_byte_icw: true,
-            elcr: 0b01000000,
-            elcr_mask: 0b10000000,
-        };
-
-        let kvm_state = kvm_pic_state::from(&state);
-
-        assert_eq!(kvm_state.last_irr, 0b00000001);
-        assert_eq!(kvm_state.irr, 0b00000010);
-        assert_eq!(kvm_state.imr, 0b00000100);
-        assert_eq!(kvm_state.isr, 0b00001000);
-        assert_eq!(kvm_state.priority_add, 0b00010000);
-        assert_eq!(kvm_state.irq_base, 0b00100000);
-        assert_eq!(kvm_state.read_reg_select, 0);
-        assert_eq!(kvm_state.poll, 1);
-        assert_eq!(kvm_state.special_mask, 1);
-        assert_eq!(kvm_state.init_state, 0b10);
-        assert_eq!(kvm_state.auto_eoi, 1);
-        assert_eq!(kvm_state.rotate_on_auto_eoi, 0);
-        assert_eq!(kvm_state.special_fully_nested_mode, 1);
-        assert_eq!(kvm_state.auto_eoi, 1);
-        assert_eq!(kvm_state.elcr, 0b01000000);
-        assert_eq!(kvm_state.elcr_mask, 0b10000000);
-
-        let orig_state = PicState::from(&kvm_state);
-        assert_eq!(state, orig_state);
-    }
-
-    #[test]
-    fn ioapic_state() {
-        let mut entry = IoapicRedirectionTableEntry::default();
-        let noredir = IoapicRedirectionTableEntry::default();
-
-        // default entry should be 0
-        assert_eq!(entry.get(0, 64), 0);
-
-        // set some values on our entry
-        entry.set_vector(0b11111111);
-        entry.set_delivery_mode(DeliveryMode::SMI);
-        entry.set_dest_mode(DestinationMode::Physical);
-        entry.set_delivery_status(DeliveryStatus::Pending);
-        entry.set_polarity(1);
-        entry.set_remote_irr(true);
-        entry.set_trigger_mode(TriggerMode::Level);
-        entry.set_interrupt_mask(true);
-        entry.set_dest_id(0b10101010);
-
-        // Bit repr as:  destid-reserved--------------------------------flags----vector--
-        let bit_repr = 0b1010101000000000000000000000000000000000000000011111001011111111;
-        // where flags is [interrupt_mask(1), trigger_mode(Level=1), remote_irr(1), polarity(1),
-        //   delivery_status(Pending=1), dest_mode(Physical=0), delivery_mode(SMI=010)]
-
-        assert_eq!(entry.get(0, 64), bit_repr);
-
-        let mut state = IoapicState {
-            base_address: 1,
-            ioregsel: 2,
-            ioapicid: 4,
-            current_interrupt_level_bitmap: 8,
-            redirect_table: [noredir; 120],
-        };
-
-        // Initialize first 24 (kvm_state limit) redirection entries
-        for i in 0..24 {
-            state.redirect_table[i] = entry;
-        }
-
-        let kvm_state = kvm_ioapic_state::from(&state);
-        assert_eq!(kvm_state.base_address, 1);
-        assert_eq!(kvm_state.ioregsel, 2);
-        assert_eq!(kvm_state.id, 4);
-        assert_eq!(kvm_state.irr, 8);
-        assert_eq!(kvm_state.pad, 0);
-        // check first 24 entries
-        for i in 0..24 {
-            assert_eq!(unsafe { kvm_state.redirtbl[i].bits }, bit_repr);
-        }
-
-        // compare with a conversion back
-        assert_eq!(state, IoapicState::from(&kvm_state));
-    }
-
-    #[test]
-    fn lapic_state() {
-        let mut state = LapicState { regs: [0; 64] };
-        // Apic id register, 4 bytes each with a different bit set
-        state.regs[2] = 1 | 2 << 8 | 4 << 16 | 8 << 24;
-
-        let kvm_state = kvm_lapic_state::from(&state);
-
-        // check little endian bytes in kvm_state
-        for i in 0..4 {
-            assert_eq!(kvm_state.regs[32 + i] as u8, 2u8.pow(i as u32));
-        }
-
-        // Test converting back to a LapicState
-        assert_eq!(state, LapicState::from(&kvm_state));
-    }
-
-    #[test]
-    fn pit_state() {
-        let channel = PitChannelState {
-            count: 256,
-            latched_count: 512,
-            count_latched: PitRWState::LSB,
-            status_latched: false,
-            status: 7,
-            read_state: PitRWState::MSB,
-            write_state: PitRWState::Word1,
-            reload_value: 8,
-            rw_mode: PitRWMode::Both,
-            mode: 5,
-            bcd: false,
-            gate: true,
-            count_load_time: 1024,
-        };
-
-        let kvm_channel = kvm_pit_channel_state::from(&channel);
-
-        // compare the various field translations
-        assert_eq!(kvm_channel.count, 256);
-        assert_eq!(kvm_channel.latched_count, 512);
-        assert_eq!(kvm_channel.count_latched, 1);
-        assert_eq!(kvm_channel.status_latched, 0);
-        assert_eq!(kvm_channel.status, 7);
-        assert_eq!(kvm_channel.read_state, 2);
-        assert_eq!(kvm_channel.write_state, 4);
-        assert_eq!(kvm_channel.write_latch, 8);
-        assert_eq!(kvm_channel.rw_mode, 3);
-        assert_eq!(kvm_channel.mode, 5);
-        assert_eq!(kvm_channel.bcd, 0);
-        assert_eq!(kvm_channel.gate, 1);
-        assert_eq!(kvm_channel.count_load_time, 1024);
-
-        // convert back and compare
-        assert_eq!(channel, PitChannelState::from(&kvm_channel));
-
-        // convert the full pitstate
-        let state = PitState {
-            channels: [channel, channel, channel],
-            flags: 255,
-        };
-        let kvm_state = kvm_pit_state2::from(&state);
-
-        assert_eq!(kvm_state.flags, 255);
-
-        // compare a channel
-        assert_eq!(channel, PitChannelState::from(&kvm_state.channels[0]));
-        // convert back and compare
-        assert_eq!(state, PitState::from(&kvm_state));
-    }
-
-    #[test]
-    fn clock_handling() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        let mut clock_data = vm.get_pvclock().unwrap();
-        clock_data.clock += 1000;
-        vm.set_pvclock(&clock_data).unwrap();
-    }
-
-    #[test]
-    fn set_gsi_routing() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        vm.create_irq_chip().unwrap();
-        vm.set_gsi_routing(&[]).unwrap();
-        vm.set_gsi_routing(&[IrqRoute {
-            gsi: 1,
-            source: IrqSource::Irqchip {
-                chip: IrqSourceChip::Ioapic,
-                pin: 3,
-            },
-        }])
-        .unwrap();
-        vm.set_gsi_routing(&[IrqRoute {
-            gsi: 1,
-            source: IrqSource::Msi {
-                address: 0xf000000,
-                data: 0xa0,
-            },
-        }])
-        .unwrap();
-        vm.set_gsi_routing(&[
-            IrqRoute {
-                gsi: 1,
-                source: IrqSource::Irqchip {
-                    chip: IrqSourceChip::Ioapic,
-                    pin: 3,
-                },
-            },
-            IrqRoute {
-                gsi: 2,
-                source: IrqSource::Msi {
-                    address: 0xf000000,
-                    data: 0xa0,
-                },
-            },
-        ])
-        .unwrap();
-    }
-
-    #[test]
-    fn set_identity_map_addr() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        vm.set_identity_map_addr(GuestAddress(0x20000)).unwrap();
-    }
-
-    #[test]
-    fn mp_state() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        vm.create_irq_chip().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let state = vcpu.get_mp_state().unwrap();
-        vcpu.set_mp_state(&state).unwrap();
-    }
-
-    #[test]
-    fn enable_feature() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        vm.create_irq_chip().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        unsafe { vcpu.enable_raw_capability(kvm_sys::KVM_CAP_HYPERV_SYNIC, &[0; 4]) }.unwrap();
-    }
-
-    #[test]
-    fn from_fpu() {
-        // Fpu has the largest arrays in our struct adapters.  Test that they're small enough for
-        // Rust to copy.
-        let mut fpu: Fpu = Default::default();
-        let m = fpu.xmm.len();
-        let n = fpu.xmm[0].len();
-        fpu.xmm[m - 1][n - 1] = 42;
-
-        let fpu = kvm_fpu::from(&fpu);
-        assert_eq!(fpu.xmm.len(), m);
-        assert_eq!(fpu.xmm[0].len(), n);
-        assert_eq!(fpu.xmm[m - 1][n - 1], 42);
-    }
-
-    #[test]
-    fn debugregs() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let mut dregs = vcpu.get_debugregs().unwrap();
-        dregs.dr7 = 13;
-        vcpu.set_debugregs(&dregs).unwrap();
-        let dregs2 = vcpu.get_debugregs().unwrap();
-        assert_eq!(dregs.dr7, dregs2.dr7);
-    }
-
-    #[test]
-    fn xcrs() {
-        let kvm = Kvm::new().unwrap();
-        if !kvm.check_capability(HypervisorCap::Xcrs) {
-            return;
-        }
-
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let mut xcrs = vcpu.get_xcrs().unwrap();
-        xcrs[0].value = 1;
-        vcpu.set_xcrs(&xcrs).unwrap();
-        let xcrs2 = vcpu.get_xcrs().unwrap();
-        assert_eq!(xcrs[0].value, xcrs2[0].value);
-    }
-
-    #[test]
-    fn get_msrs() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let mut msrs = vec![
-            // This one should succeed
-            Register {
-                id: 0x0000011e,
-                ..Default::default()
-            },
-            // This one will fail to fetch
-            Register {
-                id: 0x000003f1,
-                ..Default::default()
-            },
-        ];
-        vcpu.get_msrs(&mut msrs).unwrap();
-        assert_eq!(msrs.len(), 1);
-    }
-
-    #[test]
-    fn set_msrs() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-
-        const MSR_TSC_AUX: u32 = 0xc0000103;
-        let mut msrs = vec![Register {
-            id: MSR_TSC_AUX,
-            value: 42,
-        }];
-        vcpu.set_msrs(&msrs).unwrap();
-
-        msrs[0].value = 0;
-        vcpu.get_msrs(&mut msrs).unwrap();
-        assert_eq!(msrs.len(), 1);
-        assert_eq!(msrs[0].id, MSR_TSC_AUX);
-        assert_eq!(msrs[0].value, 42);
-    }
-
-    #[test]
-    fn get_hyperv_cpuid() {
-        let kvm = Kvm::new().unwrap();
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vm = KvmVm::new(&kvm, gm, ProtectionType::Unprotected).unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let cpuid = vcpu.get_hyperv_cpuid();
-        // Older kernels don't support so tolerate this kind of failure.
-        match cpuid {
-            Ok(_) => {}
-            Err(e) => {
-                assert_eq!(e.errno(), EINVAL);
-            }
-        }
-    }
 }

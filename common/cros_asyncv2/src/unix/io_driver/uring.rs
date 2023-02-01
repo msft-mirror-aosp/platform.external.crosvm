@@ -1,43 +1,59 @@
-// Copyright 2021 The Chromium OS Authors. All rights reserved.
+// Copyright 2021 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
-    alloc::Layout,
-    any::Any,
-    cell::RefCell,
-    cmp::min,
-    convert::{TryFrom, TryInto},
-    ffi::CStr,
-    future::Future,
-    io,
-    mem::{replace, size_of, MaybeUninit},
-    os::unix::io::{AsRawFd, RawFd},
-    pin::Pin,
-    ptr,
-    rc::Rc,
-    sync::Arc,
-    task::{self, Poll},
-    time::Duration,
-};
+use std::alloc::Layout;
+use std::any::Any;
+use std::cell::RefCell;
+use std::cmp::min;
+use std::convert::TryFrom;
+use std::convert::TryInto;
+use std::ffi::CStr;
+use std::future::Future;
+use std::io;
+use std::mem::replace;
+use std::mem::size_of;
+use std::mem::MaybeUninit;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::RawFd;
+use std::pin::Pin;
+use std::ptr;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task;
+use std::task::Poll;
+use std::time::Duration;
 
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::ensure;
+use anyhow::Context;
+use base::error;
+use base::warn;
+use base::AsRawDescriptor;
+use base::FromRawDescriptor;
+use base::LayoutAllocation;
+use base::SafeDescriptor;
 use data_model::IoBufMut;
-use io_uring::{
-    cqueue::{self, buffer_select},
-    opcode, squeue,
-    types::{Fd, FsyncFlags, SubmitArgs, Timespec},
-    Builder, IoUring, Probe,
-};
-use once_cell::sync::{Lazy, OnceCell};
+use io_uring::cqueue;
+use io_uring::cqueue::buffer_select;
+use io_uring::opcode;
+use io_uring::squeue;
+use io_uring::types::Fd;
+use io_uring::types::FsyncFlags;
+use io_uring::types::SubmitArgs;
+use io_uring::types::Timespec;
+use io_uring::Builder;
+use io_uring::IoUring;
+use io_uring::Probe;
+use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use slab::Slab;
-use sys_util::{
-    error, warn, AsRawDescriptor, EventFd, FromRawDescriptor, LayoutAllocation, SafeDescriptor,
-};
 use thiserror::Error as ThisError;
 
 use super::cmsg::*;
-use crate::{AsIoBufs, OwnedIoBuf};
+use crate::AsIoBufs;
+use crate::OwnedIoBuf;
 
 // For now all buffers live in the same buffer group.
 const BUFFER_GROUP: u16 = 0;
@@ -402,7 +418,7 @@ impl State {
 
     fn submit_waker(&mut self) -> anyhow::Result<()> {
         let entry = opcode::Read::new(
-            Fd(self.waker.0.as_raw_fd()),
+            Fd(self.waker.0.as_raw_descriptor()),
             ptr::null_mut(),
             size_of::<u64>() as u32,
         )
@@ -588,10 +604,10 @@ fn unpack_buffer_id(bid: u16) -> (usize, usize) {
     (alloc_idx, buffer_idx)
 }
 
-pub struct Waker(EventFd);
+pub struct Waker(base::Event);
 impl Waker {
     fn new() -> anyhow::Result<Waker> {
-        EventFd::new()
+        base::Event::new()
             .map(Waker)
             .map_err(|e| anyhow!(io::Error::from(e)))
     }
@@ -604,10 +620,7 @@ impl Waker {
     }
 
     pub fn wake(&self) -> anyhow::Result<()> {
-        self.0
-            .write(1)
-            .map(drop)
-            .map_err(|e| anyhow!(io::Error::from(e)))
+        self.0.signal().map_err(|e| anyhow!(io::Error::from(e)))
     }
 }
 
@@ -780,7 +793,8 @@ pub async fn read(
     let mut read =
         opcode::Read::new(Fd(desc.as_raw_fd()), ptr::null_mut(), len).buf_group(BUFFER_GROUP);
     if let Some(offset) = offset {
-        read = read.offset(offset as libc::off64_t);
+        // TODO(b/256213235): Use offset64 instead of casting to off_t
+        read = read.offset(offset as libc::off_t);
     }
     let entry = read.build().flags(squeue::Flags::BUFFER_SELECT);
     let state = clone_state()?;
@@ -796,7 +810,8 @@ pub async fn read_iobuf<B: AsIoBufs + Unpin + 'static>(
     let iobufs = IoBufMut::as_iobufs(buf.as_iobufs());
     let mut readv = opcode::Readv::new(Fd(desc.as_raw_fd()), iobufs.as_ptr(), iobufs.len() as u32);
     if let Some(off) = offset {
-        readv = readv.offset(off as libc::off64_t);
+        // TODO(b/256213235): Use offset64 instead of casting to off_t
+        readv = readv.offset(off as libc::off_t);
     }
 
     let state = match clone_state() {
@@ -827,7 +842,8 @@ pub async fn write_iobuf<B: AsIoBufs + Unpin + 'static>(
     let mut writev =
         opcode::Writev::new(Fd(desc.as_raw_fd()), iobufs.as_ptr(), iobufs.len() as u32);
     if let Some(off) = offset {
-        writev = writev.offset(off as libc::off64_t);
+        // TODO(b/256213235): Use offset64 instead of casting to off_t
+        writev = writev.offset(off as libc::off_t);
     }
 
     let state = match clone_state() {
@@ -844,8 +860,9 @@ pub async fn fallocate(
     len: u64,
     mode: u32,
 ) -> anyhow::Result<()> {
-    let entry = opcode::Fallocate::new(Fd(desc.as_raw_fd()), len as libc::off64_t)
-        .offset(file_offset as libc::off64_t)
+    // TODO(b/256213235): Use offset64 instead of casting to off_t
+    let entry = opcode::Fallocate::new(Fd(desc.as_raw_fd()), len as libc::off_t)
+        .offset(file_offset as libc::off_t)
         .mode(mode as libc::c_int)
         .build();
     let state = clone_state()?;
@@ -941,7 +958,7 @@ pub async fn next_packet_size(desc: &Arc<SafeDescriptor>) -> anyhow::Result<usiz
             return Ok(ret as usize);
         }
 
-        match sys_util::Error::last() {
+        match base::Error::last() {
             e if e.errno() == libc::EWOULDBLOCK || e.errno() == libc::EAGAIN => {
                 wait_readable(desc).await?;
             }
@@ -1010,7 +1027,7 @@ pub async fn send_iobuf_with_fds<B: AsIoBufs + Unpin + 'static>(
                     return Ok(ret as usize);
                 }
 
-                match sys_util::Error::last() {
+                match base::Error::last() {
                     e if e.errno() == libc::EWOULDBLOCK || e.errno() == libc::EAGAIN => {
                         wait_writable(desc).await?;
                     }
@@ -1071,7 +1088,7 @@ pub async fn recv_iobuf_with_fds<B: AsIoBufs + Unpin + 'static>(
                     break ret as usize;
                 }
 
-                match sys_util::Error::last() {
+                match base::Error::last() {
                     e if e.errno() == libc::EWOULDBLOCK || e.errno() == libc::EAGAIN => {
                         wait_readable(desc).await?;
                     }

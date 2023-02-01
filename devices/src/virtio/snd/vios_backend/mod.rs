@@ -1,4 +1,4 @@
-// Copyright 2020 The Chromium OS Authors. All rights reserved.
+// Copyright 2020 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,32 +7,41 @@ mod shm_vios;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use self::shm_streams::*;
-
 pub use self::shm_vios::*;
 
 pub mod streams;
-
 mod worker;
 
+use std::io::Error as IoError;
+use std::path::Path;
+use std::sync::mpsc::RecvError;
+use std::sync::mpsc::SendError;
+use std::sync::Arc;
 use std::thread;
 
-use crate::virtio::{copy_config, DescriptorError, Interrupt, Queue, VirtioDevice, TYPE_SOUND};
-use base::{error, Error as BaseError, Event, RawDescriptor};
-use data_model::{DataInit, Le32};
+use anyhow::anyhow;
+use anyhow::Context;
+use base::error;
+use base::Error as BaseError;
+use base::Event;
+use base::RawDescriptor;
+use data_model::DataInit;
+use data_model::Le32;
 use remain::sorted;
-use sync::Mutex;
-use vm_memory::GuestMemory;
-
-use std::path::Path;
-use std::sync::mpsc::{RecvError, SendError};
-use std::sync::Arc;
-
-use super::layout::*;
 use streams::StreamMsg;
+use sync::Mutex;
+use thiserror::Error as ThisError;
+use vm_memory::GuestMemory;
 use worker::*;
 
-use std::io::Error as IoError;
-use thiserror::Error as ThisError;
+use crate::virtio::copy_config;
+use crate::virtio::device_constants::snd::virtio_snd_config;
+use crate::virtio::DescriptorError;
+use crate::virtio::DeviceType;
+use crate::virtio::Interrupt;
+use crate::virtio::Queue;
+use crate::virtio::VirtioDevice;
+use crate::Suspendable;
 
 const QUEUE_SIZES: &[u16] = &[64, 64, 64, 64];
 
@@ -81,11 +90,11 @@ pub struct Sound {
 
 impl VirtioDevice for Sound {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        self.vios_client.keep_fds()
+        self.vios_client.keep_rds()
     }
 
-    fn device_type(&self) -> u32 {
-        TYPE_SOUND
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Sound
     }
 
     fn queue_max_sizes(&self) -> &[u16] {
@@ -108,49 +117,37 @@ impl VirtioDevice for Sound {
         &mut self,
         mem: GuestMemory,
         interrupt: Interrupt,
-        mut queues: Vec<Queue>,
-        mut queue_evts: Vec<Event>,
-    ) {
+        mut queues: Vec<(Queue, Event)>,
+    ) -> anyhow::Result<()> {
         if self.worker_thread.is_some() {
-            error!("virtio-snd: Device is already active");
-            return;
+            return Err(anyhow!("virtio-snd: Device is already active"));
         }
-        if queues.len() != 4 || queue_evts.len() != 4 {
-            error!(
-                "virtio-snd: device activated with wrong number of queues: {}, {}",
+        if queues.len() != 4 {
+            return Err(anyhow!(
+                "virtio-snd: device activated with wrong number of queues: {}",
                 queues.len(),
-                queue_evts.len()
-            );
-            return;
+            ));
         }
-        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("virtio-snd: failed to create kill Event pair: {}", e);
-                return;
-            }
-        };
+        let (self_kill_evt, kill_evt) = Event::new()
+            .and_then(|e| Ok((e.try_clone()?, e)))
+            .context("failed to create kill Event pair")?;
         self.kill_evt = Some(self_kill_evt);
-        let control_queue = queues.remove(0);
-        let control_queue_evt = queue_evts.remove(0);
-        let event_queue = queues.remove(0);
-        let event_queue_evt = queue_evts.remove(0);
-        let tx_queue = queues.remove(0);
-        let tx_queue_evt = queue_evts.remove(0);
-        let rx_queue = queues.remove(0);
-        let rx_queue_evt = queue_evts.remove(0);
+        let (control_queue, control_queue_evt) = queues.remove(0);
+        let (event_queue, event_queue_evt) = queues.remove(0);
+        let (tx_queue, tx_queue_evt) = queues.remove(0);
+        let (rx_queue, rx_queue_evt) = queues.remove(0);
 
         let vios_client = self.vios_client.clone();
-        if let Err(e) = vios_client.start_bg_thread() {
-            error!("Failed to start vios background thread: {}", e);
-        }
+        vios_client
+            .start_bg_thread()
+            .context("Failed to start vios background thread")?;
 
-        let thread_result = thread::Builder::new()
-            .name(String::from("virtio_snd"))
+        let worker_thread = thread::Builder::new()
+            .name("v_snd_vios".to_string())
             .spawn(move || {
                 match Worker::try_new(
                     vios_client,
-                    Arc::new(interrupt),
+                    interrupt,
                     mem,
                     Arc::new(Mutex::new(control_queue)),
                     control_queue_evt,
@@ -173,21 +170,17 @@ impl VirtioDevice for Sound {
                         false
                     }
                 }
-            });
-        match thread_result {
-            Err(e) => {
-                error!("failed to spawn virtio_snd worker thread: {}", e);
-            }
-            Ok(join_handle) => {
-                self.worker_thread = Some(join_handle);
-            }
-        }
+            })
+            .context("failed to spawn virtio_snd worker thread")?;
+
+        self.worker_thread = Some(worker_thread);
+        Ok(())
     }
 
     fn reset(&mut self) -> bool {
         let mut ret = true;
         if let Some(kill_evt) = self.kill_evt.take() {
-            if let Err(e) = kill_evt.write(1) {
+            if let Err(e) = kill_evt.signal() {
                 error!("virtio-snd: failed to notify the kill event: {}", e);
                 ret = false;
             }
@@ -209,6 +202,8 @@ impl VirtioDevice for Sound {
         ret
     }
 }
+
+impl Suspendable for Sound {}
 
 /// Creates a new virtio sound device connected to a VioS backend
 pub fn new_sound<P: AsRef<Path>>(path: P, virtio_features: u64) -> Result<Sound> {

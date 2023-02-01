@@ -1,16 +1,25 @@
-// Copyright 2019 The Chromium OS Authors. All rights reserved.
+// Copyright 2019 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use base::{error, AsRawDescriptor, Error as SysError, Event, RawDescriptor, Tube, TubeError};
+use std::convert::TryInto;
+
+use base::error;
+use base::AsRawDescriptor;
+use base::Error as SysError;
+use base::Event;
+use base::RawDescriptor;
+use base::Tube;
+use base::TubeError;
 use bit_field::*;
 use data_model::DataInit;
 use remain::sorted;
-use std::convert::TryInto;
 use thiserror::Error;
-use vm_control::{VmIrqRequest, VmIrqResponse};
+use vm_control::VmIrqRequest;
+use vm_control::VmIrqResponse;
 
-use crate::pci::{PciCapability, PciCapabilityID};
+use crate::pci::PciCapability;
+use crate::pci::PciCapabilityID;
 
 const MAX_MSIX_VECTORS_PER_DEVICE: u16 = 2048;
 pub const MSIX_TABLE_ENTRIES_MODULO: u64 = 16;
@@ -333,7 +342,7 @@ impl MsixConfig {
     ///     for the memory write transaction; different MSI-X vectors have
     ///     different Message Address values
     /// Message Data: the contents of this field specifies the data driven
-    ///     on AD[31::00] during the memory write transaction's data phase.
+    ///     on AD\[31::00\] during the memory write transaction's data phase.
     /// Vector Control: only bit 0 (Mask Bit) is not reserved: when this bit
     ///     is set, the function is prohibited from sending a message using
     ///     this MSI-X Table entry.
@@ -428,7 +437,7 @@ impl MsixConfig {
     ///  * 'offset' - the offset within the PBA entries
     ///  * 'data' - used to store the read results
     ///
-    /// Pending Bits[63::00]: For each Pending Bit that is set, the function
+    /// Pending Bits\[63::00\]: For each Pending Bit that is set, the function
     /// has a pending message for the associated MSI-X Table entry.
     pub fn read_pba_entries(&self, offset: u64, data: &mut [u8]) {
         let index: usize = (offset / MSIX_PBA_ENTRIES_MODULO) as usize;
@@ -496,7 +505,7 @@ impl MsixConfig {
 
     fn inject_msix_and_clear_pba(&mut self, vector: usize) {
         if let Some(irq) = &self.irq_vec[vector] {
-            irq.irqfd.write(1).unwrap();
+            irq.irqfd.signal().unwrap();
         }
 
         // Clear the bit from PBA
@@ -522,7 +531,7 @@ impl MsixConfig {
         if self.table_entries[vector as usize].masked() || self.masked() {
             self.set_pba_bit(vector, true);
         } else if let Some(irq) = self.irq_vec.get(vector as usize).unwrap_or(&None) {
-            irq.irqfd.write(1).unwrap();
+            irq.irqfd.signal().unwrap();
         }
     }
 

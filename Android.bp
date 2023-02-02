@@ -201,6 +201,7 @@ rust_test {
         "libnet_util",
         "libonce_cell",
         "libp9",
+        "librand",
         "libresources",
         "librutabaga_gfx",
         "libserde",

@@ -70,7 +70,7 @@ geteuid: 1
 getrandom: 1
 getuid: 1
 # 0x40086200 = DMA_BUF_IOCTL_SYNC, 0x6400 == DRM_IOCTL_BASE, 0x40087543 == UDMABUF_CREATE_LIST
-ioctl: arg1 == FIONBIO || arg1 == FIOCLEX || arg1 == 0x40086200 || arg1 & 0x6400 || arg1 == 0x40087543 || arg1 == 0x5421 || arg1 == 0xc0383e04
+ioctl: arg1 == FIONBIO || arg1 == FIOCLEX || arg1 == 0x40086200 || arg1 & 0x6400 || arg1 == 0x40087543 || arg1 == 0x5421 || arg1 == 0xc0383e04 || arg1 == 0xc018aa3f || arg1 == 0xaa00
 lseek: 1
 lstat: 1
 # Used for sharing memory with wayland. Also internally by Intel anv.
@@ -116,4 +116,4 @@ getegid: 1
 ## Rules for vmm-swap
 userfaultfd: 1
 # 0xc018aa3f == UFFDIO_API, 0xaa00 == USERFAULTFD_IOC_NEW
-ioctl: arg1 == 0xc018aa3f || arg1 == 0xaa00
+# ioctl: arg1 == 0xc018aa3f || arg1 == 0xaa00

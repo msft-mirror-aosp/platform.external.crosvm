@@ -10,36 +10,11 @@ package {
     default_applicable_licenses: ["external_crosvm_license"],
 }
 
-rust_library {
-    name: "libvm_memory",
-    defaults: ["crosvm_defaults"],
-    host_supported: true,
-    crate_name: "vm_memory",
-    cargo_env_compat: true,
-    cargo_pkg_version: "0.1.0",
-    srcs: ["src/lib.rs"],
-    edition: "2021",
-    rustlibs: [
-        "libanyhow",
-        "libbase_rust",
-        "libbitflags",
-        "libcfg_if",
-        "libcros_async",
-        "libdata_model",
-        "liblibc",
-        "libserde",
-        "libserde_json",
-        "libthiserror",
-        "libzerocopy",
-    ],
-    proc_macros: ["libremain"],
-}
-
 rust_test {
-    name: "vm_memory_test_src_lib",
+    name: "jail_test_src_lib",
     defaults: ["crosvm_defaults"],
     host_supported: true,
-    crate_name: "vm_memory",
+    crate_name: "jail",
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
@@ -52,15 +27,31 @@ rust_test {
     rustlibs: [
         "libanyhow",
         "libbase_rust",
-        "libbitflags",
         "libcfg_if",
-        "libcros_async",
-        "libdata_model",
         "liblibc",
+        "libminijail_rust",
+        "libonce_cell",
         "libserde",
-        "libserde_json",
-        "libthiserror",
-        "libzerocopy",
+        "libserde_keyvalue",
     ],
-    proc_macros: ["libremain"],
+}
+
+rust_library {
+    name: "libjail",
+    defaults: ["crosvm_defaults"],
+    host_supported: true,
+    crate_name: "jail",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    srcs: ["src/lib.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libanyhow",
+        "libbase_rust",
+        "liblibc",
+        "libminijail_rust",
+        "libonce_cell",
+        "libserde",
+        "libserde_keyvalue",
+    ],
 }

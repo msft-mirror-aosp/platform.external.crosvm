@@ -30,6 +30,7 @@ rust_test {
         "libserde",
         "libstatic_assertions",
         "libthiserror",
+        "libzerocopy",
     ],
     proc_macros: ["libremain"],
 }
@@ -49,6 +50,7 @@ rust_library {
         "libserde",
         "libstatic_assertions",
         "libthiserror",
+        "libzerocopy",
     ],
     proc_macros: ["libremain"],
 }

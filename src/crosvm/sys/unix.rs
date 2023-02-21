@@ -9,7 +9,6 @@ pub mod config;
 mod device_helpers;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu;
-pub(crate) mod jail_helpers;
 mod vcpu;
 
 use std::cmp::max;
@@ -142,7 +141,7 @@ use hypervisor::VmAArch64 as VmArch;
 use hypervisor::VmCap;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use hypervisor::VmX86_64 as VmArch;
-use jail_helpers::*;
+use jail::*;
 use libc;
 use minijail::Minijail;
 use resources::AddressRange;
@@ -170,7 +169,6 @@ use crate::crosvm::config::FileBackedMappingParameters;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::crosvm::config::HostPcieRootPortParameters;
 use crate::crosvm::config::HypervisorKind;
-use crate::crosvm::config::JailConfig;
 use crate::crosvm::config::SharedDir;
 use crate::crosvm::config::SharedDirKind;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
@@ -1154,6 +1152,8 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     };
 
     Ok(VmComponents {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        ac_adapter: cfg.ac_adapter,
         memory_size: cfg
             .memory
             .unwrap_or(256)
@@ -1296,6 +1296,16 @@ fn create_guest_memory(
         mem_policy |= MemoryPolicy::LOCK_GUEST_MEMORY;
     }
     guest_mem.set_memory_policy(mem_policy);
+
+    if cfg.unmap_guest_memory_on_fork {
+        // Note that this isn't compatible with sandboxing. We could potentially fix that by
+        // delaying the call until after the sandboxed devices are forked. However, the main use
+        // for this is in conjunction with protected VMs, where most of the guest memory has been
+        // unshared with the host. We'd need to be confident that the guest memory is unshared with
+        // the host only after the `use_dontfork` call and those details will vary by hypervisor.
+        // So, for now we keep things simple to be safe.
+        guest_mem.use_dontfork().context("use_dontfork failed")?;
+    }
 
     // Setup page fault handlers for vmm-swap.
     // This should be called before device processes are forked.
@@ -2413,6 +2423,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let (device_ctrl_tube, device_ctrl_resp) = Tube::pair().context("failed to create tube")?;
     // Create devices thread, and restore if a restore file exists.
     linux.devices_thread = match create_devices_worker_thread(
+        linux.vm.get_memory().clone(),
         linux.io_bus.clone(),
         linux.mmio_bus.clone(),
         device_ctrl_resp,

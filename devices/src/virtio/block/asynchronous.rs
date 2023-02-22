@@ -37,7 +37,6 @@ use cros_async::Executor;
 use cros_async::ExecutorKind;
 use cros_async::SelectResult;
 use cros_async::TimerAsync;
-use data_model::DataInit;
 use data_model::Le16;
 use data_model::Le32;
 use data_model::Le64;
@@ -52,6 +51,7 @@ use thiserror::Error as ThisError;
 use vm_control::DiskControlCommand;
 use vm_control::DiskControlResult;
 use vm_memory::GuestMemory;
+use zerocopy::AsBytes;
 
 use crate::virtio::async_utils;
 use crate::virtio::block::sys::*;
@@ -89,8 +89,7 @@ use crate::virtio::Writer;
 use crate::Suspendable;
 
 const DEFAULT_QUEUE_SIZE: u16 = 256;
-// ANDROID(b/251366833): We've temporarily reduced the number of queues to debug an issue.
-pub const DEFAULT_NUM_QUEUES: u16 = 1; // 16;
+pub const DEFAULT_NUM_QUEUES: u16 = 16;
 
 const SECTOR_SHIFT: u8 = 9;
 const SECTOR_SIZE: u64 = 0x01 << SECTOR_SHIFT;
@@ -901,7 +900,7 @@ impl VirtioDevice for BlockAsync {
                 self.queue_sizes.len() as u16,
             )
         };
-        copy_config(data, 0, config_space.as_slice(), offset);
+        copy_config(data, 0, config_space.as_bytes(), offset);
     }
 
     fn activate(

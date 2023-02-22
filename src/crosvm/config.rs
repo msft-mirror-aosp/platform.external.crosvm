@@ -2248,8 +2248,6 @@ mod tests {
         );
     }
 
-    // ANDROID(b/242733327): re-enable test once it no longer requires "/usr/local/bin" to exist.
-    #[ignore]
     #[cfg(unix)]
     #[test]
     fn parse_shared_dir() {

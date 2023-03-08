@@ -4,12 +4,14 @@
 
 //! Runs hardware devices in child processes.
 
-use std::ffi::CString;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use base::error;
+use base::unix::process::fork_process;
 use base::AsRawDescriptor;
+#[cfg(feature = "swap")]
+use base::AsRawDescriptors;
 use base::RawDescriptor;
 use base::Tube;
 use base::TubeError;
@@ -35,9 +37,9 @@ use crate::Suspendable;
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Failed to fork jail process: {0}")]
-    ForkingJail(minijail::Error),
+    ForkingJail(#[from] minijail::Error),
     #[error("Failed to configure tube: {0}")]
-    Tube(TubeError),
+    Tube(#[from] TubeError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -211,55 +213,49 @@ impl ProxyDevice {
         mut device: D,
         jail: Minijail,
         mut keep_rds: Vec<RawDescriptor>,
+        #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
     ) -> Result<ProxyDevice> {
         let debug_label = device.debug_label();
-        let (child_tube, parent_tube) = Tube::pair().map_err(Error::Tube)?;
+        let (child_tube, parent_tube) = Tube::pair()?;
 
         keep_rds.push(child_tube.as_raw_descriptor());
 
-        // Deduplicate the FDs since minijail expects this.
-        keep_rds.sort_unstable();
-        keep_rds.dedup();
+        #[cfg(feature = "swap")]
+        if let Some(swap_controller) = swap_controller {
+            keep_rds.extend(swap_controller.as_raw_descriptors());
+        }
 
-        let tz = std::env::var("TZ").unwrap_or_default();
-
-        // Forking here is safe as long as the program is still single threaded.
-        // We own the jail object and nobody else will try to reuse it.
-        let pid = match unsafe { jail.fork(Some(&keep_rds)) }.map_err(Error::ForkingJail)? {
-            0 => {
-                let max_len = 15; // pthread_setname_np() limit on Linux
-                let debug_label_trimmed =
-                    &debug_label.as_bytes()[..std::cmp::min(max_len, debug_label.len())];
-                let thread_name = CString::new(debug_label_trimmed).unwrap();
-                // thread_name is a valid pointer and setting name of this thread should be safe.
-                let _ =
-                    unsafe { libc::pthread_setname_np(libc::pthread_self(), thread_name.as_ptr()) };
-
-                // Preserve TZ for `chrono::Local` (b/257987535).
-                std::env::set_var("TZ", tz);
-
-                device.on_sandboxed();
-                child_proc(child_tube, device);
-
-                // We're explicitly not using std::process::exit here to avoid the cleanup of
-                // stdout/stderr globals. This can cause cascading panics and SIGILL if a worker
-                // thread attempts to log to stderr after at_exit handlers have been run.
-                // TODO(crbug.com/992494): Remove this once device shutdown ordering is clearly
-                // defined.
-                //
-                // exit() is trivially safe.
-                // ! Never returns
-                unsafe { libc::exit(0) };
+        let child_process = fork_process(jail, keep_rds, Some(debug_label.clone()), || {
+            #[cfg(feature = "swap")]
+            if let Some(swap_controller) = swap_controller {
+                if let Err(e) = swap_controller.on_process_forked() {
+                    error!("failed to SwapController::on_process_forked: {:?}", e);
+                    // exit() is trivially safe.
+                    unsafe { libc::exit(1) };
+                }
             }
-            p => p,
-        };
 
-        parent_tube
-            .set_send_timeout(Some(Duration::from_millis(SOCKET_TIMEOUT_MS)))
-            .map_err(Error::Tube)?;
-        parent_tube
-            .set_recv_timeout(Some(Duration::from_millis(SOCKET_TIMEOUT_MS)))
-            .map_err(Error::Tube)?;
+            device.on_sandboxed();
+            child_proc(child_tube, device);
+
+            // We're explicitly not using std::process::exit here to avoid the cleanup of
+            // stdout/stderr globals. This can cause cascading panics and SIGILL if a worker
+            // thread attempts to log to stderr after at_exit handlers have been run.
+            // TODO(crbug.com/992494): Remove this once device shutdown ordering is clearly
+            // defined.
+            //
+            // exit() is trivially safe.
+            // ! Never returns
+            unsafe { libc::exit(0) };
+        })?;
+
+        // Suppress the no waiting warning from `base::sys::unix::process::Child` because crosvm
+        // does not wait for the processes from ProxyDevice explicitly. Instead it reaps all the
+        // child processes on its exit by `crosvm::sys::unix::main::wait_all_children()`.
+        let pid = child_process.into_pid();
+
+        parent_tube.set_send_timeout(Some(Duration::from_millis(SOCKET_TIMEOUT_MS)))?;
+        parent_tube.set_recv_timeout(Some(Duration::from_millis(SOCKET_TIMEOUT_MS)))?;
         Ok(ProxyDevice {
             tube: parent_tube,
             pid,
@@ -510,7 +506,14 @@ mod tests {
         let device = EchoDevice::new();
         let keep_fds: Vec<RawDescriptor> = Vec::new();
         let minijail = Minijail::new().unwrap();
-        ProxyDevice::new(device, minijail, keep_fds).unwrap()
+        ProxyDevice::new(
+            device,
+            minijail,
+            keep_fds,
+            #[cfg(feature = "swap")]
+            None,
+        )
+        .unwrap()
     }
 
     // TODO(b/173833661): Find a way to ensure these tests are run single-threaded.

@@ -65,9 +65,16 @@ DOCKER_ARGS = [
     "--mount type=tmpfs,destination=/tmp",
     # KVM is required to run a VM for testing.
     "--device /dev/kvm",
-    f"--env OUTSIDE_UID={os.getuid()}",
-    f"--env OUTSIDE_GID={os.getgid()}",
 ]
+
+if sys.platform == "linux":
+    DOCKER_ARGS.extend(
+        [
+            f"--env OUTSIDE_UID={os.getuid()}",
+            f"--env OUTSIDE_GID={os.getgid()}",
+            f"--env TERM={os.environ.get('TERM', 'xterm-256color')}",
+        ]
+    )
 
 PODMAN_ARGS = [
     # Share cache dir

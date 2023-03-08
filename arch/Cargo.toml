@@ -21,6 +21,7 @@ devices = { path = "../devices" }
 gdbstub = { version = "0.6.3", optional = true }
 gdbstub_arch = { version = "0.2.4", optional = true }
 hypervisor = { path = "../hypervisor" }
+jail = { path = "../jail" }
 kernel_cmdline = { path = "../kernel_cmdline" }
 libc = "*"
 resources = { path = "../resources" }
@@ -35,6 +36,9 @@ vm_memory = { path = "../vm_memory" }
 [target.'cfg(unix)'.dependencies]
 minijail = "*" # provided by ebuild
 power_monitor = { path = "../power_monitor" }
+
+[target.'cfg(target_os="linux")'.dependencies]
+swap = { path = "../swap", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "*"

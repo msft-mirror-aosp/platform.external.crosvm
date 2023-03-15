@@ -266,9 +266,6 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
         disk.block_size,
         disk.id,
         Some(disk_device_tube),
-        None,
-        None,
-        None,
     )
     .exit_context(Exit::BlockDeviceNew, "failed to create block device")?;
 

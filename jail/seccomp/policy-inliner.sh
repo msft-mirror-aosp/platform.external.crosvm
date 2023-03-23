@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set -eu
+
 common_device="$1"
 gpu_common="$2"
 serial="$3"
@@ -20,6 +22,8 @@ block="$4"
 vvu="$5"
 vhost_user="$6"
 vhost_vsock="$7"
+# NOTE: We can't require all of the files to exist because aarch64 doesn't have
+# all of them.
 if ! [[ -f $common_device ]] || ! [[ -f $gpu_common ]] || ! [[ -f $serial ]]; then
   echo "usage: $0 /path/to/common_device.policy /path/to/gpu_common.policy /path/to/serial.policy /path/to/block.policy /path/to/vvu.policy /path/to/vhost_user.policy <input.policy >output.policy"
   exit 1

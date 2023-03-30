@@ -18,11 +18,12 @@ extern "C" {
 #endif
 
 /**
- * Versioning
+ * Rutabaga component types
  */
-#define RUTABAGA_VERSION_MAJOR 0
-#define RUTABAGA_VERSION_MINOR 1
-#define RUTABAGA_VERSION_PATCH 1
+#define RUTABAGA_COMPONENT_2D 1
+#define RUTABAGA_COMPONENT_VIRGL_RENDERER 2
+#define RUTABAGA_COMPONENT_GFXSTREAM 3
+#define RUTABAGA_COMPONENT_CROSS_DOMAIN 4
 
 /**
  * Blob resource creation parameters.
@@ -43,7 +44,6 @@ extern "C" {
 #define RUTABAGA_CAPSET_GFXSTREAM 3
 #define RUTABAGA_CAPSET_VENUS 4
 #define RUTABAGA_CAPSET_CROSS_DOMAIN 5
-#define RUTABAGA_CAPSET_DRM 6
 
 /**
  * Mapped memory caching flags (see virtio_gpu spec)
@@ -62,6 +62,7 @@ extern "C" {
  * Rutabaga channel types
  */
 #define RUTABAGA_CHANNEL_TYPE_WAYLAND 1
+#define RUTABAGA_CHANNEL_TYPE_CAMERA 2
 
 /**
  * Rutabaga handle types
@@ -70,10 +71,9 @@ extern "C" {
 #define RUTABAGA_MEM_HANDLE_TYPE_DMABUF 0x2
 #define RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_WIN32 0x3
 #define RUTABAGA_MEM_HANDLE_TYPE_SHM 0x4
-
 #define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD 0x10
-#define RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD 0x20
-#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x40
+#define RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD 0x11
+#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x12
 
 struct rutabaga;
 
@@ -127,11 +127,6 @@ struct rutabaga_handle {
 	uint32_t handle_type;
 };
 
-struct rutabaga_mapping {
-    uint64_t ptr;
-    uint64_t size;
-};
-
 /**
  * Assumes null-terminated C-string.
  */
@@ -151,12 +146,9 @@ struct rutabaga_channels {
 typedef void (*write_fence_cb)(uint64_t user_data, struct rutabaga_fence fence_data);
 
 struct rutabaga_builder {
-	// Required for correct functioning
 	uint64_t user_data;
-	uint64_t capset_mask;
+	uint32_t rutabaga_component;
 	write_fence_cb fence_cb;
-
-	// Optional and platform specific
 	struct rutabaga_channels *channels;
 };
 
@@ -253,11 +245,6 @@ int32_t rutabaga_resource_unref(struct rutabaga *ptr, uint32_t resource_id);
  */
 int32_t rutabaga_resource_export_blob(struct rutabaga *ptr, uint32_t resource_id,
 				      struct rutabaga_handle *handle);
-
-int32_t rutabaga_resource_map(struct rutabaga *ptr, uint32_t resource_id,
-                struct rutabaga_mapping *mapping);
-
-int32_t rutabaga_resource_unmap(struct rutabaga *ptr, uint32_t resource_id);
 
 int32_t rutabaga_resource_map_info(struct rutabaga *ptr, uint32_t resource_id, uint32_t *map_info);
 

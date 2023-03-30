@@ -35,7 +35,6 @@ pub mod resource_bridge;
 #[cfg(feature = "audio")]
 pub mod snd;
 pub mod vhost;
-pub mod vsock;
 
 #[cfg(feature = "balloon")]
 pub use self::balloon::*;
@@ -75,6 +74,7 @@ cfg_if::cfg_if! {
         pub use self::wl::*;
 
     } else if #[cfg(windows)] {
+        mod vsock;
         #[cfg(feature = "slirp")]
         pub mod net;
 

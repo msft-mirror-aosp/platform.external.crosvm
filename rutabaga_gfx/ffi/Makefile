@@ -4,7 +4,7 @@
 
 prefix ?= /usr/local
 libdir = ${prefix}/lib
-includedir = ${prefix}/include
+includedir = ${prefix}/lib
 
 ifdef debug
   release :=

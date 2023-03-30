@@ -63,6 +63,6 @@ pub fn run_snd_device(opts: Options) -> anyhow::Result<()> {
         snd_device.max_queue_num(),
         None,
     )?;
-
-    listener.run_device(ex, snd_device)
+    // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
+    ex.run_until(listener.run_backend(snd_device, &ex))?
 }

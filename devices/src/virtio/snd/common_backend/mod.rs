@@ -14,8 +14,6 @@ use audio_streams::BoxError;
 use base::debug;
 use base::error;
 use base::warn;
-use base::AsRawDescriptor;
-use base::Descriptor;
 use base::Error as SysError;
 use base::Event;
 use base::RawDescriptor;
@@ -45,8 +43,6 @@ use crate::virtio::device_constants::snd::virtio_snd_config;
 use crate::virtio::snd::common_backend::async_funcs::*;
 use crate::virtio::snd::common_backend::stream_info::StreamInfo;
 use crate::virtio::snd::constants::*;
-use crate::virtio::snd::file_backend::create_file_stream_source_generators;
-use crate::virtio::snd::file_backend::Error as FileError;
 use crate::virtio::snd::layout::*;
 use crate::virtio::snd::null_backend::create_null_stream_source_generators;
 use crate::virtio::snd::parameters::Parameters;
@@ -88,8 +84,6 @@ pub enum Error {
     /// Creating WaitContext failed.
     #[error("Failed to create wait context: {0}")]
     CreateWaitContext(SysError),
-    #[error("Failed to create file stream source generator")]
-    CreateFileStreamSourceGenerator(FileError),
     /// Cloning kill event failed.
     #[error("Failed to clone kill event: {0}")]
     CloneKillEvent(SysError),
@@ -164,9 +158,9 @@ pub enum WorkerStatus {
 // Stores constant data
 #[derive(Clone)]
 pub struct SndData {
-    pub(crate) jack_info: Vec<virtio_snd_jack_info>,
-    pub(crate) pcm_info: Vec<virtio_snd_pcm_info>,
-    pub(crate) chmap_info: Vec<virtio_snd_chmap_info>,
+    jack_info: Vec<virtio_snd_jack_info>,
+    pcm_info: Vec<virtio_snd_pcm_info>,
+    chmap_info: Vec<virtio_snd_chmap_info>,
 }
 
 impl SndData {
@@ -207,7 +201,6 @@ pub struct VirtioSnd {
     acked_features: u64,
     queue_sizes: Box<[u16]>,
     worker_thread: Option<WorkerThread<()>>,
-    keep_rds: Vec<Descriptor>,
 }
 
 impl VirtioSnd {
@@ -216,13 +209,10 @@ impl VirtioSnd {
         let cfg = hardcoded_virtio_snd_config(&params);
         let snd_data = hardcoded_snd_data(&params);
         let avail_features = base_features;
-        let mut keep_rds: Vec<RawDescriptor> = Vec::new();
-
-        let stream_source_generators =
-            create_stream_source_generators(&params, &snd_data, &mut keep_rds)?
-                .into_iter()
-                .map(Arc::new)
-                .collect();
+        let stream_source_generators = create_stream_source_generators(&params, &snd_data)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
 
         Ok(VirtioSnd {
             cfg,
@@ -232,7 +222,6 @@ impl VirtioSnd {
             acked_features: 0,
             queue_sizes: vec![MAX_VRING_LEN; MAX_QUEUE_NUM].into_boxed_slice(),
             worker_thread: None,
-            keep_rds: keep_rds.iter().map(|rd| Descriptor(*rd)).collect(),
         })
     }
 }
@@ -240,19 +229,13 @@ impl VirtioSnd {
 pub(crate) fn create_stream_source_generators(
     params: &Parameters,
     snd_data: &SndData,
-    keep_rds: &mut Vec<RawDescriptor>,
-) -> Result<Vec<SysAudioStreamSourceGenerator>, Error> {
-    let generators = match params.backend {
+) -> Vec<SysAudioStreamSourceGenerator> {
+    match params.backend {
         StreamSourceBackend::NULL => create_null_stream_source_generators(snd_data),
-        StreamSourceBackend::FILE => {
-            create_file_stream_source_generators(params, snd_data, keep_rds)
-                .map_err(Error::CreateFileStreamSourceGenerator)?
-        }
         StreamSourceBackend::Sys(backend) => {
             sys_create_stream_source_generators(backend, params, snd_data)
         }
-    };
-    Ok(generators)
+    }
 }
 
 // To be used with hardcoded_snd_data
@@ -380,10 +363,7 @@ fn resize_parameters_pcm_device_config(mut params: Parameters) -> Parameters {
 
 impl VirtioDevice for VirtioSnd {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        self.keep_rds
-            .iter()
-            .map(|descr| descr.as_raw_descriptor())
-            .collect()
+        Vec::new()
     }
 
     fn device_type(&self) -> DeviceType {

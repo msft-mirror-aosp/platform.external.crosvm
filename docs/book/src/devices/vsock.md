@@ -2,13 +2,13 @@
 
 crosvm supports [virtio-vsock] device for communication between the host and a guest VM.
 
-Assign a context id to a guest VM by passing it with the `--vsock` flag.
+Assign a context id to a guest VM by passing it with `--cid` flag.
 
 ```sh
 GUEST_CID=3
 
 crosvm run \
-  --vsock "${GUEST_CID}" \
+  --cid "${GUEST_CID}" \
   <usual crosvm arguments>
   /path/to/bzImage
 ```

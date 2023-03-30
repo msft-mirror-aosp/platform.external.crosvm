@@ -40,8 +40,7 @@ use devices::virtio::vfio_wrapper::VfioWrapper;
 use devices::virtio::vhost::user::proxy::VirtioVhostUser;
 use devices::virtio::vhost::user::vmm::VhostUserVirtioDevice;
 use devices::virtio::vhost::user::VhostUserDevice;
-use devices::virtio::vhost::user::VhostUserVsockDevice;
-use devices::virtio::vsock::VsockConfig;
+use devices::virtio::vhost::vsock::VhostVsockConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
 use devices::virtio::Console;
@@ -443,7 +442,7 @@ pub fn create_virtio_snd_device(
     use virtio::snd::parameters::StreamSourceBackend as Backend;
 
     let policy = match backend {
-        Backend::NULL | Backend::FILE => "snd_null_device",
+        Backend::NULL => "snd_null_device",
         #[cfg(feature = "audio_cras")]
         Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) => "snd_cras_device",
         #[cfg(not(feature = "audio_cras"))]
@@ -1056,31 +1055,20 @@ pub fn create_vhost_user_video_device(
     })
 }
 
-impl VirtioDeviceBuilder for &VsockConfig {
-    const NAME: &'static str = "vhost_vsock";
+pub fn create_vhost_vsock_device(
+    protection_type: ProtectionType,
+    jail_config: &Option<JailConfig>,
+    vhost_config: &VhostVsockConfig,
+) -> DeviceResult {
+    let features = virtio::base_features(protection_type);
 
-    fn create_virtio_device(
-        self,
-        protection_type: ProtectionType,
-    ) -> anyhow::Result<Box<dyn VirtioDevice>> {
-        let features = virtio::base_features(protection_type);
+    let dev = virtio::vhost::Vsock::new(features, vhost_config)
+        .context("failed to set up virtual socket device")?;
 
-        let dev = virtio::vhost::Vsock::new(features, self)
-            .context("failed to set up virtual socket device")?;
-
-        Ok(Box::new(dev))
-    }
-
-    fn create_vhost_user_device(
-        self,
-        keep_rds: &mut Vec<RawDescriptor>,
-    ) -> anyhow::Result<Box<dyn VhostUserDevice>> {
-        let vsock_device = VhostUserVsockDevice::new(self.cid, &self.vhost_device)?;
-
-        keep_rds.push(vsock_device.as_raw_descriptor());
-
-        Ok(Box::new(vsock_device))
-    }
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "vhost_vsock_device")?,
+    })
 }
 
 pub fn create_fs_device(

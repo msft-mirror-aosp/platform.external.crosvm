@@ -23,7 +23,6 @@ use tube_transporter::TubeTransporterReader;
 use vmm_vhost::message::MasterReq;
 use vmm_vhost::message::VhostUserMsgHeader;
 use vmm_vhost::SlaveReqHandler;
-use vmm_vhost::VhostUserSlaveReqHandler;
 
 use crate::virtio::vhost::user::device::handler::CallEvent;
 use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
@@ -47,66 +46,67 @@ pub fn read_from_tube_transporter(
     tube_transporter.read_tubes().map_err(anyhow::Error::msg)
 }
 
-pub async fn run_handler(
-    handler: Box<dyn VhostUserSlaveReqHandler>,
-    vhost_user_tube: Tube,
-    exit_event: Event,
-    ex: &Executor,
-) -> Result<()> {
-    let read_notifier = vhost_user_tube.get_read_notifier();
-    let close_notifier = vhost_user_tube.get_close_notifier();
+impl DeviceRequestHandler {
+    pub async fn run(self, vhost_user_tube: Tube, exit_event: Event, ex: &Executor) -> Result<()> {
+        let read_notifier = vhost_user_tube.get_read_notifier();
+        let close_notifier = vhost_user_tube.get_close_notifier();
 
-    let read_event = EventAsync::clone_raw_without_reset(read_notifier, ex)
-        .context("failed to create an async event")?;
-    let close_event = EventAsync::clone_raw_without_reset(close_notifier, ex)
-        .context("failed to create an async event")?;
-    let exit_event = EventAsync::new(exit_event, ex).context("failed to create an async event")?;
+        let read_event = EventAsync::clone_raw_without_reset(read_notifier, ex)
+            .context("failed to create an async event")?;
+        let close_event = EventAsync::clone_raw_without_reset(close_notifier, ex)
+            .context("failed to create an async event")?;
+        let exit_event =
+            EventAsync::new(exit_event, ex).context("failed to create an async event")?;
 
-    let mut req_handler = SlaveReqHandler::from_stream(vhost_user_tube, handler);
+        let mut req_handler =
+            SlaveReqHandler::from_stream(vhost_user_tube, std::sync::Mutex::new(self));
 
-    let read_event_fut = read_event.next_val().fuse();
-    let close_event_fut = close_event.next_val().fuse();
-    let exit_event_fut = exit_event.next_val().fuse();
-    pin_mut!(read_event_fut);
-    pin_mut!(close_event_fut);
-    pin_mut!(exit_event_fut);
+        let read_event_fut = read_event.next_val().fuse();
+        let close_event_fut = close_event.next_val().fuse();
+        let exit_event_fut = exit_event.next_val().fuse();
+        pin_mut!(read_event_fut);
+        pin_mut!(close_event_fut);
+        pin_mut!(exit_event_fut);
 
-    let mut pending_header: Option<(VhostUserMsgHeader<MasterReq>, Option<Vec<std::fs::File>>)> =
-        None;
-    loop {
-        select! {
-            _read_res = read_event_fut => {
-                match pending_header.take() {
-                    None => {
-                        let (hdr, files) = req_handler
-                            .recv_header()
-                            .context("failed to handle a vhost-user request")?;
-                        if req_handler.needs_wait_for_payload(&hdr) {
-                            // Wait for the message body being notified.
-                            pending_header = Some((hdr, files));
-                        } else {
+        let mut pending_header: Option<(
+            VhostUserMsgHeader<MasterReq>,
+            Option<Vec<std::fs::File>>,
+        )> = None;
+        loop {
+            select! {
+                _read_res = read_event_fut => {
+                    match pending_header.take() {
+                        None => {
+                            let (hdr, files) = req_handler
+                                .recv_header()
+                                .context("failed to handle a vhost-user request")?;
+                            if req_handler.needs_wait_for_payload(&hdr) {
+                                // Wait for the message body being notified.
+                                pending_header = Some((hdr, files));
+                            } else {
+                                req_handler
+                                    .process_message(hdr, files)
+                                    .context("failed to handle a vhost-user request")?;
+                            }
+                        }
+                        Some((hdr, files)) => {
                             req_handler
                                 .process_message(hdr, files)
                                 .context("failed to handle a vhost-user request")?;
                         }
                     }
-                    Some((hdr, files)) => {
-                        req_handler
-                            .process_message(hdr, files)
-                            .context("failed to handle a vhost-user request")?;
-                    }
+                    read_event_fut.set(read_event.next_val().fuse());
                 }
-                read_event_fut.set(read_event.next_val().fuse());
-            }
-            // Tube closed event.
-            _close_res = close_event_fut => {
-                info!("exit run loop: got close event");
-                return Ok(())
-            }
-            // Broker exit event.
-            _exit_res = exit_event_fut => {
-                info!("exit run loop: got exit event");
-                return Ok(())
+                // Tube closed event.
+                _close_res = close_event_fut => {
+                    info!("exit run loop: got close event");
+                    return Ok(())
+                }
+                // Broker exit event.
+                _exit_res = exit_event_fut => {
+                    info!("exit run loop: got exit event");
+                    return Ok(())
+                }
             }
         }
     }
@@ -118,7 +118,6 @@ mod tests {
 
     use super::*;
     use crate::virtio::vhost::user::device::handler::tests::*;
-    use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
     use crate::virtio::vhost::user::device::handler::*;
     use crate::virtio::vhost::user::vmm::VhostUserHandler;
     #[test]
@@ -151,10 +150,8 @@ mod tests {
         });
 
         // Device side
-        let backend = std::sync::Mutex::new(DeviceRequestHandler::new(
-            Box::new(FakeBackend::new()),
-            Box::new(VhostUserRegularOps),
-        ));
+        let backend =
+            std::sync::Mutex::new(DeviceRequestHandler::new(Box::new(FakeBackend::new())));
 
         let mut req_handler = SlaveReqHandler::from_stream(dev_tube, backend);
 

@@ -8,8 +8,9 @@ pub mod layout;
 pub mod parameters;
 pub mod sys;
 
+#[cfg(feature = "audio")]
 pub mod common_backend;
-pub mod file_backend;
+#[cfg(feature = "audio")]
 pub mod null_backend;
 
 cfg_if::cfg_if! {

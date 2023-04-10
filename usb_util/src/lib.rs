@@ -5,6 +5,7 @@
 //! USB device access and descriptor manipulation.
 
 mod descriptor;
+#[cfg(unix)]
 mod device;
 mod error;
 mod types;
@@ -13,8 +14,11 @@ pub use self::descriptor::parse_usbfs_descriptors;
 pub use self::descriptor::ConfigDescriptorTree;
 pub use self::descriptor::DeviceDescriptorTree;
 pub use self::descriptor::InterfaceDescriptorTree;
+#[cfg(unix)]
 pub use self::device::Device;
+#[cfg(unix)]
 pub use self::device::Transfer;
+#[cfg(unix)]
 pub use self::device::TransferStatus;
 pub use self::error::Error;
 pub use self::error::Result;
@@ -26,6 +30,7 @@ pub use self::types::ControlRequestType;
 pub use self::types::DescriptorHeader;
 pub use self::types::DescriptorType;
 pub use self::types::DeviceDescriptor;
+pub use self::types::DeviceSpeed;
 pub use self::types::EndpointDescriptor;
 pub use self::types::EndpointDirection;
 pub use self::types::EndpointType;

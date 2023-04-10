@@ -8,22 +8,19 @@ use std::mem;
 use std::net::Ipv4Addr;
 use std::os::raw::c_uint;
 use std::str::FromStr;
-use std::thread;
 
 use anyhow::anyhow;
-use anyhow::Context;
 use base::error;
 #[cfg(windows)]
 use base::named_pipes::OverlappedWrapper;
 use base::warn;
-use base::AsRawDescriptor;
 use base::Error as SysError;
 use base::Event;
 use base::EventToken;
 use base::RawDescriptor;
 use base::ReadNotifier;
 use base::WaitContext;
-use data_model::DataInit;
+use base::WorkerThread;
 use data_model::Le16;
 use data_model::Le64;
 use net_util::Error as TapError;
@@ -42,6 +39,8 @@ use virtio_sys::virtio_net::VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET;
 use virtio_sys::virtio_net::VIRTIO_NET_ERR;
 use virtio_sys::virtio_net::VIRTIO_NET_OK;
 use vm_memory::GuestMemory;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
 
 use super::copy_config;
 use super::DescriptorError;
@@ -179,14 +178,11 @@ impl FromStr for NetParameters {
 }
 
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, AsBytes, FromBytes)]
 pub struct virtio_net_ctrl_hdr {
     pub class: u8,
     pub cmd: u8,
 }
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for virtio_net_ctrl_hdr {}
 
 /// Converts virtio-net feature bits to tap's offload bits.
 pub fn virtio_features_to_tap_offload(features: u64) -> c_uint {
@@ -210,7 +206,7 @@ pub fn virtio_features_to_tap_offload(features: u64) -> c_uint {
     tap_offloads
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, AsBytes, FromBytes)]
 #[repr(C)]
 pub struct VirtioNetConfig {
     mac: [u8; 6],
@@ -218,9 +214,6 @@ pub struct VirtioNetConfig {
     max_vq_pairs: Le16,
     mtu: Le16,
 }
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VirtioNetConfig {}
 
 pub fn process_ctrl<I: SignalableInterrupt, T: TapT>(
     interrupt: &I,
@@ -367,6 +360,7 @@ where
         rx_queue_evt: Event,
         tx_queue_evt: Event,
         ctrl_queue_evt: Option<Event>,
+        handle_interrupt_resample: bool,
     ) -> Result<(), NetError> {
         let wait_ctx: WaitContext<Token> = WaitContext::build_with(&[
             // This doesn't use get_read_notifier() because of overlapped io; we
@@ -390,7 +384,9 @@ where
             wait_ctx
                 .add(ctrl_evt, Token::CtrlQueue)
                 .map_err(NetError::CreateWaitContext)?;
-            // Let CtrlQueue's thread handle InterruptResample also.
+        }
+
+        if handle_interrupt_resample {
             if let Some(resample_evt) = self.interrupt.get_resample_evt() {
                 wait_ctx
                     .add(resample_evt, Token::InterruptResample)
@@ -464,12 +460,10 @@ pub fn build_config(vq_pairs: u16, mtu: u16, mac: Option<[u8; 6]>) -> VirtioNetC
     }
 }
 
-pub struct Net<T: TapT + ReadNotifier> {
+pub struct Net<T: TapT + ReadNotifier + 'static> {
     guest_mac: Option<[u8; 6]>,
     queue_sizes: Box<[u16]>,
-    workers_kill_evt: Vec<Event>,
-    kill_evts: Vec<Event>,
-    worker_threads: Vec<thread::JoinHandle<Worker<T>>>,
+    worker_threads: Vec<WorkerThread<Worker<T>>>,
     taps: Vec<T>,
     avail_features: u64,
     acked_features: u64,
@@ -543,20 +537,9 @@ where
         mac_addr: Option<MacAddress>,
         #[cfg(windows)] slirp_kill_evt: Option<Event>,
     ) -> Result<Self, NetError> {
-        let mut kill_evts: Vec<Event> = Vec::new();
-        let mut workers_kill_evt: Vec<Event> = Vec::new();
-        for _ in 0..taps.len() {
-            let kill_evt = Event::new().map_err(NetError::CreateKillEvent)?;
-            let worker_kill_evt = kill_evt.try_clone().map_err(NetError::CloneKillEvent)?;
-            kill_evts.push(kill_evt);
-            workers_kill_evt.push(worker_kill_evt);
-        }
-
         Ok(Self {
             guest_mac: mac_addr.map(|mac| mac.octets()),
             queue_sizes: vec![QUEUE_SIZE; (taps.len() * 2 + 1) as usize].into_boxed_slice(),
-            workers_kill_evt,
-            kill_evts,
             worker_threads: Vec::new(),
             taps,
             avail_features,
@@ -565,6 +548,12 @@ where
             #[cfg(windows)]
             slirp_kill_evt: None,
         })
+    }
+
+    /// Returns the maximum number of receive/transmit queue pairs for this device.
+    /// Only relevant when multi-queue support is negotiated.
+    fn max_virtqueue_pairs(&self) -> usize {
+        self.taps.len()
     }
 }
 
@@ -612,26 +601,11 @@ where
     T: TapT + ReadNotifier,
 {
     fn drop(&mut self) {
-        let len = self.kill_evts.len();
-        for i in 0..len {
-            // Only kill the child if it claimed its event.
-            if self.workers_kill_evt.get(i).is_none() {
-                if let Some(kill_evt) = self.kill_evts.get(i) {
-                    // Ignore the result because there is nothing we can do about it.
-                    let _ = kill_evt.signal();
-                }
-            }
-        }
         #[cfg(windows)]
         {
             if let Some(slirp_kill_evt) = self.slirp_kill_evt.take() {
                 let _ = slirp_kill_evt.signal();
             }
-        }
-
-        let len = self.worker_threads.len();
-        for _ in 0..len {
-            let _ = self.worker_threads.remove(0).join();
         }
     }
 }
@@ -645,13 +619,6 @@ where
 
         for tap in &self.taps {
             keep_rds.push(tap.as_raw_descriptor());
-        }
-
-        for worker_kill_evt in &self.workers_kill_evt {
-            keep_rds.push(worker_kill_evt.as_raw_descriptor());
-        }
-        for kill_evt in &self.kill_evts {
-            keep_rds.push(kill_evt.as_raw_descriptor());
         }
 
         keep_rds
@@ -696,7 +663,7 @@ where
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         let vq_pairs = self.queue_sizes.len() / 2;
         let config_space = build_config(vq_pairs as u16, self.mtu, self.guest_mac);
-        copy_config(data, 0, config_space.as_slice(), offset);
+        copy_config(data, 0, config_space.as_bytes(), offset);
     }
 
     fn activate(
@@ -705,7 +672,21 @@ where
         interrupt: Interrupt,
         mut queues: Vec<(Queue, Event)>,
     ) -> anyhow::Result<()> {
-        if queues.len() != self.queue_sizes.len() {
+        let ctrl_vq_enabled = self.acked_features & (1 << virtio_net::VIRTIO_NET_F_CTRL_VQ) != 0;
+        let mq_enabled = self.acked_features & (1 << virtio_net::VIRTIO_NET_F_MQ) != 0;
+
+        let vq_pairs = if mq_enabled {
+            self.max_virtqueue_pairs()
+        } else {
+            1
+        };
+
+        let mut num_queues_expected = vq_pairs * 2;
+        if ctrl_vq_enabled {
+            num_queues_expected += 1;
+        }
+
+        if queues.len() != num_queues_expected {
             return Err(anyhow!(
                 "net: expected {} queues, got {} queues",
                 self.queue_sizes.len(),
@@ -713,100 +694,74 @@ where
             ));
         }
 
-        let vq_pairs = self.queue_sizes.len() / 2;
-        if self.taps.len() != vq_pairs {
+        if self.taps.len() < vq_pairs {
             return Err(anyhow!(
                 "net: expected {} taps, got {}",
                 vq_pairs,
                 self.taps.len()
             ));
         }
-        if self.workers_kill_evt.len() != vq_pairs {
-            return Err(anyhow!(
-                "net: expected {} worker_kill_evt, got {}",
-                vq_pairs,
-                self.workers_kill_evt.len()
-            ));
-        }
+
         for i in 0..vq_pairs {
             let tap = self.taps.remove(0);
             let acked_features = self.acked_features;
             let interrupt = interrupt.clone();
             let memory = mem.clone();
-            let kill_evt = self.workers_kill_evt.remove(0);
+            let first_queue = i == 0;
             // Queues alternate between rx0, tx0, rx1, tx1, ..., rxN, txN, ctrl.
             let (rx_queue, rx_queue_evt) = queues.remove(0);
             let (tx_queue, tx_queue_evt) = queues.remove(0);
-            let (ctrl_queue, ctrl_queue_evt) = if i == 0 {
+            let (ctrl_queue, ctrl_queue_evt) = if first_queue && ctrl_vq_enabled {
                 let (queue, evt) = queues.remove(queues.len() - 1);
                 (Some(queue), Some(evt))
             } else {
                 (None, None)
             };
+            // Handle interrupt resampling on the first queue's thread.
+            let handle_interrupt_resample = first_queue;
             let pairs = vq_pairs as u16;
             #[cfg(windows)]
             let overlapped_wrapper = OverlappedWrapper::new(true).unwrap();
-            self.worker_threads.push(
-                thread::Builder::new()
-                    .name(format!("v_net:{i}"))
-                    .spawn(move || {
-                        let mut worker = Worker {
-                            interrupt,
-                            mem: memory,
-                            rx_queue,
-                            tx_queue,
-                            ctrl_queue,
-                            tap,
-                            #[cfg(windows)]
-                            overlapped_wrapper,
-                            acked_features,
-                            vq_pairs: pairs,
-                            #[cfg(windows)]
-                            rx_buf: [0u8; MAX_BUFFER_SIZE],
-                            #[cfg(windows)]
-                            rx_count: 0,
-                            #[cfg(windows)]
-                            deferred_rx: false,
-                            kill_evt,
-                        };
-                        let result = worker.run(rx_queue_evt, tx_queue_evt, ctrl_queue_evt);
-                        if let Err(e) = result {
-                            error!("net worker thread exited with error: {}", e);
-                        }
-                        worker
-                    })
-                    .context("failed to spawn virtio_net worker")?,
-            );
+            self.worker_threads
+                .push(WorkerThread::start(format!("v_net:{i}"), move |kill_evt| {
+                    let mut worker = Worker {
+                        interrupt,
+                        mem: memory,
+                        rx_queue,
+                        tx_queue,
+                        ctrl_queue,
+                        tap,
+                        #[cfg(windows)]
+                        overlapped_wrapper,
+                        acked_features,
+                        vq_pairs: pairs,
+                        #[cfg(windows)]
+                        rx_buf: [0u8; MAX_BUFFER_SIZE],
+                        #[cfg(windows)]
+                        rx_count: 0,
+                        #[cfg(windows)]
+                        deferred_rx: false,
+                        kill_evt,
+                    };
+                    let result = worker.run(
+                        rx_queue_evt,
+                        tx_queue_evt,
+                        ctrl_queue_evt,
+                        handle_interrupt_resample,
+                    );
+                    if let Err(e) = result {
+                        error!("net worker thread exited with error: {}", e);
+                    }
+                    worker
+                }));
         }
         Ok(())
     }
 
     fn reset(&mut self) -> bool {
-        let len = self.kill_evts.len();
-        for i in 0..len {
-            // Only kill the child if it claimed its event.
-            if self.workers_kill_evt.get(i).is_none() {
-                if let Some(kill_evt) = self.kill_evts.get(i) {
-                    if kill_evt.signal().is_err() {
-                        error!("{}: failed to notify the kill event", self.debug_label());
-                        return false;
-                    }
-                }
-            }
-        }
-
-        let len = self.worker_threads.len();
-        for _ in 0..len {
-            match self.worker_threads.remove(0).join() {
-                Err(_) => {
-                    error!("{}: failed to get back resources", self.debug_label());
-                    return false;
-                }
-                Ok(worker) => {
-                    self.taps.push(worker.tap);
-                    self.workers_kill_evt.push(worker.kill_evt);
-                }
-            }
+        for worker_thread in self.worker_threads.drain(..) {
+            let worker = worker_thread.stop();
+            self.taps.push(worker.tap);
         }
 
         true

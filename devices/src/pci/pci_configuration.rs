@@ -7,11 +7,11 @@ use std::convert::TryInto;
 
 use anyhow::anyhow;
 use anyhow::Context;
+use base::custom_serde::serialize_arr;
 use base::warn;
 use remain::sorted;
 use serde::Deserialize;
 use serde::Serialize;
-use serde::Serializer;
 use thiserror::Error;
 
 use crate::pci::PciInterruptPin;
@@ -255,16 +255,6 @@ pub struct PciConfiguration {
     bar_configs: [Option<PciBarConfiguration>; NUM_BAR_REGS],
     // Contains the byte offset and size of the last capability.
     last_capability: Option<(usize, usize)>,
-}
-
-fn serialize_arr<S>(
-    data: &[u32; NUM_CONFIGURATION_REGISTERS],
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serde::Serialize::serialize(&data[..], serializer)
 }
 
 /// See pci_regs.h in kernel
@@ -783,12 +773,12 @@ impl PciBarConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use data_model::DataInit;
+    use zerocopy::AsBytes;
 
     use super::*;
 
     #[repr(packed)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, AsBytes)]
     #[allow(dead_code)]
     struct TestCap {
         _vndr: u8,
@@ -797,12 +787,9 @@ mod tests {
         foo: u8,
     }
 
-    // It is safe to implement DataInit; all members are simple numbers and any value is valid.
-    unsafe impl DataInit for TestCap {}
-
     impl PciCapability for TestCap {
         fn bytes(&self) -> &[u8] {
-            self.as_slice()
+            self.as_bytes()
         }
 
         fn id(&self) -> PciCapabilityID {

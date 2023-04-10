@@ -126,6 +126,52 @@ impl<T> ExitContextAnyhow<T> for anyhow::Result<T> {
     }
 }
 
+/// Trait for attaching context with process exit codes to an Option.
+pub trait ExitContextOption<T> {
+    fn exit_code<X>(self, exit_code: X) -> anyhow::Result<T>
+    where
+        X: Into<ExitCode>;
+
+    fn exit_context<X, C>(self, exit_code: X, context: C) -> anyhow::Result<T>
+    where
+        X: Into<ExitCode>,
+        C: Display + Send + Sync + 'static;
+
+    fn with_exit_context<X, C, F>(self, exit_code: X, f: F) -> anyhow::Result<T>
+    where
+        X: Into<ExitCode>,
+        C: Display + Send + Sync + 'static,
+        F: FnOnce() -> C;
+}
+
+impl<T> ExitContextOption<T> for std::option::Option<T> {
+    fn exit_code<X>(self, exit_code: X) -> anyhow::Result<T>
+    where
+        X: Into<ExitCode>,
+    {
+        self.context(ExitCodeWrapper(exit_code.into()))
+    }
+
+    fn exit_context<X, C>(self, exit_code: X, context: C) -> anyhow::Result<T>
+    where
+        X: Into<ExitCode>,
+        C: Display + Send + Sync + 'static,
+    {
+        self.context(ExitCodeWrapper(exit_code.into()))
+            .context(context)
+    }
+
+    fn with_exit_context<X, C, F>(self, exit_code: X, f: F) -> anyhow::Result<T>
+    where
+        X: Into<ExitCode>,
+        C: Display + Send + Sync + 'static,
+        F: FnOnce() -> C,
+    {
+        self.context(ExitCodeWrapper(exit_code.into()))
+            .with_context(f)
+    }
+}
+
 #[macro_export]
 macro_rules! bail_exit_code {
     ($exit_code:literal, $msg:literal $(,)?) => {
@@ -193,7 +239,7 @@ macro_rules! ensure_exit_code {
 }
 
 #[allow(clippy::enum_clike_unportable_variant)]
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
     // Windows process exit codes triggered by the kernel tend to be NTSTATUS, so we treat
     // our error codes as NTSTATUS to avoid clashing. This means we set the vendor bit. We also
@@ -339,6 +385,11 @@ pub enum Exit {
     CreateImeThread = 0xE0000099,
     OpenDiskImage = 0xE000009A,
     VirtioSoundDeviceNew = 0xE000009B,
+    StartSpu = 0xE000009C,
+    SandboxCreateProcessAccessDenied = 0xE000009D,
+    SandboxCreateProcessElevationRequired = 0xE000009E,
+    BalloonSizeInvalid = 0xE000009F,
+    VhostUserSndDeviceNew = 0xE00000A0,
 }
 
 impl From<Exit> for ExitCode {

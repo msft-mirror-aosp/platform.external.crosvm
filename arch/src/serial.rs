@@ -4,15 +4,19 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "seccomp_trace")]
+use base::debug;
 use base::Event;
 use devices::serial_device::SerialHardware;
 use devices::serial_device::SerialParameters;
 use devices::serial_device::SerialType;
 use devices::Bus;
-#[cfg(windows)]
-use devices::Minijail;
 use devices::Serial;
 use hypervisor::ProtectionType;
+#[cfg(feature = "seccomp_trace")]
+use jail::read_jail_addr;
+#[cfg(windows)]
+use jail::FakeMinijailStub as Minijail;
 #[cfg(unix)]
 use minijail::Minijail;
 use remain::sorted;
@@ -97,6 +101,7 @@ pub fn add_serial_devices(
     com_evt_2_4: &Event,
     serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
     #[cfg_attr(windows, allow(unused_variables))] serial_jail: Option<Minijail>,
+    #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
 ) -> std::result::Result<(), DeviceRegistrationError> {
     for com_num in 0..=3 {
         let com_evt = match com_num {
@@ -120,11 +125,16 @@ pub fn add_serial_devices(
 
         #[cfg(unix)]
         let serial_jail = if let Some(serial_jail) = serial_jail.as_ref() {
-            Some(
-                serial_jail
-                    .try_clone()
-                    .map_err(DeviceRegistrationError::CloneJail)?,
-            )
+            let jail_clone = serial_jail
+                .try_clone()
+                .map_err(DeviceRegistrationError::CloneJail)?;
+            #[cfg(feature = "seccomp_trace")]
+            debug!(
+                    "seccomp_trace {{\"event\": \"minijail_clone\", \"src_jail_addr\": \"0x{:x}\", \"dst_jail_addr\": \"0x{:x}\"}}",
+                    read_jail_addr(serial_jail),
+                    read_jail_addr(&jail_clone)
+                );
+            Some(jail_clone)
         } else {
             None
         };
@@ -138,6 +148,8 @@ pub fn add_serial_devices(
             serial_jail,
             preserved_descriptors,
             io_bus,
+            #[cfg(feature = "swap")]
+            swap_controller,
         )?;
     }
 

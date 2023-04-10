@@ -32,7 +32,7 @@ use base::FromRawDescriptor;
 use base::RawDescriptor;
 use base::SafeDescriptor;
 use data_model::vec_with_array_field;
-use data_model::DataInit;
+use data_model::zerocopy_from_reader;
 use hypervisor::DeviceKind;
 use hypervisor::Vm;
 use once_cell::sync::OnceCell;
@@ -44,6 +44,9 @@ use resources::Error as ResourcesError;
 use sync::Mutex;
 use thiserror::Error;
 use vfio_sys::*;
+use vm_memory::MemoryRegionInformation;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
 
 use crate::IommuDevType;
 
@@ -146,7 +149,7 @@ enum IommuType {
 
 // Hint as to whether IOMMU mappings will tend to be large and static or
 // small and dynamic.
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 enum IommuMappingHint {
     Static,
     Dynamic,
@@ -160,9 +163,10 @@ pub struct VfioContainer {
 
 fn extract_vfio_struct<T>(bytes: &[u8], offset: usize) -> T
 where
-    T: DataInit,
+    T: FromBytes,
 {
-    T::from_reader(&bytes[offset..(offset + mem::size_of::<T>())]).expect("malformed kernel data")
+    zerocopy_from_reader(&bytes[offset..(offset + mem::size_of::<T>())])
+        .expect("malformed kernel data")
 }
 
 const VFIO_API_VERSION: u8 = 0;
@@ -389,7 +393,12 @@ impl VfioContainer {
 
                     if !iommu_enabled {
                         vm.get_memory().with_regions(
-                            |_index, guest_addr, size, host_addr, _mmap, _fd_offset| {
+                            |MemoryRegionInformation {
+                                 guest_addr,
+                                 size,
+                                 host_addr,
+                                 ..
+                             }| {
                                 // Safe because the guest regions are guaranteed not to overlap
                                 unsafe {
                                     self.vfio_dma_map(
@@ -894,6 +903,36 @@ impl VfioDevice {
         }
     }
 
+    /// enter the device's low power state with wakeup notification
+    pub fn pm_low_power_enter_with_wakeup(&self, wakeup_evt: Event) -> Result<()> {
+        let payload = vfio_device_low_power_entry_with_wakeup {
+            wakeup_eventfd: wakeup_evt.as_raw_descriptor(),
+            reserved: 0,
+        };
+        let payload_size = mem::size_of::<vfio_device_low_power_entry_with_wakeup>();
+        let mut device_feature = vec_with_array_field::<vfio_device_feature, u8>(payload_size);
+        device_feature[0].argsz = (mem::size_of::<vfio_device_feature>() + payload_size) as u32;
+        device_feature[0].flags =
+            VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_LOW_POWER_ENTRY_WITH_WAKEUP;
+        unsafe {
+            // Safe as we know vfio_device_low_power_entry_with_wakeup has two 32-bit int fields
+            device_feature[0]
+                .data
+                .as_mut_slice(payload_size)
+                .copy_from_slice(
+                    mem::transmute::<vfio_device_low_power_entry_with_wakeup, [u8; 8]>(payload)
+                        .as_slice(),
+                );
+        }
+        // Safe as we are the owner of self and power_management which are valid value
+        let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_FEATURE(), &device_feature[0]) };
+        if ret < 0 {
+            Err(VfioError::VfioPmLowPowerEnter(get_error()))
+        } else {
+            Ok(())
+        }
+    }
+
     /// exit the device's low power state
     pub fn pm_low_power_exit(&self) -> Result<()> {
         let mut device_feature = vec_with_array_field::<vfio_device_feature, u8>(0);
@@ -1361,14 +1400,13 @@ impl VfioDevice {
     }
 
     /// Reads a value from the specified `VfioRegionAddr.addr` + `offset`.
-    pub fn region_read_from_addr<T: DataInit>(&self, addr: &VfioRegionAddr, offset: u64) -> T {
+    pub fn region_read_from_addr<T: FromBytes>(&self, addr: &VfioRegionAddr, offset: u64) -> T {
         let mut val = mem::MaybeUninit::zeroed();
         // Safe because we have zero-initialized `size_of::<T>()` bytes.
         let buf =
             unsafe { slice::from_raw_parts_mut(val.as_mut_ptr() as *mut u8, mem::size_of::<T>()) };
         self.region_read(addr.index, buf, addr.addr + offset);
-        // Safe because any bit pattern is valid for a type that implements
-        // DataInit.
+        // Safe because any bit pattern is valid for a type that implements FromBytes.
         unsafe { val.assume_init() }
     }
 
@@ -1404,8 +1442,8 @@ impl VfioDevice {
     }
 
     /// Writes data into the specified `VfioRegionAddr.addr` + `offset`.
-    pub fn region_write_to_addr<T: DataInit>(&self, val: &T, addr: &VfioRegionAddr, offset: u64) {
-        self.region_write(addr.index, val.as_slice(), addr.addr + offset);
+    pub fn region_write_to_addr<T: AsBytes>(&self, val: &T, addr: &VfioRegionAddr, offset: u64) {
+        self.region_write(addr.index, val.as_bytes(), addr.addr + offset);
     }
 
     /// get vfio device's descriptors which are passed into minijail process
@@ -1481,19 +1519,17 @@ impl VfioPciConfig {
         VfioPciConfig { device }
     }
 
-    pub fn read_config<T: DataInit>(&self, offset: u32) -> T {
+    pub fn read_config<T: FromBytes>(&self, offset: u32) -> T {
         let mut buf = vec![0u8; std::mem::size_of::<T>()];
         self.device
             .region_read(VFIO_PCI_CONFIG_REGION_INDEX, &mut buf, offset.into());
-        T::from_slice(&buf)
-            .copied()
-            .expect("failed to convert config data from slice")
+        T::read_from(&buf[..]).expect("failed to convert config data from slice")
     }
 
-    pub fn write_config<T: DataInit>(&self, config: T, offset: u32) {
+    pub fn write_config<T: AsBytes>(&self, config: T, offset: u32) {
         self.device.region_write(
             VFIO_PCI_CONFIG_REGION_INDEX,
-            config.as_slice(),
+            config.as_bytes(),
             offset.into(),
         );
     }

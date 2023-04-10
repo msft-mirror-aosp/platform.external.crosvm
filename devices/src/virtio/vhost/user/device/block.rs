@@ -22,7 +22,6 @@ use cros_async::EventAsync;
 use cros_async::Executor;
 use cros_async::ExecutorKind;
 use cros_async::TimerAsync;
-use data_model::DataInit;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
 use sync::Mutex;
@@ -30,6 +29,8 @@ pub use sys::start_device as run_block_device;
 pub use sys::Options;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::*;
+use vmm_vhost::VhostUserSlaveReqHandler;
+use zerocopy::AsBytes;
 
 use crate::virtio;
 use crate::virtio::block::asynchronous::flush_disk;
@@ -39,9 +40,11 @@ use crate::virtio::block::asynchronous::BlockAsync;
 use crate::virtio::block::DiskState;
 use crate::virtio::copy_config;
 use crate::virtio::vhost::user::device::handler::sys::Doorbell;
+use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
 use crate::virtio::vhost::user::device::handler::VhostBackendReqConnection;
 use crate::virtio::vhost::user::device::handler::VhostBackendReqConnectionState;
 use crate::virtio::vhost::user::device::handler::VhostUserBackend;
+use crate::virtio::vhost::user::device::handler::VhostUserPlatformOps;
 use crate::virtio::vhost::user::device::VhostUserDevice;
 
 const NUM_QUEUES: u16 = 16;
@@ -66,10 +69,11 @@ impl VhostUserDevice for BlockAsync {
         NUM_QUEUES as usize
     }
 
-    fn into_backend(
+    fn into_req_handler(
         mut self: Box<Self>,
+        ops: Box<dyn VhostUserPlatformOps>,
         ex: &Executor,
-    ) -> anyhow::Result<Box<dyn VhostUserBackend>> {
+    ) -> anyhow::Result<Box<dyn VhostUserSlaveReqHandler>> {
         let avail_features =
             self.avail_features | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
 
@@ -123,7 +127,7 @@ impl VhostUserDevice for BlockAsync {
             .detach();
         }
 
-        Ok(Box::new(BlockBackend {
+        let backend = BlockBackend {
             ex: ex.clone(),
             disk_state,
             disk_size: Arc::clone(&self.disk_size),
@@ -136,7 +140,10 @@ impl VhostUserDevice for BlockAsync {
             backend_req_conn: Arc::clone(&backend_req_conn),
             flush_timer_armed,
             workers: Default::default(),
-        }))
+        };
+
+        let handler = DeviceRequestHandler::new(Box::new(backend), ops);
+        Ok(Box::new(std::sync::Mutex::new(handler)))
     }
 
     fn executor_kind(&self) -> Option<ExecutorKind> {
@@ -191,7 +198,7 @@ impl VhostUserBackend for BlockBackend {
             let disk_size = self.disk_size.load(Ordering::Relaxed);
             BlockAsync::build_config_space(disk_size, self.seg_max, self.block_size, NUM_QUEUES)
         };
-        copy_config(data, 0, config_space.as_slice(), offset);
+        copy_config(data, 0, config_space.as_bytes(), offset);
     }
 
     fn reset(&mut self) {
@@ -201,7 +208,7 @@ impl VhostUserBackend for BlockBackend {
     fn start_queue(
         &mut self,
         idx: usize,
-        mut queue: virtio::Queue,
+        queue: virtio::Queue,
         mem: GuestMemory,
         doorbell: Doorbell,
         kick_evt: Event,
@@ -210,9 +217,6 @@ impl VhostUserBackend for BlockBackend {
             warn!("Starting new queue handler without stopping old handler");
             handle.abort();
         }
-
-        // Enable any virtqueue features that were negotiated (like VIRTIO_RING_F_EVENT_IDX).
-        queue.ack_features(self.acked_features);
 
         let kick_evt = EventAsync::new(kick_evt, &self.ex)
             .context("failed to create EventAsync for kick_evt")?;
@@ -224,7 +228,6 @@ impl VhostUserBackend for BlockBackend {
         self.ex
             .spawn_local(Abortable::new(
                 handle_queue(
-                    self.ex.clone(),
                     mem,
                     disk_state,
                     Rc::new(RefCell::new(queue)),

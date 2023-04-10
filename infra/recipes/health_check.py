@@ -4,8 +4,6 @@
 
 from recipe_engine.post_process import Filter
 
-PYTHON_VERSION_COMPATIBILITY = "PY3"
-
 DEPS = [
     "crosvm",
     "recipe_engine/raw_io",
@@ -31,22 +29,17 @@ def RunSteps(api):
             "List checks to run",
             [
                 "vpython3",
-                api.crosvm.source_dir.join("tools/health-check"),
+                api.crosvm.source_dir.join("tools/presubmit"),
                 "--list-checks",
+                "health_checks",
             ],
-            stdout=api.raw_io.output(),
+            stdout=api.raw_io.output_text(),
         )
-        check_list = result.stdout.strip().decode("utf-8").split("\n")
+        check_list = result.stdout.strip().split("\n")
         for check in check_list:
             api.crosvm.step_in_container(
-                "Checking %s" % check, ["./tools/health-check", "--all", check]
+                "tools/presubmit %s" % check, ["tools/presubmit", "--no-delta", check]
             )
-
-        api.crosvm.step_in_container("Checking mdbook", ["mdbook", "build", "docs/book/"])
-        api.crosvm.step_in_container(
-            "Checking cargo docs",
-            ["./tools/cargo-doc"],
-        )
 
 
 def GenTests(api):
@@ -57,8 +50,8 @@ def GenTests(api):
             # Provide a fake response to --list-checks
             api.step_data(
                 "List checks to run",
-                stdout=api.raw_io.output("a\nb"),
+                stdout=api.raw_io.output_text("check_a\ncheck_b"),
             ),
         )
-        + api.post_process(Filter().include_re(r"Checking.*"))
+        + api.post_process(Filter("List checks to run").include_re(r"tools/presubmit .*"))
     )

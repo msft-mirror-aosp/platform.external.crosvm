@@ -6,6 +6,8 @@
 //!
 //! New code should use the `hypervisor` crate instead.
 
+#![cfg(unix)]
+
 mod cap;
 
 use std::cell::RefCell;
@@ -26,8 +28,6 @@ use std::ptr::copy_nonoverlapping;
 use std::sync::Arc;
 
 #[allow(unused_imports)]
-use base::block_signal;
-#[allow(unused_imports)]
 use base::ioctl;
 #[allow(unused_imports)]
 use base::ioctl_with_mut_ptr;
@@ -43,6 +43,7 @@ use base::ioctl_with_val;
 use base::pagesize;
 #[allow(unused_imports)]
 use base::signal;
+use base::sys::BlockedSignal;
 #[allow(unused_imports)]
 use base::unblock_signal;
 #[allow(unused_imports)]
@@ -84,6 +85,7 @@ use libc::O_RDWR;
 use sync::Mutex;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionInformation;
 
 pub use crate::cap::*;
 
@@ -256,6 +258,7 @@ impl Kvm {
     // Ideally, this would take a description of the memory map and return
     // the closest machine type for this VM. Here, we just return the maximum
     // the kernel support.
+    #[allow(clippy::useless_conversion)]
     pub fn get_vm_type(&self) -> c_ulong {
         // Safe because we know self is a real kvm fd
         match unsafe { ioctl_with_val(self, KVM_CHECK_EXTENSION(), KVM_CAP_ARM_VM_IPA_SIZE.into()) }
@@ -346,20 +349,28 @@ impl Vm {
         if ret >= 0 {
             // Safe because we verify the value of ret and we are the owners of the fd.
             let vm_file = unsafe { File::from_raw_descriptor(ret) };
-            guest_mem.with_regions(|index, guest_addr, size, host_addr, _, _| {
-                unsafe {
-                    // Safe because the guest regions are guaranteed not to overlap.
-                    set_user_memory_region(
-                        &vm_file,
-                        index as u32,
-                        false,
-                        false,
-                        guest_addr.offset() as u64,
-                        size as u64,
-                        host_addr as *mut u8,
-                    )
-                }
-            })?;
+            guest_mem.with_regions(
+                |MemoryRegionInformation {
+                     index,
+                     guest_addr,
+                     size,
+                     host_addr,
+                     ..
+                 }| {
+                    unsafe {
+                        // Safe because the guest regions are guaranteed not to overlap.
+                        set_user_memory_region(
+                            &vm_file,
+                            index as u32,
+                            false,
+                            false,
+                            guest_addr.offset() as u64,
+                            size as u64,
+                            host_addr as *mut u8,
+                        )
+                    }
+                },
+            )?;
 
             Ok(Vm {
                 vm: vm_file,
@@ -1691,7 +1702,8 @@ impl RunnableVcpu {
                     // Safe because we know the exit reason told us this union
                     // field is valid
                     let event_type = unsafe { run.__bindgen_anon_1.system_event.type_ };
-                    let event_flags = unsafe { run.__bindgen_anon_1.system_event.flags };
+                    let event_flags =
+                        unsafe { run.__bindgen_anon_1.system_event.__bindgen_anon_1.flags };
                     Ok(VcpuExit::SystemEvent(event_type, event_flags))
                 }
                 r => panic!("unknown kvm exit reason: {}", r),
@@ -1740,25 +1752,3 @@ impl Drop for RunnableVcpu {
 /// Hides the zero length array behind a bounds check.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub type CpuId = FlexibleArrayWrapper<kvm_cpuid2, kvm_cpuid_entry2>;
-
-// Represents a temporarily blocked signal. It will unblock the signal when dropped.
-struct BlockedSignal {
-    signal_num: c_int,
-}
-
-impl BlockedSignal {
-    // Returns a `BlockedSignal` if the specified signal can be blocked, otherwise None.
-    fn new(signal_num: c_int) -> Option<BlockedSignal> {
-        if block_signal(signal_num).is_ok() {
-            Some(BlockedSignal { signal_num })
-        } else {
-            None
-        }
-    }
-}
-
-impl Drop for BlockedSignal {
-    fn drop(&mut self) {
-        unblock_signal(self.signal_num).expect("failed to restore signal mask");
-    }
-}

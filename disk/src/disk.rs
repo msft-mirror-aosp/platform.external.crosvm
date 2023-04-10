@@ -21,10 +21,11 @@ use base::AsRawDescriptors;
 use base::FileAllocate;
 use base::FileReadWriteAtVolatile;
 use base::FileSetLen;
+use base::PunchHole;
 use cros_async::AllocateMode;
 use cros_async::BackingMemory;
 use cros_async::Executor;
-use cros_async::IoSourceExt;
+use cros_async::IoSource;
 use thiserror::Error as ThisError;
 
 mod asynchronous;
@@ -119,10 +120,14 @@ pub enum Error {
     #[error("failed to write data: {0}")]
     WritingData(io::Error),
     #[error("failed to convert to async: {0}")]
-    ToAsync(io::Error),
+    ToAsync(cros_async::AsyncError),
     #[cfg(windows)]
     #[error("failed to set disk file sparse: {0}")]
     SetSparseFailure(io::Error),
+    #[error("failure with guest memory access: {0}")]
+    GuestMemory(cros_async::mem::Error),
+    #[error("unsupported operation")]
+    UnsupportedOperation,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -143,21 +148,33 @@ impl DiskGetLen for File {
     }
 }
 
+pub trait PunchHoleMut {
+    /// Replace a range of bytes with a hole.
+    fn punch_hole_mut(&mut self, offset: u64, length: u64) -> io::Result<()>;
+}
+
+impl<T: PunchHole> PunchHoleMut for T {
+    fn punch_hole_mut(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        self.punch_hole(offset, length)
+    }
+}
+
 /// The prerequisites necessary to support a block device.
 pub trait DiskFile:
     FileSetLen + DiskGetLen + FileReadWriteAtVolatile + ToAsyncDisk + Send + AsRawDescriptors + Debug
 {
-}
-impl<
-        D: FileSetLen
-            + DiskGetLen
-            + FileReadWriteAtVolatile
-            + ToAsyncDisk
-            + Send
-            + AsRawDescriptors
-            + Debug,
-    > DiskFile for D
-{
+    /// Creates a new DiskFile instance that shares the same underlying disk file image. IO
+    /// operations to a DiskFile should affect all DiskFile instances with the same underlying disk
+    /// file image.
+    ///
+    /// `try_clone()` returns [`io::ErrorKind::Unsupported`] Error if a DiskFile does not support
+    /// creating an instance with the same underlying disk file image.
+    fn try_clone(&self) -> io::Result<Box<dyn DiskFile>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported operation",
+        ))
+    }
 }
 
 /// A `DiskFile` that can be converted for asychronous access.
@@ -242,6 +259,12 @@ pub fn detect_image_type(file: &File) -> Result<ImageType> {
     }
 
     Ok(ImageType::Raw)
+}
+
+impl DiskFile for File {
+    fn try_clone(&self) -> io::Result<Box<dyn DiskFile>> {
+        Ok(Box::new(self.try_clone()?))
+    }
 }
 
 /// Inspect the image file type and create an appropriate disk file to match it.
@@ -364,7 +387,7 @@ pub trait AsyncDisk: DiskGetLen + FileSetLen + FileAllocate {
 
 /// A disk backed by a single file that implements `AsyncDisk` for access.
 pub struct SingleFileDisk {
-    inner: Box<dyn IoSourceExt<File>>,
+    inner: IoSource<File>,
 }
 
 impl SingleFileDisk {

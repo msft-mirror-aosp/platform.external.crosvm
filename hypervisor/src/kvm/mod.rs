@@ -6,6 +6,7 @@
 mod aarch64;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub use aarch64::*;
+use base::sys::BlockedSignal;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86_64;
@@ -28,7 +29,6 @@ use std::ptr::copy_nonoverlapping;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use base::block_signal;
 use base::errno_result;
 use base::error;
 use base::ioctl;
@@ -37,7 +37,6 @@ use base::ioctl_with_ref;
 use base::ioctl_with_val;
 use base::pagesize;
 use base::signal;
-use base::unblock_signal;
 use base::AsRawDescriptor;
 use base::Error;
 use base::Event;
@@ -61,12 +60,14 @@ use libc::EINVAL;
 use libc::EIO;
 use libc::ENOENT;
 use libc::ENOSPC;
+use libc::ENOSYS;
 use libc::EOVERFLOW;
 use libc::O_CLOEXEC;
 use libc::O_RDWR;
 use sync::Mutex;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionInformation;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub use x86_64::*;
 
@@ -149,9 +150,25 @@ impl Kvm {
             return errno_result();
         }
         // Safe because we verify that ret is valid and we own the fd.
-        Ok(Kvm {
-            kvm: unsafe { SafeDescriptor::from_raw_descriptor(ret) },
-        })
+        let kvm = unsafe { SafeDescriptor::from_raw_descriptor(ret) };
+
+        // Safe because we know that the descriptor is valid and we verify the return result.
+        let version = unsafe { ioctl(&kvm, KVM_GET_API_VERSION()) };
+        if version < 0 {
+            return errno_result();
+        }
+
+        // Per the kernel KVM API documentation: "Applications should refuse to run if
+        // KVM_GET_API_VERSION returns a value other than 12."
+        if version as u32 != KVM_API_VERSION {
+            error!(
+                "KVM_GET_API_VERSION: expected {}, got {}",
+                KVM_API_VERSION, version,
+            );
+            return Err(Error::new(ENOSYS));
+        }
+
+        Ok(Kvm { kvm })
     }
 
     /// Opens `/dev/kvm/` and returns a Kvm object on success.
@@ -223,20 +240,28 @@ impl KvmVm {
         }
         // Safe because we verify that ret is valid and we own the fd.
         let vm_descriptor = unsafe { SafeDescriptor::from_raw_descriptor(ret) };
-        guest_mem.with_regions(|index, guest_addr, size, host_addr, _, _| {
-            unsafe {
-                // Safe because the guest regions are guaranteed not to overlap.
-                set_user_memory_region(
-                    &vm_descriptor,
-                    index as MemSlot,
-                    false,
-                    false,
-                    guest_addr.offset(),
-                    size as u64,
-                    host_addr as *mut u8,
-                )
-            }
-        })?;
+        guest_mem.with_regions(
+            |MemoryRegionInformation {
+                 index,
+                 guest_addr,
+                 size,
+                 host_addr,
+                 ..
+             }| {
+                unsafe {
+                    // Safe because the guest regions are guaranteed not to overlap.
+                    set_user_memory_region(
+                        &vm_descriptor,
+                        index as MemSlot,
+                        false,
+                        false,
+                        guest_addr.offset(),
+                        size as u64,
+                        host_addr as *mut u8,
+                    )
+                }
+            },
+        )?;
 
         let vm = KvmVm {
             kvm: kvm.try_clone()?,
@@ -268,6 +293,7 @@ impl KvmVm {
             .map_err(|_| Error::new(ENOSPC))?;
 
         Ok(KvmVcpu {
+            kvm: self.kvm.try_clone()?,
             vm: self.vm.try_clone()?,
             vcpu,
             id,
@@ -740,6 +766,7 @@ impl AsRawDescriptor for KvmVm {
 
 /// A wrapper around using a KVM Vcpu.
 pub struct KvmVcpu {
+    kvm: Kvm,
     vm: SafeDescriptor,
     vcpu: SafeDescriptor,
     id: usize,
@@ -765,6 +792,7 @@ impl Vcpu for KvmVcpu {
         let vcpu_run_handle_fingerprint = self.vcpu_run_handle_fingerprint.clone();
 
         Ok(KvmVcpu {
+            kvm: self.kvm.try_clone()?,
             vm,
             vcpu,
             id: self.id,
@@ -984,7 +1012,8 @@ impl Vcpu for KvmVcpu {
                 // Safe because we know the exit reason told us this union
                 // field is valid
                 let event_type = unsafe { run.__bindgen_anon_1.system_event.type_ };
-                let event_flags = unsafe { run.__bindgen_anon_1.system_event.flags };
+                let event_flags =
+                    unsafe { run.__bindgen_anon_1.system_event.__bindgen_anon_1.flags };
                 match event_type {
                     KVM_SYSTEM_EVENT_SHUTDOWN => Ok(VcpuExit::SystemEventShutdown),
                     KVM_SYSTEM_EVENT_RESET => self.system_event_reset(event_flags),
@@ -1223,6 +1252,8 @@ impl TryFrom<HypervisorCap> for KvmCap {
             HypervisorCap::Xcrs => Ok(KvmCap::Xcrs),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             HypervisorCap::CalibratedTscLeafRequired => Err(Error::new(libc::EINVAL)),
+            HypervisorCap::StaticSwiotlbAllocationRequired => Err(Error::new(libc::EINVAL)),
+            HypervisorCap::HypervisorInitializedBootContext => Err(Error::new(libc::EINVAL)),
         }
     }
 }
@@ -1255,28 +1286,6 @@ impl From<&IrqRoute> for kvm_irq_routing_entry {
                 ..Default::default()
             },
         }
-    }
-}
-
-// Represents a temporarily blocked signal. It will unblock the signal when dropped.
-struct BlockedSignal {
-    signal_num: c_int,
-}
-
-impl BlockedSignal {
-    // Returns a `BlockedSignal` if the specified signal can be blocked, otherwise None.
-    fn new(signal_num: c_int) -> Option<BlockedSignal> {
-        if block_signal(signal_num).is_ok() {
-            Some(BlockedSignal { signal_num })
-        } else {
-            None
-        }
-    }
-}
-
-impl Drop for BlockedSignal {
-    fn drop(&mut self) {
-        unblock_signal(self.signal_num).expect("failed to restore signal mask");
     }
 }
 

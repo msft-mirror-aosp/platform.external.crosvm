@@ -2,6 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs;
+use std::hash::Hash;
+use std::hash::Hasher;
+
 use argh::FromArgs;
 use serde::Deserialize;
 use serde::Serialize;
@@ -9,11 +15,6 @@ use serde_json::json;
 use serde_json::to_string_pretty;
 use serde_json::Number;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::fs;
-use std::hash::Hash;
-use std::hash::Hasher;
 use uuid::Uuid;
 
 /// This tool takes results from Fuchsia performance tests (in Fuchsia's JSON perf test results
@@ -33,7 +34,7 @@ struct ConverterArgs {
 
     /// release version in the format 0.yyyymmdd.a.b if applicable. e.g. 0.20200101.1.2
     #[argh(option, arg_name = "STRING")]
-    product_version: Option<String>,
+    product_versions: Option<String>,
 
     /// copied into output file as pointId, used to order results from different builds in a graph
     #[argh(option, arg_name = "NUMBER")]
@@ -266,7 +267,7 @@ fn build_shared_diagnostic_map(
     diag_set.insert(diag.clone());
     diag_map.insert("masters", diag.guid);
 
-    if let Some(version) = &args.product_version {
+    if let Some(version) = &args.product_versions {
         let diag = Diagnostic {
             values: vec![json!(version)],
             ..Default::default()

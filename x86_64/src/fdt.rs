@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 use std::fs::File;
+use std::path::PathBuf;
 
 use arch::android::create_android_fdt;
 use cros_fdt::Error;
@@ -10,7 +11,6 @@ use cros_fdt::FdtWriter;
 
 use crate::SetupData;
 use crate::SetupDataType;
-use crate::X86_64_FDT_MAX_SIZE;
 
 /// Creates a flattened device tree containing all of the parameters for the
 /// kernel and returns it as `SetupData`.
@@ -18,7 +18,10 @@ use crate::X86_64_FDT_MAX_SIZE;
 /// # Arguments
 ///
 /// * `android_fstab` - the File object for the android fstab
-pub fn create_fdt(android_fstab: File) -> Result<SetupData, Error> {
+pub fn create_fdt(
+    android_fstab: File,
+    dump_device_tree_blob: Option<PathBuf>,
+) -> Result<SetupData, Error> {
     let mut fdt = FdtWriter::new(&[]);
 
     // The whole thing is put into one giant node with some top level properties
@@ -26,7 +29,12 @@ pub fn create_fdt(android_fstab: File) -> Result<SetupData, Error> {
     create_android_fdt(&mut fdt, android_fstab)?;
     fdt.end_node(root_node)?;
 
-    let fdt_final = fdt.finish(X86_64_FDT_MAX_SIZE as usize)?;
+    let fdt_final = fdt.finish()?;
+
+    if let Some(file_path) = dump_device_tree_blob {
+        std::fs::write(&file_path, &fdt_final)
+            .map_err(|e| Error::FdtDumpIoError(e, file_path.clone()))?;
+    }
 
     Ok(SetupData {
         data: fdt_final,

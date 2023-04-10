@@ -13,18 +13,21 @@ use base::Event;
 use base::RawDescriptor;
 use base::Terminal;
 use cros_async::Executor;
-use data_model::DataInit;
 use hypervisor::ProtectionType;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::VhostUserProtocolFeatures;
 use vmm_vhost::message::VhostUserVirtioFeatures;
+use vmm_vhost::VhostUserSlaveReqHandler;
+use zerocopy::AsBytes;
 
 use crate::virtio;
 use crate::virtio::console::asynchronous::ConsoleDevice;
 use crate::virtio::console::virtio_console_config;
 use crate::virtio::copy_config;
 use crate::virtio::vhost::user::device::handler::sys::Doorbell;
+use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
 use crate::virtio::vhost::user::device::handler::VhostUserBackend;
+use crate::virtio::vhost::user::device::handler::VhostUserPlatformOps;
 use crate::virtio::vhost::user::device::listener::sys::VhostUserListener;
 use crate::virtio::vhost::user::device::listener::VhostUserListenerTrait;
 use crate::virtio::vhost::user::device::VhostUserDevice;
@@ -59,7 +62,11 @@ impl VhostUserDevice for VhostUserConsoleDevice {
         MAX_QUEUE_NUM
     }
 
-    fn into_backend(self: Box<Self>, ex: &Executor) -> anyhow::Result<Box<dyn VhostUserBackend>> {
+    fn into_req_handler(
+        self: Box<Self>,
+        ops: Box<dyn VhostUserPlatformOps>,
+        ex: &Executor,
+    ) -> anyhow::Result<Box<dyn VhostUserSlaveReqHandler>> {
         if self.raw_stdin {
             // Set stdin() to raw mode so we can send over individual keystrokes unbuffered
             std::io::stdin()
@@ -67,12 +74,15 @@ impl VhostUserDevice for VhostUserConsoleDevice {
                 .context("failed to set terminal in raw mode")?;
         }
 
-        Ok(Box::new(ConsoleBackend {
+        let backend = ConsoleBackend {
             device: *self,
             acked_features: 0,
             acked_protocol_features: VhostUserProtocolFeatures::empty(),
             ex: ex.clone(),
-        }))
+        };
+
+        let handler = DeviceRequestHandler::new(Box::new(backend), ops);
+        Ok(Box::new(std::sync::Mutex::new(handler)))
     }
 }
 
@@ -128,7 +138,7 @@ impl VhostUserBackend for ConsoleBackend {
             max_nr_ports: 1.into(),
             ..Default::default()
         };
-        copy_config(data, 0, config.as_slice(), offset);
+        copy_config(data, 0, config.as_bytes(), offset);
     }
 
     fn reset(&mut self) {
@@ -140,14 +150,11 @@ impl VhostUserBackend for ConsoleBackend {
     fn start_queue(
         &mut self,
         idx: usize,
-        mut queue: virtio::Queue,
+        queue: virtio::Queue,
         mem: GuestMemory,
         doorbell: Doorbell,
         kick_evt: Event,
     ) -> anyhow::Result<()> {
-        // Enable any virtqueue features that were negotiated (like VIRTIO_RING_F_EVENT_IDX).
-        queue.ack_features(self.acked_features);
-
         match idx {
             // ReceiveQueue
             0 => self
@@ -258,15 +265,13 @@ pub fn run_console_device(opts: Options) -> anyhow::Result<()> {
     // We won't jail the device and can simply ignore `keep_rds`.
     let device = Box::new(create_vu_console_device(&params, &mut Vec::new())?);
     let ex = Executor::new().context("Failed to create executor")?;
-    let backend = device.into_backend(&ex)?;
 
     let listener = VhostUserListener::new_from_socket_or_vfio(
         &opts.socket,
         &opts.vfio,
-        backend.max_queue_num(),
+        device.max_queue_num(),
         None,
     )?;
 
-    // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
-    ex.run_until(listener.run_backend(backend, &ex))?
+    listener.run_device(ex, device)
 }

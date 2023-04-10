@@ -26,6 +26,7 @@ use vm_control::client::*;
 use vm_control::BalloonControlCommand;
 use vm_control::BalloonStats;
 use vm_control::DiskControlCommand;
+use vm_control::RegisteredEvent;
 use vm_control::UsbControlAttachedDevice;
 use vm_control::UsbControlResult;
 use vm_control::VmRequest;
@@ -111,6 +112,52 @@ pub extern "C" fn crosvm_client_balloon_vms(socket_path: *const c_char, num_byte
         if let Some(socket_path) = validate_socket_path(socket_path) {
             let command = BalloonControlCommand::Adjust { num_bytes };
             vms_request(&VmRequest::BalloonCommand(command), &socket_path).is_ok()
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Enable vmm swap for crosvm instance whose control socket is listening on `socket_path`.
+///
+/// The function returns true on success or false if an error occured.
+#[no_mangle]
+pub extern "C" fn crosvm_client_swap_enable_vm(socket_path: *const c_char) -> bool {
+    catch_unwind(|| {
+        if let Some(socket_path) = validate_socket_path(socket_path) {
+            vms_request(&VmRequest::Swap(SwapCommand::Enable), &socket_path).is_ok()
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Swap out staging memory for crosvm instance whose control socket is listening
+/// on `socket_path`.
+///
+/// The function returns true on success or false if an error occured.
+#[no_mangle]
+pub extern "C" fn crosvm_client_swap_swapout_vm(socket_path: *const c_char) -> bool {
+    catch_unwind(|| {
+        if let Some(socket_path) = validate_socket_path(socket_path) {
+            vms_request(&VmRequest::Swap(SwapCommand::SwapOut), &socket_path).is_ok()
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Disable vmm swap for crosvm instance whose control socket is listening on `socket_path`.
+///
+/// The function returns true on success or false if an error occured.
+#[no_mangle]
+pub extern "C" fn crosvm_client_swap_disable_vm(socket_path: *const c_char) -> bool {
+    catch_unwind(|| {
+        if let Some(socket_path) = validate_socket_path(socket_path) {
+            vms_request(&VmRequest::Swap(SwapCommand::Disable), &socket_path).is_ok()
         } else {
             false
         }
@@ -384,6 +431,110 @@ pub extern "C" fn crosvm_client_balloon_stats(
                     }
                 }
                 true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Publically exposed version of RegisteredEvent enum, implemented as an
+/// integral newtype for FFI safety.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct RegisteredEventFfi(u32);
+
+pub const REGISTERED_EVENT_VIRTIO_BALLOON_WSS_REPORT: RegisteredEventFfi = RegisteredEventFfi(0);
+pub const REGISTERED_EVENT_VIRTIO_BALLOON_RESIZE: RegisteredEventFfi = RegisteredEventFfi(1);
+pub const REGISTERED_EVENT_VIRTIO_BALLOON_OOM_DEFLATION: RegisteredEventFfi = RegisteredEventFfi(2);
+
+impl TryFrom<RegisteredEventFfi> for RegisteredEvent {
+    type Error = &'static str;
+
+    fn try_from(value: RegisteredEventFfi) -> Result<Self, Self::Error> {
+        match value.0 {
+            0 => Ok(RegisteredEvent::VirtioBalloonWssReport),
+            1 => Ok(RegisteredEvent::VirtioBalloonResize),
+            2 => Ok(RegisteredEvent::VirtioBalloonOOMDeflation),
+            _ => Err("RegisteredEventFFi outside of known RegisteredEvent enum range"),
+        }
+    }
+}
+
+/// Registers the connected process as a listener for `event`.
+#[no_mangle]
+pub extern "C" fn crosvm_client_register_events_listener(
+    socket_path: *const c_char,
+    listening_socket_path: *const c_char,
+    event: RegisteredEventFfi,
+) -> bool {
+    catch_unwind(|| {
+        if let Some(socket_path) = validate_socket_path(socket_path) {
+            if let Some(listening_socket_path) = validate_socket_path(listening_socket_path) {
+                if let Ok(event) = event.try_into() {
+                    let request = VmRequest::RegisterListener {
+                        event,
+                        socket_addr: listening_socket_path.to_str().unwrap().to_string(),
+                    };
+                    vms_request(&request, &socket_path).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Unegisters the connected process as a listener for `event`.
+#[no_mangle]
+pub extern "C" fn crosvm_client_unregister_events_listener(
+    socket_path: *const c_char,
+    listening_socket_path: *const c_char,
+    event: RegisteredEventFfi,
+) -> bool {
+    catch_unwind(|| {
+        if let Some(socket_path) = validate_socket_path(socket_path) {
+            if let Some(listening_socket_path) = validate_socket_path(listening_socket_path) {
+                if let Ok(event) = event.try_into() {
+                    let request = VmRequest::UnregisterListener {
+                        event,
+                        socket_addr: listening_socket_path.to_str().unwrap().to_string(),
+                    };
+                    vms_request(&request, &socket_path).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Unegisters the connected process as a listener for all events.
+#[no_mangle]
+pub extern "C" fn crosvm_client_unregister_listener(
+    socket_path: *const c_char,
+    listening_socket_path: *const c_char,
+) -> bool {
+    catch_unwind(|| {
+        if let Some(socket_path) = validate_socket_path(socket_path) {
+            if let Some(listening_socket_path) = validate_socket_path(listening_socket_path) {
+                let request = VmRequest::Unregister {
+                    socket_addr: listening_socket_path.to_str().unwrap().to_string(),
+                };
+                vms_request(&request, &socket_path).is_ok()
             } else {
                 false
             }

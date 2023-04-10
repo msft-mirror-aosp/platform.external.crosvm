@@ -4,12 +4,10 @@
 
 #[cfg(test)]
 use std::any::Any;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::rc::Rc;
 
-use anyhow::anyhow;
 use anyhow::Result;
 use libva::BufferType;
 use libva::Display;
@@ -17,37 +15,27 @@ use libva::IQMatrix;
 use libva::IQMatrixBufferVP8;
 use libva::Picture as VaPicture;
 use libva::ProbabilityDataBufferVP8;
-use libva::UsageHint;
 
-use crate::decoders::h264::backends::Result as StatelessBackendResult;
-use crate::decoders::vp8::backends::AsBackendHandle;
-use crate::decoders::vp8::backends::BlockingMode;
-use crate::decoders::vp8::backends::ContainedPicture;
-use crate::decoders::vp8::backends::DecodedHandle;
+use crate::decoders::vp8::backends::Result as StatelessBackendResult;
 use crate::decoders::vp8::backends::StatelessDecoderBackend;
-use crate::decoders::vp8::backends::Vp8Picture;
 use crate::decoders::vp8::decoder::Decoder;
 use crate::decoders::vp8::parser::Header;
 use crate::decoders::vp8::parser::MbLfAdjustments;
-use crate::decoders::vp8::parser::Parser;
 use crate::decoders::vp8::parser::Segmentation;
-use crate::decoders::Error as DecoderError;
+use crate::decoders::BlockingMode;
+use crate::decoders::DecodedHandle;
 use crate::decoders::Result as DecoderResult;
 use crate::decoders::StatelessBackendError;
 use crate::decoders::VideoDecoderBackend;
-use crate::utils;
 use crate::utils::vaapi::DecodedHandle as VADecodedHandle;
-use crate::utils::vaapi::FormatMap;
 use crate::utils::vaapi::GenericBackendHandle;
 use crate::utils::vaapi::NegotiationStatus;
-use crate::utils::vaapi::PendingJob;
-use crate::utils::vaapi::StreamMetadataState;
-use crate::utils::vaapi::SurfacePoolHandle;
-use crate::DecodedFormat;
+use crate::utils::vaapi::StreamInfo;
+use crate::utils::vaapi::VaapiBackend;
 use crate::Resolution;
 
 /// Resolves to the type used as Handle by the backend.
-type AssociatedHandle = <Backend as StatelessDecoderBackend>::Handle;
+type AssociatedHandle = <Backend as VideoDecoderBackend>::Handle;
 
 /// The number of surfaces to allocate for this codec. Same as GStreamer's vavp8dec.
 const NUM_SURFACES: usize = 7;
@@ -61,15 +49,30 @@ struct TestParams {
     probability_table: BufferType,
 }
 
+impl StreamInfo for &Header {
+    fn va_profile(&self) -> anyhow::Result<i32> {
+        Ok(libva::VAProfile::VAProfileVP8Version0_3)
+    }
+
+    fn rt_format(&self) -> anyhow::Result<u32> {
+        Ok(libva::constants::VA_RT_FORMAT_YUV420)
+    }
+
+    fn min_num_surfaces(&self) -> usize {
+        NUM_SURFACES
+    }
+
+    fn coded_size(&self) -> (u32, u32) {
+        (self.width() as u32, self.height() as u32)
+    }
+
+    fn visible_rect(&self) -> ((u32, u32), (u32, u32)) {
+        ((0, 0), self.coded_size())
+    }
+}
+
 struct Backend {
-    /// The metadata state. Updated whenever the decoder reads new data from the stream.
-    metadata_state: StreamMetadataState,
-    /// The FIFO for all pending pictures, in the order they were submitted.
-    pending_jobs: VecDeque<PendingJob<Vp8Picture<GenericBackendHandle>>>,
-    /// The number of allocated surfaces.
-    num_allocated_surfaces: usize,
-    /// The negotiation status
-    negotiation_status: NegotiationStatus<Box<Header>>,
+    backend: VaapiBackend<Header>,
 
     #[cfg(test)]
     /// Test params. Saves the metadata sent to VA-API for the purposes of
@@ -81,11 +84,7 @@ impl Backend {
     /// Create a new codec backend for VP8.
     fn new(display: Rc<libva::Display>) -> Result<Self> {
         Ok(Self {
-            metadata_state: StreamMetadataState::Unparsed { display },
-            pending_jobs: Default::default(),
-            num_allocated_surfaces: Default::default(),
-            negotiation_status: Default::default(),
-
+            backend: VaapiBackend::new(display),
             #[cfg(test)]
             test_params: Default::default(),
         })
@@ -102,97 +101,23 @@ impl Backend {
         }
     }
 
-    /// Initialize the codec state by reading some metadata from the current
-    /// frame.
-    fn open(&mut self, frame_hdr: &Header, format_map: Option<&FormatMap>) -> Result<()> {
-        let display = self.metadata_state.display();
-
-        let va_profile = libva::VAProfile::VAProfileVP8Version0_3;
-        let rt_format = libva::constants::VA_RT_FORMAT_YUV420;
-
-        let frame_w = u32::from(frame_hdr.width());
-        let frame_h = u32::from(frame_hdr.height());
-
-        let attrs = vec![libva::VAConfigAttrib {
-            type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
-            value: rt_format,
-        }];
-
-        let config =
-            display.create_config(attrs, va_profile, libva::VAEntrypoint::VAEntrypointVLD)?;
-
-        let format_map = if let Some(format_map) = format_map {
-            format_map
-        } else {
-            // Pick the first one that fits
-            utils::vaapi::FORMAT_MAP
-                .iter()
-                .find(|&map| map.rt_format == rt_format)
-                .ok_or(anyhow!("Unsupported format {}", rt_format))?
-        };
-
-        let map_format = display
-            .query_image_formats()?
-            .iter()
-            .find(|f| f.fourcc == format_map.va_fourcc)
-            .cloned()
-            .unwrap();
-
-        let surfaces = display.create_surfaces(
-            rt_format,
-            Some(map_format.fourcc),
-            frame_w,
-            frame_h,
-            Some(UsageHint::USAGE_HINT_DECODER),
-            NUM_SURFACES as u32,
-        )?;
-
-        self.num_allocated_surfaces = NUM_SURFACES;
-
-        let context = display.create_context(
-            &config,
-            i32::try_from(frame_w)?,
-            i32::try_from(frame_h)?,
-            Some(&surfaces),
-            true,
-        )?;
-
-        let coded_resolution = Resolution {
-            width: frame_w,
-            height: frame_h,
-        };
-
-        let surface_pool = SurfacePoolHandle::new(surfaces, coded_resolution);
-
-        self.metadata_state = StreamMetadataState::Parsed {
-            context,
-            config,
-            surface_pool,
-            coded_resolution,
-            display_resolution: coded_resolution, // TODO(dwlsalmeida)
-            map_format: Rc::new(map_format),
-            rt_format,
-            profile: va_profile,
-        };
-
-        Ok(())
-    }
-
     /// Gets the VASurfaceID for the given `picture`.
-    fn surface_id(picture: &Vp8Picture<GenericBackendHandle>) -> libva::VASurfaceID {
-        picture.backend_handle.as_ref().unwrap().surface_id()
+    fn surface_id(picture: &GenericBackendHandle) -> libva::VASurfaceID {
+        picture.surface_id()
     }
 
-    fn build_iq_matrix(frame_hdr: &Header, parser: &Parser) -> Result<libva::BufferType> {
+    fn build_iq_matrix(
+        frame_hdr: &Header,
+        segmentation: &Segmentation,
+    ) -> Result<libva::BufferType> {
         let mut quantization_index: [[u16; 6]; 4] = Default::default();
-        let seg = parser.segmentation();
 
         for (i, quantization_index) in quantization_index.iter_mut().enumerate() {
             let mut qi_base: i16;
 
-            if seg.segmentation_enabled {
-                qi_base = i16::from(seg.quantizer_update_value[i]);
-                if !seg.segment_feature_mode {
+            if segmentation.segmentation_enabled {
+                qi_base = i16::from(segmentation.quantizer_update_value[i]);
+                if !segmentation.segment_feature_mode {
                     qi_base += i16::from(frame_hdr.quant_indices().y_ac_qi);
                 }
             } else {
@@ -252,19 +177,19 @@ impl Backend {
         }
 
         let last_surface = if let Some(last_ref) = last {
-            Self::surface_id(&last_ref.picture())
+            Self::surface_id(&last_ref.handle())
         } else {
             libva::constants::VA_INVALID_SURFACE
         };
 
         let golden_surface = if let Some(golden_ref) = golden {
-            Self::surface_id(&golden_ref.picture())
+            Self::surface_id(&golden_ref.handle())
         } else {
             libva::constants::VA_INVALID_SURFACE
         };
 
         let alt_surface = if let Some(alt_ref) = alt {
-            Self::surface_id(&alt_ref.picture())
+            Self::surface_id(&alt_ref.handle())
         } else {
             libva::constants::VA_INVALID_SURFACE
         };
@@ -357,78 +282,60 @@ impl Backend {
 
         self.test_params.push(test_params);
     }
-
-    fn build_va_decoded_handle(
-        &self,
-        picture: &ContainedPicture<GenericBackendHandle>,
-    ) -> Result<AssociatedHandle> {
-        Ok(VADecodedHandle::new(
-            Rc::clone(picture),
-            self.metadata_state.coded_resolution()?,
-            self.metadata_state.surface_pool()?,
-        ))
-    }
 }
 
 impl StatelessDecoderBackend for Backend {
-    type Handle = VADecodedHandle<Vp8Picture<GenericBackendHandle>>;
-
     fn new_sequence(&mut self, header: &Header) -> StatelessBackendResult<()> {
-        self.open(header, None)?;
-        self.negotiation_status = NegotiationStatus::Possible(Box::new(header.clone()));
+        self.backend.metadata_state.open(header, None)?;
+        self.backend.negotiation_status = NegotiationStatus::Possible(Box::new(header.clone()));
 
         Ok(())
     }
 
     fn submit_picture(
         &mut self,
-        picture: Vp8Picture<AsBackendHandle<Self::Handle>>,
+        picture: &Header,
         last_ref: Option<&Self::Handle>,
         golden_ref: Option<&Self::Handle>,
         alt_ref: Option<&Self::Handle>,
-        bitstream: &dyn AsRef<[u8]>,
-        parser: &Parser,
+        bitstream: &[u8],
+        segmentation: &Segmentation,
+        mb_lf_adjust: &MbLfAdjustments,
         timestamp: u64,
-        block: bool,
+        block: BlockingMode,
     ) -> StatelessBackendResult<Self::Handle> {
-        self.negotiation_status = NegotiationStatus::Negotiated;
+        self.backend.negotiation_status = NegotiationStatus::Negotiated;
 
-        let context = self.metadata_state.context()?;
+        let metadata = self.backend.metadata_state.get_parsed_mut()?;
+        let context = &metadata.context;
+        let coded_resolution = metadata.surface_pool.coded_resolution();
 
-        let iq_buffer = context.create_buffer(Backend::build_iq_matrix(&picture.data, parser)?)?;
+        let iq_buffer = context.create_buffer(Backend::build_iq_matrix(picture, segmentation)?)?;
 
-        let probs = context.create_buffer(Backend::build_probability_table(&picture.data))?;
-
-        let coded_resolution = self.metadata_state.coded_resolution()?;
+        let probs = context.create_buffer(Backend::build_probability_table(picture))?;
 
         let pic_param = context.create_buffer(Backend::build_pic_param(
-            &picture.data,
+            picture,
             &coded_resolution,
-            parser.segmentation(),
-            parser.mb_lf_adjust(),
+            segmentation,
+            mb_lf_adjust,
             last_ref,
             golden_ref,
             alt_ref,
         )?)?;
 
-        let slice_param = context.create_buffer(Backend::build_slice_param(
-            &picture.data,
-            bitstream.as_ref().len(),
-        )?)?;
+        let slice_param =
+            context.create_buffer(Backend::build_slice_param(picture, bitstream.len())?)?;
 
         let slice_data =
-            context.create_buffer(libva::BufferType::SliceData(Vec::from(bitstream.as_ref())))?;
+            context.create_buffer(libva::BufferType::SliceData(Vec::from(bitstream)))?;
 
-        let context = self.metadata_state.context()?;
-
-        let surface = self
-            .metadata_state
-            .get_surface()?
+        let surface = metadata
+            .surface_pool
+            .get_surface()
             .ok_or(StatelessBackendError::OutOfResources)?;
 
-        let surface_id = surface.id();
-
-        let mut va_picture = VaPicture::new(timestamp, Rc::clone(&context), surface);
+        let mut va_picture = VaPicture::new(timestamp, Rc::clone(context), surface);
 
         // Add buffers with the parsed data.
         va_picture.add_buffer(iq_buffer);
@@ -437,129 +344,24 @@ impl StatelessDecoderBackend for Backend {
         va_picture.add_buffer(slice_param);
         va_picture.add_buffer(slice_data);
 
-        let va_picture = va_picture.begin()?.render()?.end()?;
-
         #[cfg(test)]
         self.save_params(
             Backend::build_pic_param(
-                &picture.data,
+                picture,
                 &coded_resolution,
-                parser.segmentation(),
-                parser.mb_lf_adjust(),
+                segmentation,
+                mb_lf_adjust,
                 last_ref,
                 golden_ref,
                 alt_ref,
             )?,
-            Backend::build_slice_param(&picture.data, bitstream.as_ref().len())?,
-            libva::BufferType::SliceData(Vec::from(bitstream.as_ref())),
-            Backend::build_iq_matrix(&picture.data, parser)?,
-            Backend::build_probability_table(&picture.data),
+            Backend::build_slice_param(picture, bitstream.len())?,
+            libva::BufferType::SliceData(Vec::from(bitstream)),
+            Backend::build_iq_matrix(picture, segmentation)?,
+            Backend::build_probability_table(picture),
         );
 
-        let picture = Rc::new(RefCell::new(picture));
-
-        if block {
-            let va_picture = va_picture.sync()?;
-
-            let map_format = self.metadata_state.map_format()?;
-
-            let backend_handle = GenericBackendHandle::new_ready(
-                va_picture,
-                Rc::clone(map_format),
-                self.metadata_state.display_resolution()?,
-            );
-
-            picture.borrow_mut().backend_handle = Some(backend_handle);
-        } else {
-            // Append to our queue of pending jobs
-            let pending_job = PendingJob {
-                va_picture,
-                codec_picture: Rc::clone(&picture),
-            };
-
-            self.pending_jobs.push_back(pending_job);
-
-            picture.borrow_mut().backend_handle =
-                Some(GenericBackendHandle::new_pending(surface_id));
-        }
-
-        self.build_va_decoded_handle(&picture)
-            .map_err(|e| StatelessBackendError::Other(anyhow!(e)))
-    }
-
-    fn poll(
-        &mut self,
-        blocking_mode: super::BlockingMode,
-    ) -> StatelessBackendResult<VecDeque<Self::Handle>> {
-        let mut completed = VecDeque::new();
-        let candidates = self.pending_jobs.drain(..).collect::<VecDeque<_>>();
-
-        for job in candidates {
-            if matches!(blocking_mode, BlockingMode::NonBlocking) {
-                let status = job.va_picture.query_status()?;
-                if status != libva::VASurfaceStatus::VASurfaceReady {
-                    self.pending_jobs.push_back(job);
-                    continue;
-                }
-            }
-
-            let current_picture = job.va_picture.sync()?;
-
-            let map_format = self.metadata_state.map_format()?;
-
-            let backend_handle = GenericBackendHandle::new_ready(
-                current_picture,
-                Rc::clone(map_format),
-                self.metadata_state.display_resolution()?,
-            );
-
-            job.codec_picture.borrow_mut().backend_handle = Some(backend_handle);
-
-            completed.push_back(job.codec_picture);
-        }
-
-        let completed = completed.into_iter().map(|picture| {
-            self.build_va_decoded_handle(&picture)
-                .map_err(|e| StatelessBackendError::Other(anyhow!(e)))
-        });
-
-        completed.collect::<Result<VecDeque<_>, StatelessBackendError>>()
-    }
-
-    fn handle_is_ready(&self, handle: &Self::Handle) -> bool {
-        match &handle.picture().backend_handle {
-            Some(backend_handle) => backend_handle.is_ready(),
-            None => true,
-        }
-    }
-
-    fn block_on_handle(&mut self, handle: &Self::Handle) -> StatelessBackendResult<()> {
-        for i in 0..self.pending_jobs.len() {
-            // Remove from the queue in order.
-            let job = &self.pending_jobs[i];
-
-            if Vp8Picture::same(&job.codec_picture, handle.picture_container()) {
-                let job = self.pending_jobs.remove(i).unwrap();
-
-                let current_picture = job.va_picture.sync()?;
-
-                let map_format = self.metadata_state.map_format()?;
-
-                let backend_handle = GenericBackendHandle::new_ready(
-                    current_picture,
-                    Rc::clone(map_format),
-                    self.metadata_state.display_resolution()?,
-                );
-
-                job.codec_picture.borrow_mut().backend_handle = Some(backend_handle);
-
-                return Ok(());
-            }
-        }
-
-        Err(StatelessBackendError::Other(anyhow!(
-            "Asked to block on a pending job that doesn't exist"
-        )))
+        self.backend.process_picture(va_picture, block)
     }
 
     #[cfg(test)]
@@ -569,66 +371,46 @@ impl StatelessDecoderBackend for Backend {
 }
 
 impl VideoDecoderBackend for Backend {
+    type Handle = VADecodedHandle;
+
     fn coded_resolution(&self) -> Option<Resolution> {
-        self.metadata_state.coded_resolution().ok()
+        self.backend.coded_resolution()
     }
 
     fn display_resolution(&self) -> Option<Resolution> {
-        self.metadata_state.display_resolution().ok()
+        self.backend.display_resolution()
     }
 
     fn num_resources_total(&self) -> usize {
-        self.num_allocated_surfaces
+        self.backend.num_resources_total()
     }
 
     fn num_resources_left(&self) -> usize {
-        match self.metadata_state.surface_pool() {
-            Ok(pool) => pool.num_surfaces_left(),
-            Err(_) => 0,
-        }
+        self.backend.num_resources_left()
     }
 
     fn format(&self) -> Option<crate::DecodedFormat> {
-        let map_format = self.metadata_state.map_format().ok()?;
-        DecodedFormat::try_from(map_format.as_ref()).ok()
+        self.backend.format()
     }
 
     fn try_format(&mut self, format: crate::DecodedFormat) -> DecoderResult<()> {
-        let header = match &self.negotiation_status {
-            NegotiationStatus::Possible(header) => header.clone(),
-            _ => {
-                return Err(DecoderError::StatelessBackendError(
-                    StatelessBackendError::NegotiationFailed(anyhow!(
-                        "Negotiation is not possible at this stage {:?}",
-                        self.negotiation_status
-                    )),
-                ))
-            }
-        };
+        self.backend.try_format(format)
+    }
 
-        let supported_formats_for_stream = self.metadata_state.supported_formats_for_stream()?;
+    fn poll(&mut self, blocking_mode: BlockingMode) -> DecoderResult<VecDeque<Self::Handle>> {
+        self.backend.poll(blocking_mode)
+    }
 
-        if supported_formats_for_stream.contains(&format) {
-            let map_format = utils::vaapi::FORMAT_MAP
-                .iter()
-                .find(|&map| map.decoded_format == format)
-                .unwrap();
+    fn handle_is_ready(&self, handle: &Self::Handle) -> bool {
+        self.backend.handle_is_ready(handle)
+    }
 
-            self.open(&header, Some(map_format))?;
-
-            Ok(())
-        } else {
-            Err(DecoderError::StatelessBackendError(
-                StatelessBackendError::NegotiationFailed(anyhow!(
-                    "Format {:?} is unsupported.",
-                    format
-                )),
-            ))
-        }
+    fn block_on_handle(&mut self, handle: &Self::Handle) -> StatelessBackendResult<()> {
+        self.backend.block_on_handle(handle)
     }
 }
 
-impl Decoder<VADecodedHandle<Vp8Picture<GenericBackendHandle>>> {
+impl Decoder<VADecodedHandle> {
     // Creates a new instance of the decoder using the VAAPI backend.
     pub fn new_vaapi(display: Rc<Display>, blocking_mode: BlockingMode) -> Result<Self> {
         Self::new(Box::new(Backend::new(display)?), blocking_mode)
@@ -647,13 +429,13 @@ mod tests {
 
     use crate::decoders::vp8::backends::vaapi::AssociatedHandle;
     use crate::decoders::vp8::backends::vaapi::TestParams;
-    use crate::decoders::vp8::backends::BlockingMode;
-    use crate::decoders::vp8::backends::DecodedHandle;
     use crate::decoders::vp8::backends::StatelessDecoderBackend;
     use crate::decoders::vp8::decoder::tests::process_ready_frames;
     use crate::decoders::vp8::decoder::tests::run_decoding_loop;
     use crate::decoders::vp8::decoder::Decoder;
-    use crate::decoders::DynPicture;
+    use crate::decoders::BlockingMode;
+    use crate::decoders::DecodedHandle;
+    use crate::decoders::DynHandle;
 
     fn get_test_params(
         backend: &dyn StatelessDecoderBackend<Handle = AssociatedHandle>,
@@ -667,7 +449,7 @@ mod tests {
         expected_crcs: Option<&mut HashSet<&str>>,
         frame_num: i32,
     ) {
-        let mut picture = handle.picture_mut();
+        let mut picture = handle.handle_mut();
         let mut backend_handle = picture.dyn_mappable_handle_mut();
 
         let buffer_size = backend_handle.image_size();

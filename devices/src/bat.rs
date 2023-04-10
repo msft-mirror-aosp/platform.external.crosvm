@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 use std::sync::Arc;
-use std::thread;
 
 use acpi_tables::aml;
 use acpi_tables::aml::Aml;
@@ -15,6 +14,7 @@ use base::EventToken;
 use base::RawDescriptor;
 use base::Tube;
 use base::WaitContext;
+use base::WorkerThread;
 use power_monitor::BatteryStatus;
 use power_monitor::CreatePowerMonitorFn;
 use remain::sorted;
@@ -110,8 +110,7 @@ pub struct GoldfishBattery {
     irq_num: u32,
     irq_evt: IrqLevelEvent,
     activated: bool,
-    monitor_thread: Option<thread::JoinHandle<()>>,
-    kill_evt: Option<Event>,
+    monitor_thread: Option<WorkerThread<()>>,
     tube: Option<Tube>,
     create_power_monitor: Option<Box<dyn CreatePowerMonitorFn>>,
 }
@@ -337,7 +336,6 @@ impl GoldfishBattery {
             irq_evt,
             activated: false,
             monitor_thread: None,
-            kill_evt: None,
             tube: Some(tube),
             create_power_monitor,
         })
@@ -363,40 +361,13 @@ impl GoldfishBattery {
             return;
         }
 
-        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "{}: failed to create kill Event pair: {}",
-                    self.debug_label(),
-                    e
-                );
-                return;
-            }
-        };
-
         if let Some(tube) = self.tube.take() {
             let irq_evt = self.irq_evt.try_clone().unwrap();
             let bat_state = self.state.clone();
             let create_monitor_fn = self.create_power_monitor.take();
-            let monitor_result = thread::Builder::new()
-                .name(self.debug_label())
-                .spawn(move || {
-                    command_monitor(tube, irq_evt, kill_evt, bat_state, create_monitor_fn);
-                });
-
-            self.monitor_thread = match monitor_result {
-                Err(e) => {
-                    error!(
-                        "{}: failed to spawn PowerIO monitor: {}",
-                        self.debug_label(),
-                        e
-                    );
-                    return;
-                }
-                Ok(join_handle) => Some(join_handle),
-            };
-            self.kill_evt = Some(self_kill_evt);
+            self.monitor_thread = Some(WorkerThread::start(self.debug_label(), move |kill_evt| {
+                command_monitor(tube, irq_evt, kill_evt, bat_state, create_monitor_fn)
+            }));
             self.activated = true;
         }
     }
@@ -404,13 +375,9 @@ impl GoldfishBattery {
 
 impl Drop for GoldfishBattery {
     fn drop(&mut self) {
-        if let Some(kill_evt) = self.kill_evt.take() {
-            // Ignore the result because there is nothing we can do with a failure.
-            let _ = kill_evt.signal();
-        }
-        if let Some(thread) = self.monitor_thread.take() {
-            let _ = thread.join();
-        }
+        if let Err(e) = self.sleep() {
+            error!("{}", e);
+        };
     }
 }
 
@@ -510,4 +477,20 @@ impl Aml for GoldfishBattery {
     }
 }
 
-impl Suspendable for GoldfishBattery {}
+impl Suspendable for GoldfishBattery {
+    fn sleep(&mut self) -> anyhow::Result<()> {
+        if let Some(thread) = self.monitor_thread.take() {
+            thread.stop();
+        }
+        Ok(())
+    }
+
+    fn wake(&mut self) -> anyhow::Result<()> {
+        if self.activated {
+            // Set activated to false for start_monitor to start monitoring again.
+            self.activated = false;
+            self.start_monitor();
+        }
+        Ok(())
+    }
+}

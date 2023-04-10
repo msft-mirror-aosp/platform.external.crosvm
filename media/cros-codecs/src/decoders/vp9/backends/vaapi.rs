@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -13,54 +12,33 @@ use libva::BufferType;
 use libva::Display;
 use libva::Picture as VaPicture;
 use libva::SegmentParameterVP9;
-use libva::UsageHint;
 
-use crate::decoders::vp9::backends::AsBackendHandle;
-use crate::decoders::vp9::backends::BlockingMode;
-use crate::decoders::vp9::backends::ContainedPicture;
-use crate::decoders::vp9::backends::DecodedHandle;
 use crate::decoders::vp9::backends::Result as StatelessBackendResult;
 use crate::decoders::vp9::backends::StatelessDecoderBackend;
-use crate::decoders::vp9::backends::Vp9Picture;
 use crate::decoders::vp9::decoder::Decoder;
-use crate::decoders::vp9::lookups::AC_QLOOKUP;
-use crate::decoders::vp9::lookups::AC_QLOOKUP_10;
-use crate::decoders::vp9::lookups::AC_QLOOKUP_12;
-use crate::decoders::vp9::lookups::DC_QLOOKUP;
-use crate::decoders::vp9::lookups::DC_QLOOKUP_10;
-use crate::decoders::vp9::lookups::DC_QLOOKUP_12;
+use crate::decoders::vp9::decoder::Segmentation;
 use crate::decoders::vp9::parser::BitDepth;
 use crate::decoders::vp9::parser::Header;
 use crate::decoders::vp9::parser::Profile;
 use crate::decoders::vp9::parser::ALTREF_FRAME;
 use crate::decoders::vp9::parser::GOLDEN_FRAME;
-use crate::decoders::vp9::parser::INTRA_FRAME;
 use crate::decoders::vp9::parser::LAST_FRAME;
-use crate::decoders::vp9::parser::MAX_LOOP_FILTER;
-use crate::decoders::vp9::parser::MAX_MODE_LF_DELTAS;
-use crate::decoders::vp9::parser::MAX_REF_FRAMES;
 use crate::decoders::vp9::parser::MAX_SEGMENTS;
 use crate::decoders::vp9::parser::NUM_REF_FRAMES;
-use crate::decoders::vp9::parser::SEG_LVL_ALT_L;
-use crate::decoders::vp9::parser::SEG_LVL_REF_FRAME;
-use crate::decoders::vp9::parser::SEG_LVL_SKIP;
-use crate::decoders::Error as DecoderError;
+use crate::decoders::BlockingMode;
+use crate::decoders::DecodedHandle;
 use crate::decoders::Result as DecoderResult;
 use crate::decoders::StatelessBackendError;
 use crate::decoders::VideoDecoderBackend;
-use crate::utils;
 use crate::utils::vaapi::DecodedHandle as VADecodedHandle;
-use crate::utils::vaapi::FormatMap;
 use crate::utils::vaapi::GenericBackendHandle;
 use crate::utils::vaapi::NegotiationStatus;
-use crate::utils::vaapi::PendingJob;
-use crate::utils::vaapi::StreamMetadataState;
-use crate::utils::vaapi::SurfacePoolHandle;
-use crate::DecodedFormat;
+use crate::utils::vaapi::StreamInfo;
+use crate::utils::vaapi::VaapiBackend;
 use crate::Resolution;
 
 /// Resolves to the type used as Handle by the backend.
-type AssociatedHandle = <Backend as StatelessDecoderBackend>::Handle;
+type AssociatedHandle = <Backend as VideoDecoderBackend>::Handle;
 
 /// The number of surfaces to allocate for this codec.
 const NUM_SURFACES: usize = 12;
@@ -72,39 +50,40 @@ struct TestParams {
     slice_data: BufferType,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Segmentation {
-    /// Loop filter level
-    lvl_lookup: [[u8; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES],
+impl StreamInfo for &Header {
+    fn va_profile(&self) -> anyhow::Result<i32> {
+        Ok(match self.profile() {
+            Profile::Profile0 => libva::VAProfile::VAProfileVP9Profile0,
+            Profile::Profile1 => libva::VAProfile::VAProfileVP9Profile1,
+            Profile::Profile2 => libva::VAProfile::VAProfileVP9Profile2,
+            Profile::Profile3 => libva::VAProfile::VAProfileVP9Profile3,
+        })
+    }
 
-    /// AC quant scale for luma component
-    luma_ac_quant_scale: i16,
-    /// DC quant scale for luma component
-    luma_dc_quant_scale: i16,
-    /// AC quant scale for chroma component
-    chroma_ac_quant_scale: i16,
-    /// DC quant scale for chroma component
-    chroma_dc_quant_scale: i16,
+    fn rt_format(&self) -> anyhow::Result<u32> {
+        Backend::get_rt_format(
+            self.profile(),
+            self.bit_depth(),
+            self.subsampling_x(),
+            self.subsampling_y(),
+        )
+    }
 
-    /// Whether the alternate reference frame segment feature is enabled (SEG_LVL_REF_FRAME)
-    reference_frame_enabled: bool,
-    /// The feature data for the reference frame featire
-    reference_frame: i16,
-    /// Whether the skip segment feature is enabled (SEG_LVL_SKIP)
-    reference_skip_enabled: bool,
+    fn min_num_surfaces(&self) -> usize {
+        NUM_SURFACES
+    }
+
+    fn coded_size(&self) -> (u32, u32) {
+        (self.width() as u32, self.height() as u32)
+    }
+
+    fn visible_rect(&self) -> ((u32, u32), (u32, u32)) {
+        ((0, 0), self.coded_size())
+    }
 }
 
 struct Backend {
-    /// The metadata state. Updated whenever the decoder reads new data from the stream.
-    metadata_state: StreamMetadataState,
-    /// The FIFO for all pending pictures, in the order they were submitted.
-    pending_jobs: VecDeque<PendingJob<Vp9Picture<GenericBackendHandle>>>,
-    /// The number of allocated surfaces.
-    num_allocated_surfaces: usize,
-    /// The negotiation status
-    negotiation_status: NegotiationStatus<Box<Header>>,
-    /// Per-segment data.
-    segmentation: [Segmentation; MAX_SEGMENTS],
+    backend: VaapiBackend<Header>,
 
     #[cfg(test)]
     /// Test params. Saves the metadata sent to VA-API for the purposes of
@@ -116,35 +95,11 @@ impl Backend {
     /// Create a new codec backend for VP8.
     fn new(display: Rc<libva::Display>) -> Result<Self> {
         Ok(Self {
-            metadata_state: StreamMetadataState::Unparsed { display },
-            pending_jobs: Default::default(),
-            num_allocated_surfaces: Default::default(),
-            negotiation_status: Default::default(),
-            segmentation: Default::default(),
+            backend: VaapiBackend::new(display),
 
             #[cfg(test)]
             test_params: Default::default(),
         })
-    }
-
-    /// A clamp such that min <= x <= max
-    fn clamp<U: PartialOrd>(x: U, low: U, high: U) -> U {
-        if x > high {
-            high
-        } else if x < low {
-            low
-        } else {
-            x
-        }
-    }
-
-    fn get_profile(profile: Profile) -> libva::VAProfile::Type {
-        match profile {
-            Profile::Profile0 => libva::VAProfile::VAProfileVP9Profile0,
-            Profile::Profile1 => libva::VAProfile::VAProfileVP9Profile1,
-            Profile::Profile2 => libva::VAProfile::VAProfileVP9Profile2,
-            Profile::Profile3 => libva::VAProfile::VAProfileVP9Profile3,
-        }
     }
 
     fn get_rt_format(
@@ -211,227 +166,9 @@ impl Backend {
         }
     }
 
-    /// Initialize the codec state by reading some metadata from the current
-    /// frame.
-    fn open(&mut self, hdr: &Header, format_map: Option<&FormatMap>) -> Result<()> {
-        let display = self.metadata_state.display();
-
-        let hdr_profile = hdr.profile();
-
-        let va_profile = Self::get_profile(hdr_profile);
-        let rt_format = Self::get_rt_format(
-            hdr_profile,
-            hdr.bit_depth(),
-            hdr.subsampling_x(),
-            hdr.subsampling_y(),
-        )?;
-
-        let frame_w = hdr.width();
-        let frame_h = hdr.height();
-
-        let attrs = vec![libva::VAConfigAttrib {
-            type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
-            value: rt_format,
-        }];
-
-        let config =
-            display.create_config(attrs, va_profile, libva::VAEntrypoint::VAEntrypointVLD)?;
-
-        let format_map = if let Some(format_map) = format_map {
-            format_map
-        } else {
-            // Pick the first one that fits
-            utils::vaapi::FORMAT_MAP
-                .iter()
-                .find(|&map| map.rt_format == rt_format)
-                .ok_or(anyhow!("Unsupported format {}", rt_format))?
-        };
-
-        let map_format = display
-            .query_image_formats()?
-            .iter()
-            .find(|f| f.fourcc == format_map.va_fourcc)
-            .cloned()
-            .unwrap();
-
-        let surfaces = display.create_surfaces(
-            rt_format,
-            Some(map_format.fourcc),
-            frame_w,
-            frame_h,
-            Some(UsageHint::USAGE_HINT_DECODER),
-            NUM_SURFACES as u32,
-        )?;
-
-        self.num_allocated_surfaces = NUM_SURFACES;
-
-        let context = display.create_context(
-            &config,
-            i32::try_from(frame_w)?,
-            i32::try_from(frame_h)?,
-            Some(&surfaces),
-            true,
-        )?;
-
-        let coded_resolution = Resolution {
-            width: frame_w,
-            height: frame_h,
-        };
-
-        let surface_pool = SurfacePoolHandle::new(surfaces, coded_resolution);
-
-        self.metadata_state = StreamMetadataState::Parsed {
-            context,
-            config,
-            surface_pool,
-            coded_resolution,
-            display_resolution: coded_resolution, // TODO(dwlsalmeida)
-            map_format: Rc::new(map_format),
-            rt_format,
-            profile: va_profile,
-        };
-
-        Ok(())
-    }
-
     /// Gets the VASurfaceID for the given `picture`.
-    fn surface_id(picture: &Vp9Picture<GenericBackendHandle>) -> libva::VASurfaceID {
-        picture.backend_handle.as_ref().unwrap().surface_id()
-    }
-
-    /// An implementation of seg_feature_active as per "6.4.9 Segmentation feature active syntax"
-    fn seg_feature_active(hdr: &Header, segment_id: u8, feature: u8) -> bool {
-        let seg = hdr.seg();
-        let feature_enabled = seg.feature_enabled();
-        seg.enabled() && feature_enabled[usize::from(segment_id)][usize::from(feature)]
-    }
-
-    /// An implementation of get_qindex as per "8.6.1 Dequantization functions"
-    fn get_qindex(hdr: &Header, segment_id: u8) -> i32 {
-        let q = hdr.quant();
-        let base_q_idx = q.base_q_idx();
-        let seg = hdr.seg();
-
-        if Self::seg_feature_active(hdr, segment_id, 0) {
-            let mut data = seg.feature_data()[usize::from(segment_id)][0] as i32;
-
-            if !seg.abs_or_delta_update() {
-                data += i32::from(base_q_idx);
-            }
-
-            Self::clamp(data, 0, 255)
-        } else {
-            i32::from(base_q_idx)
-        }
-    }
-
-    /// An implementation of get_dc_quant as per "8.6.1 Dequantization functions"
-    fn get_dc_quant(hdr: &Header, segment_id: u8, luma: bool) -> Result<i32> {
-        let quant = hdr.quant();
-
-        let delta_q_dc = if luma {
-            quant.delta_q_y_dc()
-        } else {
-            quant.delta_q_uv_dc()
-        };
-        let qindex = Self::get_qindex(hdr, segment_id);
-        let q_table_idx = Self::clamp(qindex + i32::from(delta_q_dc), 0, 255) as usize;
-        match hdr.bit_depth() {
-            BitDepth::Depth8 => Ok(i32::from(DC_QLOOKUP[q_table_idx])),
-            BitDepth::Depth10 => Ok(i32::from(DC_QLOOKUP_10[q_table_idx])),
-            BitDepth::Depth12 => Ok(i32::from(DC_QLOOKUP_12[q_table_idx])),
-        }
-    }
-
-    /// An implementation of get_ac_quant as per "8.6.1 Dequantization functions"
-    fn get_ac_quant(hdr: &Header, segment_id: u8, luma: bool) -> Result<i32> {
-        let quant = hdr.quant();
-
-        let delta_q_ac = if luma { 0 } else { quant.delta_q_uv_ac() };
-        let qindex = Self::get_qindex(hdr, segment_id);
-        let q_table_idx = usize::try_from(Self::clamp(qindex + i32::from(delta_q_ac), 0, 255))?;
-
-        match hdr.bit_depth() {
-            BitDepth::Depth8 => Ok(i32::from(AC_QLOOKUP[q_table_idx])),
-            BitDepth::Depth10 => Ok(i32::from(AC_QLOOKUP_10[q_table_idx])),
-            BitDepth::Depth12 => Ok(i32::from(AC_QLOOKUP_12[q_table_idx])),
-        }
-    }
-
-    /// Update the state of the segmentation parameters after seeing a frame
-    fn update_segmentation(hdr: &Header, segmentation: &mut [Segmentation; 8]) -> Result<()> {
-        let lf = hdr.lf();
-        let seg = hdr.seg();
-
-        let n_shift = lf.level() >> 5;
-
-        for segment_id in 0..MAX_SEGMENTS as u8 {
-            let luma_dc_quant_scale = i16::try_from(Self::get_dc_quant(hdr, segment_id, true)?)?;
-            let luma_ac_quant_scale = i16::try_from(Self::get_ac_quant(hdr, segment_id, true)?)?;
-            let chroma_dc_quant_scale = i16::try_from(Self::get_dc_quant(hdr, segment_id, false)?)?;
-            let chroma_ac_quant_scale = i16::try_from(Self::get_ac_quant(hdr, segment_id, false)?)?;
-
-            let mut lvl_seg = i32::from(lf.level());
-            let mut lvl_lookup: [[u8; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES];
-
-            if lvl_seg == 0 {
-                lvl_lookup = Default::default()
-            } else {
-                // 8.8.1 Loop filter frame init process
-                if Self::seg_feature_active(hdr, segment_id, SEG_LVL_ALT_L as u8) {
-                    if seg.abs_or_delta_update() {
-                        lvl_seg =
-                            i32::from(seg.feature_data()[usize::from(segment_id)][SEG_LVL_ALT_L]);
-                    } else {
-                        lvl_seg +=
-                            i32::from(seg.feature_data()[usize::from(segment_id)][SEG_LVL_ALT_L]);
-                    }
-
-                    lvl_seg = Self::clamp(lvl_seg, 0, MAX_LOOP_FILTER as i32);
-                }
-
-                if !lf.delta_enabled() {
-                    lvl_lookup = [[u8::try_from(lvl_seg)?; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]
-                } else {
-                    let intra_delta = i32::from(lf.ref_deltas()[INTRA_FRAME]);
-                    let mut intra_lvl = lvl_seg + (intra_delta << n_shift);
-
-                    lvl_lookup = segmentation[usize::from(segment_id)].lvl_lookup;
-                    lvl_lookup[INTRA_FRAME][0] =
-                        u8::try_from(Self::clamp(intra_lvl, 0, MAX_LOOP_FILTER as i32))?;
-
-                    // Note, this array has the [0] element unspecified/unused in
-                    // VP9. Confusing, but we do start to index from 1.
-                    #[allow(clippy::needless_range_loop)]
-                    for ref_ in LAST_FRAME..MAX_REF_FRAMES {
-                        for mode in 0..MAX_MODE_LF_DELTAS {
-                            let ref_delta = i32::from(lf.ref_deltas()[ref_]);
-                            let mode_delta = i32::from(lf.mode_deltas()[mode]);
-
-                            intra_lvl = lvl_seg + (ref_delta << n_shift) + (mode_delta << n_shift);
-
-                            lvl_lookup[ref_][mode] =
-                                u8::try_from(Self::clamp(intra_lvl, 0, MAX_LOOP_FILTER as i32))?;
-                        }
-                    }
-                }
-            }
-
-            segmentation[usize::from(segment_id)] = Segmentation {
-                lvl_lookup,
-                luma_ac_quant_scale,
-                luma_dc_quant_scale,
-                chroma_ac_quant_scale,
-                chroma_dc_quant_scale,
-                reference_frame_enabled: seg.feature_enabled()[usize::from(segment_id)]
-                    [SEG_LVL_REF_FRAME],
-                reference_frame: seg.feature_data()[usize::from(segment_id)][SEG_LVL_REF_FRAME],
-                reference_skip_enabled: seg.feature_enabled()[usize::from(segment_id)]
-                    [SEG_LVL_SKIP],
-            }
-        }
-
-        Ok(())
+    fn surface_id(picture: &GenericBackendHandle) -> libva::VASurfaceID {
+        picture.surface_id()
     }
 
     fn build_pic_param(
@@ -442,7 +179,7 @@ impl Backend {
             .iter()
             .map(|h| {
                 if let Some(h) = h {
-                    Self::surface_id(&h.picture())
+                    Self::surface_id(&h.handle())
                 } else {
                     libva::constants::VA_INVALID_SURFACE
                 }
@@ -508,12 +245,9 @@ impl Backend {
     }
 
     fn build_slice_param(
-        hdr: &Header,
-        seg: &mut [Segmentation; MAX_SEGMENTS],
+        seg: &[Segmentation; MAX_SEGMENTS],
         slice_size: usize,
     ) -> Result<libva::BufferType> {
-        Self::update_segmentation(hdr, seg)?;
-
         let seg_params: std::result::Result<[SegmentParameterVP9; MAX_SEGMENTS], _> = seg
             .iter()
             .map(|s| {
@@ -568,185 +302,62 @@ impl Backend {
 
         self.test_params.push(test_params);
     }
-
-    fn build_va_decoded_handle(
-        &self,
-        picture: &ContainedPicture<GenericBackendHandle>,
-    ) -> Result<AssociatedHandle> {
-        Ok(VADecodedHandle::new(
-            Rc::clone(picture),
-            self.metadata_state.coded_resolution()?,
-            self.metadata_state.surface_pool()?,
-        ))
-    }
 }
 
 impl StatelessDecoderBackend for Backend {
-    type Handle = VADecodedHandle<Vp9Picture<GenericBackendHandle>>;
-
     fn new_sequence(&mut self, header: &Header) -> StatelessBackendResult<()> {
-        self.open(header, None)?;
-        self.negotiation_status = NegotiationStatus::Possible(Box::new(header.clone()));
+        self.backend.metadata_state.open(header, None)?;
+        self.backend.negotiation_status = NegotiationStatus::Possible(Box::new(header.clone()));
 
         Ok(())
     }
 
     fn submit_picture(
         &mut self,
-        picture: Vp9Picture<AsBackendHandle<Self::Handle>>,
+        picture: &Header,
         reference_frames: &[Option<Self::Handle>; NUM_REF_FRAMES],
-        bitstream: &dyn AsRef<[u8]>,
+        bitstream: &[u8],
         timestamp: u64,
-        block: bool,
+        segmentation: &[Segmentation; MAX_SEGMENTS],
+        block: BlockingMode,
     ) -> StatelessBackendResult<Self::Handle> {
-        self.negotiation_status = NegotiationStatus::Negotiated;
-
-        let context = self.metadata_state.context()?;
-
-        let pic_param =
-            context.create_buffer(Backend::build_pic_param(&picture.data, reference_frames)?)?;
+        self.backend.negotiation_status = NegotiationStatus::Negotiated;
 
         #[cfg(test)]
         {
-            let mut seg = self.segmentation.clone();
+            let seg = segmentation.clone();
             self.save_params(
-                Backend::build_pic_param(&picture.data, reference_frames)?,
-                Backend::build_slice_param(&picture.data, &mut seg, bitstream.as_ref().len())?,
-                libva::BufferType::SliceData(Vec::from(bitstream.as_ref())),
+                Backend::build_pic_param(picture, reference_frames)?,
+                Backend::build_slice_param(&seg, bitstream.len())?,
+                libva::BufferType::SliceData(Vec::from(bitstream)),
             );
         }
 
-        let slice_param = context.create_buffer(Backend::build_slice_param(
-            &picture.data,
-            &mut self.segmentation,
-            bitstream.as_ref().len(),
-        )?)?;
+        let metadata = self.backend.metadata_state.get_parsed_mut()?;
+        let context = &metadata.context;
+
+        let pic_param =
+            context.create_buffer(Backend::build_pic_param(picture, reference_frames)?)?;
+
+        let slice_param =
+            context.create_buffer(Backend::build_slice_param(segmentation, bitstream.len())?)?;
 
         let slice_data =
-            context.create_buffer(libva::BufferType::SliceData(Vec::from(bitstream.as_ref())))?;
+            context.create_buffer(libva::BufferType::SliceData(Vec::from(bitstream)))?;
 
-        let context = self.metadata_state.context()?;
-
-        let surface = self
-            .metadata_state
-            .get_surface()?
+        let surface = metadata
+            .surface_pool
+            .get_surface()
             .ok_or(StatelessBackendError::OutOfResources)?;
 
-        let surface_id = surface.id();
-
-        let mut va_picture = VaPicture::new(timestamp, Rc::clone(&context), surface);
+        let mut va_picture = VaPicture::new(timestamp, Rc::clone(context), surface);
 
         // Add buffers with the parsed data.
         va_picture.add_buffer(pic_param);
         va_picture.add_buffer(slice_param);
         va_picture.add_buffer(slice_data);
 
-        let va_picture = va_picture.begin()?.render()?.end()?;
-
-        let picture = Rc::new(RefCell::new(picture));
-
-        if block {
-            let va_picture = va_picture.sync()?;
-
-            let map_format = self.metadata_state.map_format()?;
-
-            let backend_handle = GenericBackendHandle::new_ready(
-                va_picture,
-                Rc::clone(map_format),
-                self.metadata_state.display_resolution()?,
-            );
-
-            picture.borrow_mut().backend_handle = Some(backend_handle);
-        } else {
-            // Append to our queue of pending jobs
-            let pending_job = PendingJob {
-                va_picture,
-                codec_picture: Rc::clone(&picture),
-            };
-
-            self.pending_jobs.push_back(pending_job);
-
-            picture.borrow_mut().backend_handle =
-                Some(GenericBackendHandle::new_pending(surface_id));
-        }
-
-        self.build_va_decoded_handle(&picture)
-            .map_err(|e| StatelessBackendError::Other(anyhow!(e)))
-    }
-
-    fn poll(
-        &mut self,
-        blocking_mode: super::BlockingMode,
-    ) -> StatelessBackendResult<VecDeque<Self::Handle>> {
-        let mut completed = VecDeque::new();
-        let candidates = self.pending_jobs.drain(..).collect::<VecDeque<_>>();
-
-        for job in candidates {
-            if matches!(blocking_mode, BlockingMode::NonBlocking) {
-                let status = job.va_picture.query_status()?;
-                if status != libva::VASurfaceStatus::VASurfaceReady {
-                    self.pending_jobs.push_back(job);
-                    continue;
-                }
-            }
-
-            let current_picture = job.va_picture.sync()?;
-
-            let map_format = self.metadata_state.map_format()?;
-
-            let backend_handle = GenericBackendHandle::new_ready(
-                current_picture,
-                Rc::clone(map_format),
-                self.metadata_state.display_resolution()?,
-            );
-
-            job.codec_picture.borrow_mut().backend_handle = Some(backend_handle);
-
-            completed.push_back(job.codec_picture);
-        }
-
-        let completed = completed.into_iter().map(|picture| {
-            self.build_va_decoded_handle(&picture)
-                .map_err(|e| StatelessBackendError::Other(anyhow!(e)))
-        });
-
-        completed.collect::<Result<VecDeque<_>, StatelessBackendError>>()
-    }
-
-    fn handle_is_ready(&self, handle: &Self::Handle) -> bool {
-        match &handle.picture().backend_handle {
-            Some(backend_handle) => backend_handle.is_ready(),
-            None => true,
-        }
-    }
-
-    fn block_on_handle(&mut self, handle: &Self::Handle) -> StatelessBackendResult<()> {
-        for i in 0..self.pending_jobs.len() {
-            // Remove from the queue in order.
-            let job = &self.pending_jobs[i];
-
-            if Vp9Picture::same(&job.codec_picture, handle.picture_container()) {
-                let job = self.pending_jobs.remove(i).unwrap();
-
-                let current_picture = job.va_picture.sync()?;
-
-                let map_format = self.metadata_state.map_format()?;
-
-                let backend_handle = GenericBackendHandle::new_ready(
-                    current_picture,
-                    Rc::clone(map_format),
-                    self.metadata_state.display_resolution()?,
-                );
-
-                job.codec_picture.borrow_mut().backend_handle = Some(backend_handle);
-
-                return Ok(());
-            }
-        }
-
-        Err(StatelessBackendError::Other(anyhow!(
-            "Asked to block on a pending job that doesn't exist"
-        )))
+        self.backend.process_picture(va_picture, block)
     }
 
     #[cfg(test)]
@@ -756,66 +367,46 @@ impl StatelessDecoderBackend for Backend {
 }
 
 impl VideoDecoderBackend for Backend {
+    type Handle = VADecodedHandle;
+
     fn coded_resolution(&self) -> Option<Resolution> {
-        self.metadata_state.coded_resolution().ok()
+        self.backend.coded_resolution()
     }
 
     fn display_resolution(&self) -> Option<Resolution> {
-        self.metadata_state.display_resolution().ok()
+        self.backend.display_resolution()
     }
 
     fn num_resources_total(&self) -> usize {
-        self.num_allocated_surfaces
+        self.backend.num_resources_total()
     }
 
     fn num_resources_left(&self) -> usize {
-        match self.metadata_state.surface_pool() {
-            Ok(pool) => pool.num_surfaces_left(),
-            Err(_) => 0,
-        }
+        self.backend.num_resources_left()
     }
 
     fn format(&self) -> Option<crate::DecodedFormat> {
-        let map_format = self.metadata_state.map_format().ok()?;
-        DecodedFormat::try_from(map_format.as_ref()).ok()
+        self.backend.format()
     }
 
     fn try_format(&mut self, format: crate::DecodedFormat) -> DecoderResult<()> {
-        let header = match &self.negotiation_status {
-            NegotiationStatus::Possible(header) => header.clone(),
-            _ => {
-                return Err(DecoderError::StatelessBackendError(
-                    StatelessBackendError::NegotiationFailed(anyhow!(
-                        "Negotiation is not possible at this stage {:?}",
-                        self.negotiation_status
-                    )),
-                ))
-            }
-        };
+        self.backend.try_format(format)
+    }
 
-        let supported_formats_for_stream = self.metadata_state.supported_formats_for_stream()?;
+    fn poll(&mut self, blocking_mode: BlockingMode) -> DecoderResult<VecDeque<Self::Handle>> {
+        self.backend.poll(blocking_mode)
+    }
 
-        if supported_formats_for_stream.contains(&format) {
-            let map_format = utils::vaapi::FORMAT_MAP
-                .iter()
-                .find(|&map| map.decoded_format == format)
-                .unwrap();
+    fn handle_is_ready(&self, handle: &Self::Handle) -> bool {
+        self.backend.handle_is_ready(handle)
+    }
 
-            self.open(&header, Some(map_format))?;
-
-            Ok(())
-        } else {
-            Err(DecoderError::StatelessBackendError(
-                StatelessBackendError::NegotiationFailed(anyhow!(
-                    "Format {:?} is unsupported.",
-                    format
-                )),
-            ))
-        }
+    fn block_on_handle(&mut self, handle: &Self::Handle) -> StatelessBackendResult<()> {
+        self.backend.block_on_handle(handle)
     }
 }
 
-impl Decoder<VADecodedHandle<Vp9Picture<GenericBackendHandle>>> {
+impl Decoder<VADecodedHandle> {
     // Creates a new instance of the decoder using the VAAPI backend.
     pub fn new_vaapi(display: Rc<Display>, blocking_mode: BlockingMode) -> Result<Self> {
         Self::new(Box::new(Backend::new(display)?), blocking_mode)
@@ -832,14 +423,14 @@ mod tests {
 
     use crate::decoders::vp9::backends::vaapi::AssociatedHandle;
     use crate::decoders::vp9::backends::vaapi::TestParams;
-    use crate::decoders::vp9::backends::BlockingMode;
-    use crate::decoders::vp9::backends::DecodedHandle;
     use crate::decoders::vp9::backends::StatelessDecoderBackend;
     use crate::decoders::vp9::decoder::tests::process_ready_frames;
     use crate::decoders::vp9::decoder::tests::run_decoding_loop;
     use crate::decoders::vp9::decoder::Decoder;
     use crate::decoders::vp9::parser::NUM_REF_FRAMES;
-    use crate::decoders::DynPicture;
+    use crate::decoders::BlockingMode;
+    use crate::decoders::DecodedHandle;
+    use crate::decoders::DynHandle;
 
     fn get_test_params(
         backend: &dyn StatelessDecoderBackend<Handle = AssociatedHandle>,
@@ -850,10 +441,10 @@ mod tests {
     fn process_handle(
         handle: &AssociatedHandle,
         dump_yuv: bool,
-        expected_crcs: Option<&mut Vec<&str>>,
+        expected_crcs: Option<&Vec<&str>>,
         frame_num: i32,
     ) {
-        let mut picture = handle.picture_mut();
+        let mut picture = handle.handle_mut();
         let mut backend_handle = picture.dyn_mappable_handle_mut();
 
         let buffer_size = backend_handle.image_size();
@@ -893,7 +484,7 @@ mod tests {
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
-            let mut expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
+            let expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
             let mut frame_num = 0;
             let display = Display::open().unwrap();
             let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
@@ -904,7 +495,7 @@ mod tests {
                     // write assertions against any particular value used therein.
                     let params = &get_test_params(decoder.backend())[frame_num as usize];
 
-                    process_handle(handle, false, Some(&mut expected_crcs), frame_num);
+                    process_handle(handle, false, Some(&expected_crcs), frame_num);
 
                     let pic_param = match params.pic_param {
                         BufferType::PictureParameter(PictureParameter::VP9(ref pic_param)) => {
@@ -1089,7 +680,7 @@ mod tests {
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
-            let mut expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
+            let expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
 
             let mut frame_num = 0;
             let display = Display::open().unwrap();
@@ -1104,7 +695,7 @@ mod tests {
                     // no decode operation is made.
                     let params = get_test_params(decoder.backend()).get(frame_num as usize);
 
-                    process_handle(handle, false, Some(&mut expected_crcs), frame_num);
+                    process_handle(handle, false, Some(&expected_crcs), frame_num);
 
                     if let Some(params) = params {
                         let pic_param = match params.pic_param {
@@ -1302,7 +893,7 @@ mod tests {
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
-            let mut expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
+            let expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
 
             let mut frame_num = 0;
             let display = Display::open().unwrap();
@@ -1317,7 +908,7 @@ mod tests {
                     // no decode operation is made.
                     let _params = get_test_params(decoder.backend()).get(frame_num as usize);
 
-                    process_handle(handle, false, Some(&mut expected_crcs), frame_num);
+                    process_handle(handle, false, Some(&expected_crcs), frame_num);
 
                     frame_num += 1;
                 });
@@ -1349,7 +940,7 @@ mod tests {
         let blocking_modes = [BlockingMode::Blocking, BlockingMode::NonBlocking];
 
         for blocking_mode in blocking_modes {
-            let mut expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
+            let expected_crcs = STREAM_CRCS.lines().collect::<Vec<_>>();
             let mut frame_num = 0;
             let display = Display::open().unwrap();
             let mut decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
@@ -1367,8 +958,8 @@ mod tests {
                     // check so as to not fail because of that, as some of the
                     // intermediary resolutions in this file fail this
                     // condition.
-                    let expected_crcs = if handle.picture().data.width() % 4 == 0 {
-                        Some(&mut expected_crcs)
+                    let expected_crcs = if handle.display_resolution().width % 4 == 0 {
+                        Some(&expected_crcs)
                     } else {
                         None
                     };

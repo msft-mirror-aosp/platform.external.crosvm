@@ -4,8 +4,6 @@
 
 from recipe_engine.post_process import Filter
 
-PYTHON_VERSION_COMPATIBILITY = "PY3"
-
 DEPS = [
     "crosvm",
     "depot_tools/depot_tools",
@@ -68,7 +66,8 @@ def RunSteps(api):
             "Build crosvm",
             [
                 "cros_sdk",
-                "emerge-hatch",
+                "build_packages",
+                "--board=hatch",
                 "crosvm",
             ],
             cros=True,

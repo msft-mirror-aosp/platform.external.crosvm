@@ -59,6 +59,7 @@ use x86_64::ZERO_PAGE_OFFSET;
 enum TaggedControlTube {
     VmMemory(Tube),
     VmIrq(Tube),
+    Vm(Tube),
 }
 
 /// Tests the integration of x86_64 with some hypervisor and devices setup. This test can help
@@ -98,7 +99,7 @@ where
     );
     // guest mem is 400 pages
     let arch_mem_regions = arch_memory_regions(memory_size, None);
-    let guest_mem = GuestMemory::new(&arch_mem_regions).unwrap();
+    let guest_mem = GuestMemory::new_with_options(&arch_mem_regions).unwrap();
 
     let (hyp, mut vm) = create_vm(guest_mem.clone());
     let mut resources =
@@ -137,6 +138,8 @@ where
         &mut vm,
         4,
         None,
+        #[cfg(feature = "swap")]
+        None,
     )
     .unwrap();
     let pci = Arc::new(Mutex::new(pci));
@@ -154,7 +157,9 @@ where
     )
     .unwrap();
 
-    X8664arch::setup_legacy_cmos_device(&io_bus, memory_size).unwrap();
+    let (host_cmos_tube, cmos_tube) = Tube::pair().unwrap();
+    X8664arch::setup_legacy_cmos_device(&io_bus, &mut irq_chip, cmos_tube, memory_size).unwrap();
+    control_tubes.push(TaggedControlTube::Vm(host_cmos_tube));
 
     let mut serial_params = BTreeMap::new();
 
@@ -165,6 +170,8 @@ where
         &mut irq_chip,
         &io_bus,
         &serial_params,
+        None,
+        #[cfg(feature = "swap")]
         None,
     )
     .unwrap();
@@ -211,6 +218,10 @@ where
         &mmio_bus,
         max_bus,
         &mut resume_notify_devices,
+        #[cfg(feature = "swap")]
+        None,
+        #[cfg(unix)]
+        false,
     )
     .unwrap();
 
@@ -221,6 +232,7 @@ where
         None,
         kernel_end,
         params,
+        None,
     )
     .expect("failed to setup system_memory");
 

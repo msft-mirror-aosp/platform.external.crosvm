@@ -18,6 +18,8 @@ use thiserror::Error as ThisError;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
 
 use crate::virtio::resource_bridge;
 use crate::virtio::resource_bridge::ResourceBridgeError;
@@ -30,28 +32,22 @@ use crate::virtio::video::protocol::virtio_video_mem_entry;
 use crate::virtio::video::protocol::virtio_video_object_entry;
 
 /// Defines how resources for a given queue are represented.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ResourceType {
     /// Resources are backed by guest memory pages.
     GuestPages,
     /// Resources are backed by virtio objects.
+    #[default]
     VirtioObject,
 }
 
-impl Default for ResourceType {
-    fn default() -> Self {
-        ResourceType::VirtioObject
-    }
-}
-
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AsBytes, FromBytes)]
 /// A guest resource entry which type is not decided yet.
 pub union UnresolvedResourceEntry {
     pub object: virtio_video_object_entry,
     pub guest_mem: virtio_video_mem_entry,
 }
-unsafe impl data_model::DataInit for UnresolvedResourceEntry {}
 
 impl fmt::Debug for UnresolvedResourceEntry {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

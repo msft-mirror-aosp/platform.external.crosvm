@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::stdin;
 use std::iter;
 use std::mem;
 use std::os::windows::fs::OpenOptionsExt;
@@ -61,6 +62,7 @@ use base::RecvTube;
 use base::SendTube;
 #[cfg(feature = "gpu")]
 use base::StreamChannel;
+use base::Terminal;
 use base::TriggeredEvent;
 use base::Tube;
 use base::TubeError;
@@ -79,13 +81,16 @@ use devices::tsc::standard_deviation;
 use devices::tsc::TscSyncMitigations;
 use devices::virtio;
 use devices::virtio::block::block::DiskOption;
+#[cfg(feature = "audio")]
 use devices::virtio::snd::common_backend::VirtioSnd;
+#[cfg(feature = "audio")]
 use devices::virtio::snd::parameters::Parameters as SndParameters;
-use devices::virtio::snd::parameters::StreamSourceBackend;
 #[cfg(feature = "gpu")]
 use devices::virtio::vhost::user::device::gpu::sys::windows::GpuVmmConfig;
+#[cfg(feature = "gpu")]
 use devices::virtio::vhost::user::gpu::sys::windows::product::GpuBackendConfig as GpuBackendConfigProduct;
-use devices::virtio::vhost::user::gpu::sys::windows::GpuBackendConfig;
+#[cfg(feature = "audio")]
+use devices::virtio::vhost::user::snd::sys::windows::product::SndBackendConfig as SndBackendConfigProduct;
 use devices::virtio::BalloonFeatures;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
@@ -103,7 +108,6 @@ use devices::IrqChip;
 use devices::IrqChipAArch64 as IrqChipArch;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use devices::IrqChipX86_64 as IrqChipArch;
-use devices::Minijail;
 use devices::UserspaceIrqChip;
 use devices::VirtioPciDevice;
 #[cfg(feature = "whpx")]
@@ -138,7 +142,6 @@ use hypervisor::whpx::WhpxVcpu;
 use hypervisor::whpx::WhpxVm;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use hypervisor::CpuConfigX86_64;
-#[cfg(feature = "whpx")]
 use hypervisor::Hypervisor;
 #[cfg(feature = "whpx")]
 use hypervisor::HypervisorCap;
@@ -156,8 +159,21 @@ use hypervisor::VmAArch64 as VmArch;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use hypervisor::VmX86_64 as VmArch;
 use irq_wait::IrqWaitWorker;
+use jail::FakeMinijailStub as Minijail;
 #[cfg(not(feature = "crash-report"))]
 pub(crate) use panic_hook::set_panic_hook;
+use product::create_snd_mute_tube_pair;
+#[cfg(any(feature = "haxm", feature = "gvm", feature = "whpx"))]
+use product::create_snd_state_tube;
+use product::handle_pvclock_request;
+use product::merge_session_invariants;
+use product::run_ime_thread;
+use product::set_package_name;
+pub(crate) use product::setup_metrics_reporting;
+use product::start_service_ipc_listener;
+use product::RunControlArgs;
+use product::ServiceVmState;
+use product::Token;
 use resources::SystemAllocator;
 use run_vcpu::run_all_vcpus;
 use run_vcpu::VcpuRunMode;
@@ -190,24 +206,20 @@ use crate::crosvm::config::TouchDeviceOption;
 use crate::crosvm::sys::config::HypervisorKind;
 #[cfg(any(feature = "gvm", feature = "whpx"))]
 use crate::crosvm::sys::config::IrqChipKind;
+use crate::crosvm::sys::windows::broker::BrokerTubes;
 #[cfg(feature = "stats")]
 use crate::crosvm::sys::windows::stats::StatisticsCollector;
+#[cfg(feature = "gpu")]
 pub(crate) use crate::sys::windows::product::get_gpu_product_configs;
+#[cfg(feature = "audio")]
+pub(crate) use crate::sys::windows::product::get_snd_product_configs;
 use crate::sys::windows::product::log_descriptor;
+#[cfg(feature = "audio")]
+pub(crate) use crate::sys::windows::product::num_input_sound_devices;
+#[cfg(feature = "audio")]
+pub(crate) use crate::sys::windows::product::num_input_sound_streams;
 use crate::sys::windows::product::spawn_anti_tamper_thread;
 use crate::sys::windows::product::MetricEventType;
-use product::create_snd_mute_tube_pair;
-#[cfg(any(feature = "haxm", feature = "gvm", feature = "whpx"))]
-use product::create_snd_state_tube;
-use product::handle_pvclock_request;
-use product::merge_session_invariants;
-use product::run_ime_thread;
-use product::set_package_name;
-pub(crate) use product::setup_metrics_reporting;
-use product::start_service_ipc_listener;
-use product::RunControlArgs;
-use product::ServiceVmState;
-use product::Token;
 
 const DEFAULT_GUEST_CID: u64 = 3;
 
@@ -252,6 +264,7 @@ fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) 
         disk.read_only,
         disk.sparse,
         disk.block_size,
+        false,
         disk.id,
         Some(disk_device_tube),
         None,
@@ -303,6 +316,37 @@ fn create_gpu_device(
         features,
         product_args,
     )?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: None,
+    })
+}
+
+#[cfg(feature = "audio")]
+fn create_snd_device(
+    cfg: &Config,
+    parameters: SndParameters,
+    _product_args: SndBackendConfigProduct,
+) -> DeviceResult {
+    let features = virtio::base_features(cfg.protection_type);
+    let dev = VirtioSnd::new(features, parameters)
+        .exit_context(Exit::VirtioSoundDeviceNew, "failed to create snd device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: None,
+    })
+}
+
+#[cfg(feature = "audio")]
+fn create_vhost_user_snd_device(base_features: u64, vhost_user_tube: Tube) -> DeviceResult {
+    let dev =
+        virtio::vhost::user::vmm::VhostUserVirtioDevice::new_snd(base_features, vhost_user_tube)
+            .exit_context(
+                Exit::VhostUserSndDeviceNew,
+                "failed to set up vhost-user snd device",
+            )?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -402,6 +446,7 @@ fn create_balloon_device(
             BalloonMode::Relaxed
         },
         balloon_features,
+        None,
     )
     .exit_context(Exit::BalloonDeviceNew, "failed to create balloon")?;
 
@@ -414,8 +459,11 @@ fn create_balloon_device(
 fn create_vsock_device(cfg: &Config) -> DeviceResult {
     // We only support a single guest, so we can confidently assign a default
     // CID if one isn't provided. We choose the lowest non-reserved value.
-    let dev = virtio::Vsock::new(
-        cfg.cid.unwrap_or(DEFAULT_GUEST_CID),
+    let dev = virtio::vsock::Vsock::new(
+        cfg.vsock
+            .as_ref()
+            .map(|cfg| cfg.cid)
+            .unwrap_or(DEFAULT_GUEST_CID),
         cfg.host_guid.clone(),
         virtio::base_features(cfg.protection_type),
     )
@@ -472,17 +520,36 @@ fn create_virtio_devices(
 
     #[cfg(feature = "audio")]
     if product::virtio_sound_enabled() {
-        let features = virtio::base_features(cfg.protection_type);
-        let snd_params = SndParameters {
-            backend: "winaudio".try_into().unwrap(),
-            num_input_devices: product::num_input_sound_devices(cfg),
-            num_input_streams: product::num_input_sound_streams(cfg),
-            ..Default::default()
-        };
-        devs.push(VirtioDeviceStub {
-            dev: Box::new(VirtioSnd::new(features, snd_params)?),
-            jail: None,
-        });
+        let snd_split_config = cfg
+            .snd_split_config
+            .as_mut()
+            .expect("snd_split_config must exist");
+        let snd_vmm_config = snd_split_config
+            .vmm_config
+            .as_mut()
+            .expect("snd_vmm_config must exist");
+        product::push_snd_control_tubes(control_tubes, snd_vmm_config);
+
+        match snd_split_config.backend_config.take() {
+            None => {
+                // No backend config present means the backend is running in another process.
+                devs.push(create_vhost_user_snd_device(
+                    virtio::base_features(cfg.protection_type),
+                    snd_vmm_config
+                        .main_vhost_user_tube
+                        .take()
+                        .expect("Snd VMM vhost-user tube should be set"),
+                )?);
+            }
+            Some(backend_config) => {
+                // Backend config present, so initialize Snd in this process.
+                devs.push(create_snd_device(
+                    cfg,
+                    backend_config.parameters,
+                    backend_config.product_config,
+                )?);
+            }
+        }
     }
 
     if let Some(tube) = pvclock_device_tube {
@@ -648,6 +715,10 @@ fn create_devices(
             None
         };
 
+        let (ioevent_host_tube, ioevent_device_tube) =
+            Tube::pair().context("failed to create ioevent tube")?;
+        irq_control_tubes.push(ioevent_host_tube);
+
         let dev = Box::new(
             VirtioPciDevice::new(
                 mem.clone(),
@@ -655,6 +726,7 @@ fn create_devices(
                 msi_device_tube,
                 cfg.disable_virtio_intx,
                 shared_memory_tube,
+                ioevent_device_tube,
             )
             .exit_context(Exit::VirtioPciDev, "failed to create virtio pci dev")?,
         ) as Box<dyn BusDeviceObj>;
@@ -913,6 +985,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     let (device_ctrl_tube, device_ctrl_resp) = Tube::pair().context("failed to create tube")?;
     guest_os.devices_thread = match create_devices_worker_thread(
+        guest_os.vm.get_memory().clone(),
         guest_os.io_bus.clone(),
         guest_os.mmio_bus.clone(),
         device_ctrl_resp,
@@ -922,13 +995,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             return Err(anyhow!("Failed to start devices thread: {}", e));
         }
     };
-    if let Some(path) = restore_path {
-        if let Err(e) =
-            device_ctrl_tube.send(&DeviceControlCommand::RestoreDevices { restore_path: path })
-        {
-            error!("fail to send command to devices control socket: {}", e);
-        };
-    }
 
     let vcpus: Vec<Option<_>> = match guest_os.vcpus.take() {
         Some(vec) => vec.into_iter().map(|vcpu| Some(vcpu)).collect(),
@@ -949,6 +1015,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     let ime_thread = run_ime_thread(product_args, &exit_evt)?;
 
+    let original_terminal_mode = stdin().set_raw_mode().ok();
+
     let vcpu_boxes: Arc<Mutex<Vec<Box<dyn VcpuArch>>>> = Arc::new(Mutex::new(Vec::new()));
     let run_mode_arc = Arc::new(VcpuRunMode::default());
     let vcpu_threads = run_all_vcpus(
@@ -965,6 +1033,13 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         tsc_sync_mitigations,
         force_calibrated_tsc_leaf,
     )?;
+
+    // Restore VM (if applicable).
+    if let Some(path) = restore_path {
+        // TODO(b/273992211): Port the unix --restore code to Windows.
+        todo!();
+    }
+
     let mut exit_state = ExitState::Stop;
 
     'poll: loop {
@@ -1112,6 +1187,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         println!("Statistics JSON:\n{}", stats.lock().json());
     }
 
+    if let Some(mode) = original_terminal_mode {
+        if let Err(e) = stdin().restore_mode(mode) {
+            warn!("failed to restore terminal mode: {}", e);
+        }
+    }
+
     // Explicitly drop the VM structure here to allow the devices to clean up before the
     // control tubes are closed when this function exits.
     mem::drop(guest_os);
@@ -1129,9 +1210,7 @@ const GVM_MINIMUM_VERSION: GvmVersion = GvmVersion {
 };
 
 #[cfg(feature = "gvm")]
-fn create_gvm(mem: GuestMemory) -> Result<GvmVm> {
-    info!("Creating GVM");
-    let gvm = Gvm::new()?;
+fn create_gvm_vm(gvm: Gvm, mem: GuestMemory) -> Result<GvmVm> {
     match gvm.get_full_version() {
         Ok(version) => {
             if version < GVM_MINIMUM_VERSION {
@@ -1154,9 +1233,11 @@ fn create_gvm(mem: GuestMemory) -> Result<GvmVm> {
 }
 
 #[cfg(feature = "haxm")]
-fn create_haxm(mem: GuestMemory, kernel_log_file: &Option<String>) -> Result<HaxmVm> {
-    info!("Creating HAXM ghaxm={}", get_use_ghaxm());
-    let haxm = Haxm::new()?;
+fn create_haxm_vm(
+    haxm: Haxm,
+    mem: GuestMemory,
+    kernel_log_file: &Option<String>,
+) -> Result<HaxmVm> {
     let vm = HaxmVm::new(&haxm, mem)?;
     if let Some(path) = kernel_log_file {
         use hypervisor::haxm::HAX_CAP_VM_LOG;
@@ -1184,7 +1265,8 @@ fn create_haxm(mem: GuestMemory, kernel_log_file: &Option<String>) -> Result<Hax
 
 #[cfg(feature = "whpx")]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn create_whpx(
+fn create_whpx_vm(
+    whpx: Whpx,
     mem: GuestMemory,
     cpu_count: usize,
     no_smt: bool,
@@ -1192,9 +1274,6 @@ fn create_whpx(
     force_calibrated_tsc_leaf: bool,
     vm_evt_wrtube: SendTube,
 ) -> Result<WhpxVm> {
-    info!("Creating Whpx");
-    let whpx = Whpx::new()?;
-
     let cpu_config = CpuConfigX86_64::new(
         force_calibrated_tsc_leaf,
         false, /* host_cpu_topology */
@@ -1553,26 +1632,44 @@ pub fn run_config_for_broker(raw_tube_transporter: RawDescriptor) -> Result<Exit
     #[cfg(feature = "crash-report")]
     crash_report::set_crash_tube_map(crash_tube_map);
 
-    run_config_inner(cfg)
+    let BrokerTubes {
+        vm_evt_wrtube,
+        vm_evt_rdtube,
+    } = bootstrap_tube
+        .recv::<BrokerTubes>()
+        .exit_context(Exit::TubeFailure, "failed to read bootstrap tube")?;
+
+    run_config_inner(cfg, vm_evt_wrtube, vm_evt_rdtube)
 }
 
-pub fn run_config(mut cfg: Config) -> Result<ExitState> {
+pub fn run_config(cfg: Config) -> Result<ExitState> {
     let _raise_timer_resolution = enable_high_res_timers()
         .exit_context(Exit::EnableHighResTimer, "failed to enable high res timer")?;
 
-    assert_eq!(cfg.vm_evt_wrtube.is_some(), cfg.vm_evt_rdtube.is_some());
-    if cfg.vm_evt_wrtube.is_none() {
-        // There is no broker when using run_config(), so the vm_evt tubes need to be created.
-        let (vm_evt_wrtube, vm_evt_rdtube) =
-            Tube::directional_pair().context("failed to create vm event tube")?;
-        cfg.vm_evt_wrtube = Some(vm_evt_wrtube);
-        cfg.vm_evt_rdtube = Some(vm_evt_rdtube);
-    }
+    // There is no broker when using run_config(), so the vm_evt tubes need to be created.
+    let (vm_evt_wrtube, vm_evt_rdtube) =
+        Tube::directional_pair().context("failed to create vm event tube")?;
 
-    run_config_inner(cfg)
+    run_config_inner(cfg, vm_evt_wrtube, vm_evt_rdtube)
 }
 
-fn run_config_inner(cfg: Config) -> Result<ExitState> {
+fn create_guest_memory(
+    components: &VmComponents,
+    hypervisor: &impl Hypervisor,
+) -> Result<GuestMemory> {
+    let guest_mem_layout = Arch::guest_memory_layout(components, hypervisor).exit_context(
+        Exit::GuestMemoryLayout,
+        "failed to create guest memory layout",
+    )?;
+    GuestMemory::new_with_options(&guest_mem_layout)
+        .exit_context(Exit::CreateGuestMemory, "failed to create guest memory")
+}
+
+fn run_config_inner(
+    cfg: Config,
+    vm_evt_wrtube: SendTube,
+    vm_evt_rdtube: RecvTube,
+) -> Result<ExitState> {
     product::setup_common_metric_invariants(&cfg);
 
     #[cfg(feature = "perfetto")]
@@ -1591,20 +1688,16 @@ fn run_config_inner(cfg: Config) -> Result<ExitState> {
         hypervisor = HypervisorKind::Whpx;
     }
 
-    let guest_mem_layout = Arch::guest_memory_layout(&components).exit_context(
-        Exit::GuestMemoryLayout,
-        "failed to create guest memory layout",
-    )?;
-    let guest_mem = GuestMemory::new(&guest_mem_layout)
-        .exit_context(Exit::CreateGuestMemory, "failed to create guest memory")?;
-
     match hypervisor {
         #[cfg(feature = "haxm")]
         HypervisorKind::Haxm | HypervisorKind::Ghaxm => {
             if hypervisor == HypervisorKind::Haxm {
                 set_use_ghaxm(false);
             }
-            let vm = create_haxm(guest_mem, &cfg.kernel_log_file)?;
+            info!("Creating HAXM ghaxm={}", get_use_ghaxm());
+            let haxm = Haxm::new()?;
+            let guest_mem = create_guest_memory(&components, &haxm)?;
+            let vm = create_haxm_vm(haxm, guest_mem, &cfg.kernel_log_file)?;
             let (ioapic_host_tube, ioapic_device_tube) =
                 Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
             let irq_chip = create_userspace_irq_chip::<HaxmVm, HaxmVcpu>(
@@ -1617,6 +1710,8 @@ fn run_config_inner(cfg: Config) -> Result<ExitState> {
                 vm,
                 WindowsIrqChip::Userspace(irq_chip).as_mut(),
                 Some(ioapic_host_tube),
+                vm_evt_wrtube,
+                vm_evt_rdtube,
             )
         }
         #[cfg(feature = "whpx")]
@@ -1638,15 +1733,17 @@ fn run_config_inner(cfg: Config) -> Result<ExitState> {
             let (ioapic_host_tube, ioapic_device_tube) =
                 Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
 
-            let vm = create_whpx(
+            info!("Creating Whpx");
+            let whpx = Whpx::new()?;
+            let guest_mem = create_guest_memory(&components, &whpx)?;
+            let vm = create_whpx_vm(
+                whpx,
                 guest_mem,
                 components.vcpu_count,
                 no_smt,
                 apic_emulation_supported && irq_chip == IrqChipKind::Split,
                 cfg.force_calibrated_tsc_leaf,
-                cfg.vm_evt_wrtube
-                    .as_ref()
-                    .expect("vm_evt_wrtube must be set")
+                vm_evt_wrtube
                     .try_clone()
                     .expect("could not clone vm_evt_wrtube"),
             )?;
@@ -1675,11 +1772,16 @@ fn run_config_inner(cfg: Config) -> Result<ExitState> {
                 vm,
                 irq_chip.as_mut(),
                 Some(ioapic_host_tube),
+                vm_evt_wrtube,
+                vm_evt_rdtube,
             )
         }
         #[cfg(feature = "gvm")]
         HypervisorKind::Gvm => {
-            let vm = create_gvm(guest_mem)?;
+            info!("Creating GVM");
+            let gvm = Gvm::new()?;
+            let guest_mem = create_guest_memory(&components, &gvm)?;
+            let vm = create_gvm_vm(gvm, guest_mem)?;
             let ioapic_host_tube;
             let mut irq_chip = match cfg.irq_chip.unwrap_or(IrqChipKind::Kernel) {
                 IrqChipKind::Split => unimplemented!("Split irqchip mode not supported by GVM"),
@@ -1697,7 +1799,15 @@ fn run_config_inner(cfg: Config) -> Result<ExitState> {
                     )?)
                 }
             };
-            run_vm::<GvmVcpu, GvmVm>(cfg, components, vm, irq_chip.as_mut(), ioapic_host_tube)
+            run_vm::<GvmVcpu, GvmVm>(
+                cfg,
+                components,
+                vm,
+                irq_chip.as_mut(),
+                ioapic_host_tube,
+                vm_evt_wrtube,
+                vm_evt_rdtube,
+            )
         }
     }
 }
@@ -1709,6 +1819,8 @@ fn run_vm<Vcpu, V>(
     mut vm: V,
     irq_chip: &mut dyn IrqChipArch,
     ioapic_host_tube: Option<Tube>,
+    vm_evt_wrtube: SendTube,
+    vm_evt_rdtube: RecvTube,
 ) -> Result<ExitState>
 where
     Vcpu: VcpuArch + 'static,
@@ -1762,15 +1874,6 @@ where
 
     let gralloc =
         RutabagaGralloc::new().exit_context(Exit::CreateGralloc, "failed to create gralloc")?;
-
-    let (vm_evt_wrtube, vm_evt_rdtube) = (
-        cfg.vm_evt_wrtube
-            .take()
-            .expect("vm_evt_wrtube should be set"),
-        cfg.vm_evt_rdtube
-            .take()
-            .expect("vm_evt_rdtube should be set"),
-    );
 
     let pstore_size = components.pstore.as_ref().map(|pstore| pstore.size as u64);
     let mut sys_allocator = SystemAllocator::new(
@@ -1869,6 +1972,7 @@ where
         pci_devices,
         irq_chip,
         &mut vcpu_ids,
+        cfg.dump_device_tree_blob.clone(),
         /*debugcon_jail=*/ None,
         None,
     )

@@ -110,6 +110,7 @@
       "git",
       "config",
       "--global",
+      "--replace-all",
       "credential.helper",
       "gcloud.sh"
     ],
@@ -243,8 +244,7 @@
       "--revision",
       "crosvm@refs/heads/main",
       "--refs",
-      "refs/heads/main",
-      "--gerrit_no_reset"
+      "refs/heads/main"
     ],
     "cwd": "[CACHE]/builder",
     "env": {

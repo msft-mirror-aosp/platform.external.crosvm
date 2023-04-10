@@ -10,12 +10,13 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request as request
 from contextlib import closing
 from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
+
+from .common import CACHE_DIR, download_file
 
 USAGE = """%(prog)s {command} [options]
 
@@ -87,7 +88,7 @@ def cargo_target_dir():
 
 
 def data_dir(arch: Arch):
-    return Path(tempfile.gettempdir()).joinpath("crosvm_tools").joinpath(arch)
+    return CACHE_DIR.joinpath("crosvm_tools").joinpath(arch)
 
 
 def pid_path(arch: Arch):
@@ -130,7 +131,7 @@ ARCH_TO_QEMU: Dict[Arch, Tuple[str, List[Iterable[str]]]] = {
     "x86_64": (
         "qemu-system-x86_64",
         [
-            ("-cpu", "kvm64,vmx=on"),
+            ("-cpu", "host"),
             ("-netdev", f"user,id=net0,hostfwd=tcp::{SSH_PORTS['x86_64']}-:22"),
             *([("-enable-kvm",)] if KVM_SUPPORT else []),
             *SHARED_ARGS,
@@ -273,7 +274,7 @@ def build_if_needed(arch: Arch, reset: bool = False):
     base_img = base_img_path(arch)
     if not base_img.exists():
         print(f"Downloading base image ({base_img_url(arch)})...")
-        request.urlretrieve(base_img_url(arch), base_img_path(arch))
+        download_file(base_img_url(arch), base_img_path(arch))
 
     rootfs_img = rootfs_img_path(arch)
     if not rootfs_img.exists() or reset:

@@ -39,6 +39,7 @@ use devices::virtio::device_constants::video::VideoDeviceConfig;
 #[cfg(feature = "audio")]
 use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vhost::user::device;
+use devices::virtio::vsock::VsockConfig;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuDisplayParameters;
 #[cfg(feature = "gpu")]
@@ -154,7 +155,6 @@ pub enum CrossPlatformCommands {
     Version(VersionCommand),
     Vfio(VfioCrosvmCommand),
     Snapshot(SnapshotCommand),
-    Restore(RestoreCommand),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -302,7 +302,7 @@ pub struct SuspendCommand {
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "enable")]
-/// Enable swap of a VM
+/// Enable vmm-swap of a VM. The guest memory is moved to staging memory
 pub struct SwapEnableCommand {
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
@@ -310,8 +310,17 @@ pub struct SwapEnableCommand {
 }
 
 #[derive(FromArgs)]
+#[argh(subcommand, name = "trim")]
+/// Trim pages in the staging memory
+pub struct SwapTrimCommand {
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[derive(FromArgs)]
 #[argh(subcommand, name = "out")]
-/// Enable swap of a VM
+/// Swap out staging memory to swap file
 pub struct SwapOutCommand {
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
@@ -320,7 +329,7 @@ pub struct SwapOutCommand {
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "disable")]
-/// Disable swap of a VM
+/// Disable vmm-swap of a VM
 pub struct SwapDisableCommand {
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
@@ -329,24 +338,16 @@ pub struct SwapDisableCommand {
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "status")]
-/// Get swap status of a VM
+/// Get vmm-swap status of a VM
 pub struct SwapStatusCommand {
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
     pub socket_path: String,
 }
 
+/// Vmm-swap commands
 #[derive(FromArgs)]
-#[argh(subcommand, name = "log_pagefault")]
-/// Get swap status of a VM
-pub struct SwapLogPageFaultCommand {
-    #[argh(positional, arg_name = "VM_SOCKET")]
-    /// VM Socket path
-    pub socket_path: String,
-}
-
-#[derive(FromArgs)]
-#[argh(subcommand, name = "swap", description = "vmm-swap related commands")]
+#[argh(subcommand, name = "swap")]
 pub struct SwapCommand {
     #[argh(subcommand)]
     pub nested: SwapSubcommands,
@@ -354,13 +355,12 @@ pub struct SwapCommand {
 
 #[derive(FromArgs)]
 #[argh(subcommand)]
-/// Swap related operations
 pub enum SwapSubcommands {
     Enable(SwapEnableCommand),
+    Trim(SwapTrimCommand),
     SwapOut(SwapOutCommand),
     Disable(SwapDisableCommand),
     Status(SwapStatusCommand),
-    LogPageFault(SwapLogPageFaultCommand),
 }
 
 #[derive(FromArgs)]
@@ -475,6 +475,8 @@ pub enum CrossPlatformDevicesCommands {
     #[cfg(feature = "gpu")]
     Gpu(device::GpuOptions),
     Net(device::NetOptions),
+    #[cfg(feature = "audio")]
+    Snd(device::SndOptions),
 }
 
 #[derive(argh_helpers::FlattenSubcommand)]
@@ -631,26 +633,12 @@ pub struct SnapshotTakeCommand {
 }
 
 #[derive(FromArgs)]
-#[argh(subcommand)]
-/// Snapshot commands
-pub enum SnapshotSubCommands {
-    Take(SnapshotTakeCommand),
-}
-#[derive(FromArgs)]
-#[argh(subcommand, name = "restore", description = "Restore commands")]
-/// Restore commands
-pub struct RestoreCommand {
-    #[argh(subcommand)]
-    pub restore_command: RestoreSubCommands,
-}
-
-#[derive(FromArgs)]
-#[argh(subcommand, name = "apply")]
-/// Restore VM
-pub struct RestoreApplyCommand {
-    #[argh(positional, arg_name = "restore_path")]
-    /// VM Restore image path
-    pub restore_path: PathBuf,
+#[argh(subcommand, name = "restore")]
+/// Restore VM state from a snapshot created by take
+pub struct SnapshotRestoreCommand {
+    #[argh(positional)]
+    /// path to snapshot to restore
+    pub snapshot_path: PathBuf,
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
     pub socket_path: String,
@@ -658,9 +646,10 @@ pub struct RestoreApplyCommand {
 
 #[derive(FromArgs)]
 #[argh(subcommand)]
-/// Restore commands
-pub enum RestoreSubCommands {
-    Apply(RestoreApplyCommand),
+/// Snapshot commands
+pub enum SnapshotSubCommands {
+    Take(SnapshotTakeCommand),
+    Restore(SnapshotRestoreCommand),
 }
 
 /// Container for GpuParameters that have been fixed after parsing using serde.
@@ -764,6 +753,15 @@ fn overwrite<T>(left: &mut T, right: T) {
 #[argh(subcommand, name = "run", description = "Start a new crosvm instance")]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RunCommand {
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
+    #[argh(switch)]
+    #[serde(default)]
+    #[merge(strategy = overwrite_false)]
+    /// enable AC adapter device
+    /// It purpose is to emulate ACPI ACPI0003 device, replicate and propagate the
+    /// ac adapter status from the host to the guest.
+    pub ac_adapter: bool,
+
     #[cfg(feature = "audio")]
     #[argh(
         option,
@@ -861,6 +859,10 @@ pub struct RunCommand {
     ///     async-executor=epoll|uring - set the async executor kind
     ///         to simulate the block device with. This takes
     ///         precedence over the global --async-executor option.
+    ///     multiple-workers=BOOL - (Experimental) run multiple
+    ///         worker threads in parallel. this option is not
+    ///         effective for vhost-user blk device.
+    ///         (default: false)
     block: Vec<DiskOptionWithId>,
 
     /// ratelimit enforced on detected bus locks in guest.
@@ -893,7 +895,7 @@ pub struct RunCommand {
     cfg: Option<Box<Self>>,
 
     #[argh(option, arg_name = "CID")]
-    #[serde(skip)] // TODO(b/255223604)
+    #[serde(skip)] // Deprecated - use `vsock` instead.
     #[merge(strategy = overwrite_option)]
     /// context ID for virtual sockets.
     pub cid: Option<u64>,
@@ -1074,6 +1076,12 @@ pub struct RunCommand {
     /// directory with smbios_entry_point/DMI files
     pub dmi: Option<PathBuf>,
 
+    #[argh(option, long = "dump-device-tree-blob", arg_name = "FILE")]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_option)]
+    /// dump generated device tree as a DTB file
+    pub dump_device_tree_blob: Option<PathBuf>,
+
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_false)]
@@ -1196,6 +1204,13 @@ pub struct RunCommand {
     ///        Deprecated - use `dpi` instead.
     pub gpu: Vec<FixedGpuParameters>,
 
+    #[cfg(all(unix, feature = "gpu"))]
+    #[argh(option, arg_name = "PATH")]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_option)]
+    /// move all vGPU threads to this Cgroup (default: nothing moves)
+    pub gpu_cgroup_path: Option<PathBuf>,
+
     #[cfg(feature = "gpu")]
     #[argh(option)]
     #[serde(skip)] // TODO(b/255223604). Deprecated - use `gpu` instead.
@@ -1219,6 +1234,13 @@ pub struct RunCommand {
     ///     foz-db-list-path=PATH - The path to GPU foz db list
     ///         file for dynamically loading RO caches.
     pub gpu_render_server: Option<GpuRenderServerParameters>,
+
+    #[cfg(all(unix, feature = "gpu"))]
+    #[argh(option, arg_name = "PATH")]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_option)]
+    /// move all vGPU server threads to this Cgroup (default: nothing moves)
+    pub gpu_server_cgroup_path: Option<PathBuf>,
 
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
@@ -1248,7 +1270,6 @@ pub struct RunCommand {
 
     /// hypervisor backend
     #[argh(option)]
-    #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
     pub hypervisor: Option<HypervisorKind>,
 
@@ -1296,7 +1317,7 @@ pub struct RunCommand {
 
     #[cfg(unix)]
     #[argh(option, arg_name = "PATH")]
-    #[serde(skip)] // TODO(b/255223604)
+    #[serde(skip)] // Deprecated - use `hypervisor` instead.
     #[merge(strategy = overwrite_option)]
     /// path to the KVM device. (default /dev/kvm)
     pub kvm_device: Option<PathBuf>,
@@ -1888,7 +1909,8 @@ pub struct RunCommand {
     #[argh(option, long = "swap", arg_name = "PATH")]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
-    /// path to create the swap files from. The PATH should be a directory.
+    /// enable vmm-swap via an unnamed temporary file on the filesystem which contains the specified
+    /// directory.
     pub swap_dir: Option<PathBuf>,
 
     #[argh(option, arg_name = "N")]
@@ -1935,6 +1957,19 @@ pub struct RunCommand {
     #[merge(strategy = append)]
     /// path to a socket from where to read trackpad input events and write status updates to, optionally followed by screen width and height (defaults to 800x1280)
     pub trackpad: Vec<TouchDeviceOption>,
+
+    #[cfg(unix)]
+    #[argh(switch)]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_false)]
+    /// set MADV_DONTFORK on guest memory
+    ///
+    /// Intended for use in combination with --protected-vm, where the guest memory can be
+    /// dangerous to access. Some systems, e.g. Android, have tools that fork processes and examine
+    /// their memory. This flag effectively hides the guest memory from those tools.
+    ///
+    /// Not compatible with sandboxing or vvu devices.
+    pub unmap_guest_memory_on_fork: bool,
 
     // Must be `Some` iff `protection_type == ProtectionType::UnprotectedWithFirmware`.
     #[argh(option, arg_name = "PATH")]
@@ -2073,14 +2108,14 @@ pub struct RunCommand {
 
     #[cfg(unix)]
     #[argh(option, arg_name = "SOCKET_PATH")]
-    #[serde(skip)] // TODO(b/255223604)
+    #[serde(skip)] // Deprecated - use `vsock` instead.
     #[merge(strategy = overwrite_option)]
     /// path to the vhost-vsock device. (default /dev/vhost-vsock)
     pub vhost_vsock_device: Option<PathBuf>,
 
     #[cfg(unix)]
     #[argh(option, arg_name = "FD")]
-    #[serde(skip)] // TODO(b/255223604)
+    #[serde(skip)] // Deprecated - use `vsock` instead.
     #[merge(strategy = overwrite_option)]
     /// open FD to the vhost-vsock device, mutually exclusive with vhost-vsock-device
     pub vhost_vsock_fd: Option<RawDescriptor>,
@@ -2114,12 +2149,16 @@ pub struct RunCommand {
     /// Possible key values:
     ///     capture=(false,true) - Disable/enable audio capture.
     ///         Default is false.
-    ///     backend=(null,[cras]) - Which backend to use for
+    ///     backend=(null,file,[cras]) - Which backend to use for
     ///         virtio-snd.
     ///     client_type=(crosvm,arcvm,borealis) - Set specific
     ///         client type for cras backend. Default is crosvm.
     ///     socket_type=(legacy,unified) Set specific socket type
     ///         for cras backend. Default is unified.
+    ///     playback_path=STR - Set directory of output streams
+    ///         for file backend.
+    ///     playback_size=INT - Set size of the output streams
+    ///         from file backend.
     ///     num_output_devices=INT - Set number of output PCM
     ///         devices.
     ///     num_input_devices=INT - Set number of input PCM devices.
@@ -2128,6 +2167,16 @@ pub struct RunCommand {
     ///     num_input_streams=INT - Set number of input PCM streams
     ///         per device.
     pub virtio_snd: Vec<SndParameters>,
+
+    #[argh(option, arg_name = "cid=CID[,device=VHOST_DEVICE]")]
+    #[serde(default)]
+    #[merge(strategy = overwrite_option)]
+    /// add a vsock device. Since a guest can only have one CID,
+    /// this option can only be specified once.
+    ///     cid=CID - CID to use for the device.
+    ///     device=VHOST_DEVICE - path to the vhost-vsock device to
+    ///         use (Linux only). Defaults to /dev/vhost-vsock.
+    pub vsock: Option<VsockConfig>,
 
     #[cfg(all(feature = "vtpm", target_arch = "x86_64"))]
     #[argh(switch)]
@@ -2211,7 +2260,15 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(unix)]
         if let Some(p) = cmd.kvm_device {
-            cfg.kvm_device_path = p;
+            log::warn!(
+                "`--kvm-device <PATH>` is deprecated; use `--hypervisor kvm[device=<PATH>]` instead"
+            );
+
+            if cmd.hypervisor.is_some() {
+                return Err("cannot specify both --hypervisor and --kvm-device".to_string());
+            }
+
+            cfg.hypervisor = Some(crate::crosvm::config::HypervisorKind::Kvm { device: Some(p) });
         }
 
         #[cfg(unix)]
@@ -2296,9 +2353,13 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(target_arch = "aarch64")]
         {
-            if cmd.mte && !(cmd.pmem_device.is_empty() && cmd.rw_pmem_device.is_empty()) {
+            if cmd.mte
+                && !(cmd.pmem_device.is_empty()
+                    && cmd.pstore.is_none()
+                    && cmd.rw_pmem_device.is_empty())
+            {
                 return Err(
-                    "--mte cannot be specified together with --pmem-device or --rw-pmem-device"
+                    "--mte cannot be specified together with --pmem-device, --pstore or --rw-pmem-device"
                         .to_string(),
                 );
             }
@@ -2308,7 +2369,11 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.hugepages = cmd.hugepages;
 
-        cfg.hypervisor = cmd.hypervisor;
+        // `cfg.hypervisor` may have been set by the deprecated `--kvm-device` option above.
+        // TODO(b/274817652): remove this workaround when `--kvm-device` is removed.
+        if cfg.hypervisor.is_none() {
+            cfg.hypervisor = cmd.hypervisor;
+        }
 
         #[cfg(unix)]
         {
@@ -2502,7 +2567,34 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.balloon_control = cmd.balloon_control;
 
-        cfg.cid = cmd.cid;
+        cfg.vsock = cmd.vsock;
+
+        // Legacy vsock options.
+        if let Some(cid) = cmd.cid {
+            if cfg.vsock.is_some() {
+                return Err(
+                    "`cid` and `vsock` cannot be specified together. Use `vsock` only.".to_string(),
+                );
+            }
+
+            let legacy_vsock_config = VsockConfig::new(
+                cid,
+                #[cfg(unix)]
+                match (cmd.vhost_vsock_device, cmd.vhost_vsock_fd) {
+                    (Some(_), Some(_)) => {
+                        return Err(
+                            "Only one of vhost-vsock-device vhost-vsock-fd has to be specified"
+                                .to_string(),
+                        )
+                    }
+                    (Some(path), None) => Some(path),
+                    (None, Some(fd)) => Some(PathBuf::from(format!("/proc/self/fd/{}", fd))),
+                    (None, None) => None,
+                },
+            );
+
+            cfg.vsock = Some(legacy_vsock_config);
+        }
 
         #[cfg(feature = "plugin")]
         {
@@ -2635,22 +2727,16 @@ impl TryFrom<RunCommand> for super::config::Config {
                     ));
                 }
             }
+
+            #[cfg(unix)]
+            {
+                cfg.gpu_cgroup_path = cmd.gpu_cgroup_path;
+                cfg.gpu_server_cgroup_path = cmd.gpu_server_cgroup_path;
+            }
         }
 
         #[cfg(unix)]
         {
-            if cmd.vhost_vsock_device.is_some() && cmd.vhost_vsock_fd.is_some() {
-                return Err(
-                    "Only one of vhost-vsock-device vhost-vsock-fd has to be specified".to_string(),
-                );
-            }
-
-            cfg.vhost_vsock_device = cmd.vhost_vsock_device;
-
-            if let Some(fd) = cmd.vhost_vsock_fd {
-                cfg.vhost_vsock_device = Some(PathBuf::from(format!("/proc/self/fd/{}", fd)));
-            }
-
             cfg.shared_dirs = cmd.shared_dir;
 
             cfg.net = cmd.net;
@@ -2732,16 +2818,21 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         cfg.battery_config = cmd.battery;
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
+        {
+            cfg.ac_adapter = cmd.ac_adapter;
+        }
 
         #[cfg(feature = "gdb")]
         {
             cfg.gdb = cmd.gdb;
         }
 
+        cfg.host_cpu_topology = cmd.host_cpu_topology;
+
         #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         {
             cfg.enable_hwp = cmd.enable_hwp;
-            cfg.host_cpu_topology = cmd.host_cpu_topology;
             cfg.force_s2idle = cmd.s2idle;
             cfg.pcie_ecam = cmd.pcie_ecam;
             cfg.pci_low_start = cmd.pci_start;
@@ -2790,6 +2881,8 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.dmi_path = cmd.dmi;
 
+        cfg.dump_device_tree_blob = cmd.dump_device_tree_blob;
+
         cfg.itmt = cmd.itmt;
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2822,6 +2915,14 @@ impl TryFrom<RunCommand> for super::config::Config {
         #[cfg(target_os = "android")]
         {
             cfg.task_profiles = cmd.task_profiles;
+        }
+
+        #[cfg(unix)]
+        {
+            if cmd.unmap_guest_memory_on_fork && !cmd.disable_sandbox {
+                return Err("--unmap-guest-memory-on-fork requires --disable-sandbox".to_string());
+            }
+            cfg.unmap_guest_memory_on_fork = cmd.unmap_guest_memory_on_fork;
         }
 
         #[cfg(unix)]

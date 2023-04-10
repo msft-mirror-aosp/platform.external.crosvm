@@ -12,7 +12,7 @@ package {
 
 rust_library {
     name: "libsync_rust",
-    defaults: ["crosvm_defaults"],
+    defaults: ["crosvm_inner_defaults"],
     stem: "libsync",
     host_supported: true,
     crate_name: "sync",
@@ -20,4 +20,5 @@ rust_library {
     cargo_pkg_version: "0.1.99",
     srcs: ["src/lib.rs"],
     edition: "2021",
+    visibility: ["//vendor:__subpackages__"],
 }

@@ -47,7 +47,7 @@ use base::Timer;
 use base::Tube;
 use base::TubeError;
 use base::WaitContext;
-use data_model::DataInit;
+use base::WorkerThread;
 use hypervisor::Datamatch;
 use resources::Alloc;
 use resources::AllocOptions;
@@ -64,6 +64,8 @@ use vm_control::VmMemoryResponse;
 use vm_control::VmMemorySource;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
 
 use crate::pci::pci_configuration::PciBarConfiguration;
 use crate::pci::pci_configuration::PciBarPrefetchable;
@@ -120,17 +122,12 @@ enum Error {
 const UNPIN_DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 const UNPIN_GEN_DEFAULT_THRES: u64 = 10;
 /// Holds the coiommu unpin policy
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CoIommuUnpinPolicy {
+    #[default]
     Off,
     Lru,
-}
-
-impl Default for CoIommuUnpinPolicy {
-    fn default() -> Self {
-        CoIommuUnpinPolicy::Off
-    }
 }
 
 impl fmt::Display for CoIommuUnpinPolicy {
@@ -210,7 +207,7 @@ struct CoIommuReg {
     dtt_level: u64,
 }
 
-#[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 struct PinnedPageInfo {
     gfn: u64,
     unpin_busy_cnt: u64,
@@ -225,7 +222,7 @@ impl PinnedPageInfo {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Eq)]
 enum UnpinThreadState {
     Unparked,
     Parked,
@@ -273,15 +270,13 @@ fn vfio_unmap(vfio_container: &Arc<Mutex<VfioContainer>>, iova: u64, size: u64) 
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone, FromBytes, AsBytes)]
 #[repr(C)]
 struct PinPageInfo {
     bdf: u16,
     pad: [u16; 3],
     nr_pages: u64,
 }
-// Safe because the PinPageInfo structure is raw data
-unsafe impl DataInit for PinPageInfo {}
 
 const COIOMMU_UPPER_LEVEL_STRIDE: u64 = 9;
 const COIOMMU_UPPER_LEVEL_MASK: u64 = (1 << COIOMMU_UPPER_LEVEL_STRIDE) - 1;
@@ -432,7 +427,7 @@ fn pin_page(
     Ok(())
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Eq)]
 enum UnpinResult {
     UnpinlistEmpty,
     Unpinned,
@@ -1023,10 +1018,8 @@ pub struct CoIommuDev {
     topologymap_addr: Option<u64>,
     mmapped: bool,
     device_tube: Tube,
-    pin_thread: Option<thread::JoinHandle<PinWorker>>,
-    pin_kill_evt: Option<Event>,
-    unpin_thread: Option<thread::JoinHandle<UnpinWorker>>,
-    unpin_kill_evt: Option<Event>,
+    pin_thread: Option<WorkerThread<PinWorker>>,
+    unpin_thread: Option<WorkerThread<UnpinWorker>>,
     unpin_tube: Option<Tube>,
     ioevents: Vec<Event>,
     vfio_container: Arc<Mutex<VfioContainer>>,
@@ -1105,9 +1098,7 @@ impl CoIommuDev {
             mmapped: false,
             device_tube,
             pin_thread: None,
-            pin_kill_evt: None,
             unpin_thread: None,
-            unpin_kill_evt: None,
             unpin_tube,
             ioevents,
             vfio_container,
@@ -1200,18 +1191,6 @@ impl CoIommuDev {
     }
 
     fn start_pin_thread(&mut self) {
-        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "{}: failed creating kill Event pair: {}",
-                    self.debug_label(),
-                    e
-                );
-                return;
-            }
-        };
-
         let mem = self.mem.clone();
         let endpoints = self.endpoints.to_vec();
         let notifymap_mmap = self.notifymap_mmap.clone();
@@ -1226,50 +1205,24 @@ impl CoIommuDev {
         let pinstate = self.pinstate.clone();
         let params = self.params;
 
-        let worker_result = thread::Builder::new()
-            .name("coiommu_pin".to_string())
-            .spawn(move || {
-                let mut worker = PinWorker {
-                    mem,
-                    endpoints,
-                    notifymap_mmap,
-                    dtt_root,
-                    dtt_level,
-                    ioevents,
-                    vfio_container,
-                    pinstate,
-                    params,
-                };
-                worker.run(kill_evt);
-                worker
-            });
-
-        match worker_result {
-            Err(e) => error!(
-                "{}: failed to spawn coiommu pin worker: {}",
-                self.debug_label(),
-                e
-            ),
-            Ok(join_handle) => {
-                self.pin_thread = Some(join_handle);
-                self.pin_kill_evt = Some(self_kill_evt);
-            }
-        }
+        self.pin_thread = Some(WorkerThread::start("coiommu_pin", move |kill_evt| {
+            let mut worker = PinWorker {
+                mem,
+                endpoints,
+                notifymap_mmap,
+                dtt_root,
+                dtt_level,
+                ioevents,
+                vfio_container,
+                pinstate,
+                params,
+            };
+            worker.run(kill_evt);
+            worker
+        }));
     }
 
     fn start_unpin_thread(&mut self) {
-        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "{}: failed creating kill Event pair: {}",
-                    self.debug_label(),
-                    e
-                );
-                return;
-            }
-        };
-
         let mem = self.mem.clone();
         let dtt_root = self.coiommu_reg.dtt_root;
         let dtt_level = self.coiommu_reg.dtt_level;
@@ -1277,36 +1230,20 @@ impl CoIommuDev {
         let unpin_tube = self.unpin_tube.take();
         let pinstate = self.pinstate.clone();
         let params = self.params;
-        let worker_result = thread::Builder::new()
-            .name("coiommu_unpin".to_string())
-            .spawn(move || {
-                let mut worker = UnpinWorker {
-                    mem,
-                    dtt_level,
-                    dtt_root,
-                    vfio_container,
-                    unpin_tube,
-                    pinstate,
-                    params,
-                    unpin_gen_threshold: 0,
-                };
-                worker.run(kill_evt);
-                worker
-            });
-
-        match worker_result {
-            Err(e) => {
-                error!(
-                    "{}: failed to spawn coiommu unpin worker: {}",
-                    self.debug_label(),
-                    e
-                );
-            }
-            Ok(join_handle) => {
-                self.unpin_thread = Some(join_handle);
-                self.unpin_kill_evt = Some(self_kill_evt);
-            }
-        }
+        self.unpin_thread = Some(WorkerThread::start("coiommu_unpin", move |kill_evt| {
+            let mut worker = UnpinWorker {
+                mem,
+                dtt_level,
+                dtt_root,
+                vfio_container,
+                unpin_tube,
+                pinstate,
+                params,
+                unpin_gen_threshold: 0,
+            };
+            worker.run(kill_evt);
+            worker
+        }));
     }
 
     fn allocate_bar_address(
@@ -1648,32 +1585,6 @@ impl PciDevice for CoIommuDev {
 
     fn get_bar_configuration(&self, bar_num: usize) -> Option<PciBarConfiguration> {
         self.config_regs.get_bar_configuration(bar_num)
-    }
-}
-
-impl Drop for CoIommuDev {
-    fn drop(&mut self) {
-        if let Some(kill_evt) = self.pin_kill_evt.take() {
-            // Ignore the result because there is nothing we can do about it.
-            if kill_evt.signal().is_ok() {
-                if let Some(worker_thread) = self.pin_thread.take() {
-                    let _ = worker_thread.join();
-                }
-            } else {
-                error!("CoIOMMU: failed to write to kill_evt to stop pin_thread");
-            }
-        }
-
-        if let Some(kill_evt) = self.unpin_kill_evt.take() {
-            // Ignore the result because there is nothing we can do about it.
-            if kill_evt.signal().is_ok() {
-                if let Some(worker_thread) = self.unpin_thread.take() {
-                    let _ = worker_thread.join();
-                }
-            } else {
-                error!("CoIOMMU: failed to write to kill_evt to stop unpin_thread");
-            }
-        }
     }
 }
 

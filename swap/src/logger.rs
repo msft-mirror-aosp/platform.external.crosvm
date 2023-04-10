@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#![cfg(feature = "log_page_fault")]
 #![deny(missing_docs)]
 
 use std::fs::File;
@@ -14,9 +15,12 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use base::info;
+use base::AsRawDescriptor;
+use base::RawDescriptor;
 use serde::Deserialize;
 use serde::Serialize;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionInformation;
 
 /// Logs page fault events into a log file in json format.
 pub struct PageFaultEventLogger {
@@ -83,6 +87,12 @@ impl PageFaultEventLogger {
     }
 }
 
+impl AsRawDescriptor for PageFaultEventLogger {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.file.as_raw_descriptor()
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct PageFaultInitialLog {
     base_timestamp: u128,
@@ -92,10 +102,14 @@ struct PageFaultInitialLog {
 fn regions_from_guest_memory(guest_memory: &GuestMemory) -> Vec<MemoryRegion> {
     let mut regions = Vec::new();
     guest_memory
-        .with_regions::<_, ()>(|_, _, len, base_address, _, _| {
-            regions.push(MemoryRegion { base_address, len });
-            Ok(())
-        })
+        .with_regions::<_, ()>(
+            |MemoryRegionInformation {
+                 len, base_address, ..
+             }| {
+                regions.push(MemoryRegion { base_address, len });
+                Ok(())
+            },
+        )
         .unwrap(); // the call back never return error.
     regions
 }

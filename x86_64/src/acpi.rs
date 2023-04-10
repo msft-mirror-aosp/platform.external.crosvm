@@ -16,7 +16,6 @@ use arch::CpuSet;
 use arch::VcpuAffinity;
 use base::error;
 use base::warn;
-use data_model::DataInit;
 use devices::ACPIPMResource;
 use devices::PciAddress;
 use devices::PciInterruptPin;
@@ -24,6 +23,8 @@ use devices::PciRoot;
 use sync::Mutex;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
 
 pub struct AcpiDevResource {
     pub amls: Vec<u8>,
@@ -34,7 +35,7 @@ pub struct AcpiDevResource {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
 struct GenericAddress {
     _space_id: u8,
     _bit_width: u8,
@@ -43,11 +44,8 @@ struct GenericAddress {
     _address: u64,
 }
 
-// Safe as GenericAddress structure only contains raw data
-unsafe impl DataInit for GenericAddress {}
-
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, AsBytes)]
 struct LocalApic {
     _type: u8,
     _length: u8,
@@ -56,11 +54,8 @@ struct LocalApic {
     _flags: u32,
 }
 
-// Safe as LocalAPIC structure only contains raw data
-unsafe impl DataInit for LocalApic {}
-
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
 struct Ioapic {
     _type: u8,
     _length: u8,
@@ -70,11 +65,8 @@ struct Ioapic {
     _gsi_base: u32,
 }
 
-// Safe as IOAPIC structure only contains raw data
-unsafe impl DataInit for Ioapic {}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
 struct IoapicInterruptSourceOverride {
     _type: u8,
     _length: u8,
@@ -84,11 +76,8 @@ struct IoapicInterruptSourceOverride {
     _flags: u16,
 }
 
-// Safe as IoapicInterruptSourceOverride structure only contains raw data
-unsafe impl DataInit for IoapicInterruptSourceOverride {}
-
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
 struct Localx2Apic {
     _type: u8,
     _length: u8,
@@ -97,9 +86,6 @@ struct Localx2Apic {
     _flags: u32,
     _processor_id: u32,
 }
-
-// Safe as LocalAPIC structure only contains raw data
-unsafe impl DataInit for Localx2Apic {}
 
 // Space ID for GenericAddress
 const ADR_SPACE_SYSTEM_IO: u8 = 1;
@@ -136,6 +122,9 @@ const FADT_FIELD_PM_TMR_LEN: usize = 91;
 const FADT_FIELD_GPE0_BLK_LEN: usize = 92;
 const FADT_FIELD_GPE1_BLK_LEN: usize = 93;
 const FADT_FIELD_GPE1_BASE: usize = 94;
+const FADT_FIELD_RTC_DAY_ALARM: usize = 106;
+const FADT_FIELD_RTC_MONTH_ALARM: usize = 107;
+const FADT_FIELD_RTC_CENTURY: usize = 108;
 const FADT_FIELD_FLAGS: usize = 112;
 const FADT_FIELD_RESET_REGISTER: usize = 116;
 const FADT_FIELD_RESET_VALUE: usize = 128;
@@ -252,6 +241,13 @@ fn create_facp_table(sci_irq: u16, force_s2idle: bool) -> SDT {
 
     facp.write(FADT_FIELD_MINOR_REVISION, FADT_MINOR_REVISION); // FADT minor version
     facp.write(FADT_FIELD_HYPERVISOR_ID, *b"CROSVM"); // Hypervisor Vendor Identity
+
+    facp.write(FADT_FIELD_RTC_CENTURY, devices::cmos::RTC_REG_CENTURY);
+    facp.write(FADT_FIELD_RTC_DAY_ALARM, devices::cmos::RTC_REG_ALARM_DAY);
+    facp.write(
+        FADT_FIELD_RTC_MONTH_ALARM,
+        devices::cmos::RTC_REG_ALARM_MONTH,
+    );
 
     facp
 }
@@ -577,7 +573,7 @@ pub fn create_acpi_tables(
 
     // FACS
     let facs = FACS::new();
-    guest_mem.write_at_addr(facs.as_slice(), facs_offset).ok()?;
+    guest_mem.write_at_addr(facs.as_bytes(), facs_offset).ok()?;
 
     // DSDT
     let dsdt_offset = match dsdt_offset {
@@ -733,7 +729,7 @@ pub fn create_acpi_tables(
 
     // RSDP
     let rsdp = RSDP::new(*b"CROSVM", offset.0);
-    guest_mem.write_at_addr(rsdp.as_slice(), rsdp_offset).ok()?;
+    guest_mem.write_at_addr(rsdp.as_bytes(), rsdp_offset).ok()?;
 
     Some(rsdp_offset)
 }

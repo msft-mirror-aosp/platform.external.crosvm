@@ -27,7 +27,6 @@ use base::RawDescriptor;
 use base::Timer;
 use base::WaitContext;
 use base::WaitContextExt;
-use data_model::DataInit;
 use metrics::MetricEventType;
 use metrics::PeriodicLogger;
 #[cfg(any(feature = "slirp-ring-capture", feature = "slirp-debug"))]
@@ -55,6 +54,7 @@ use winapi::um::winsock2::SOCKET;
 use winapi::um::winsock2::SOCKET_ERROR;
 use winapi::um::winsock2::WSADATA;
 use winapi::um::winsock2::WSAPOLLFD;
+use zerocopy::AsBytes;
 
 use crate::slirp::context::CallbackHandler;
 use crate::slirp::context::Context;
@@ -118,7 +118,7 @@ impl CallbackHandler for Handler {
             },
             num_buffers: 1,
         };
-        let send_buf = [vnet_hdr.as_slice(), buf].concat();
+        let send_buf = [vnet_hdr.as_bytes(), buf].concat();
 
         #[cfg(any(feature = "slirp-ring-capture", feature = "slirp-debug"))]
         let d = self.start.elapsed();
@@ -136,8 +136,12 @@ impl CallbackHandler for Handler {
         }
         // Log as rx from the guest's perspective
         self.rx_logger.log(buf.len() as i64);
-        self.pipe
-            .write_overlapped(&send_buf, &mut self.write_overlapped_wrapper)?;
+        // SAFETY: safe because the operation ends with send_buf and
+        // write_overlapped_wrapper still in scope.
+        unsafe {
+            self.pipe
+                .write_overlapped(&send_buf, &mut self.write_overlapped_wrapper)?;
+        }
         self.pipe
             .get_overlapped_result(&mut self.write_overlapped_wrapper)
             .map(|x| x as usize)
@@ -932,15 +936,23 @@ mod tests {
         let _listener = TcpListener::bind(LOOPBACK_SOCKET).unwrap();
 
         // This ARP is required or else Slirp will send us an ARP request before it returns an ACK
-        guest_pipe
-            .write_overlapped(&VETH_ARP_ANNOUNCEMENT, &mut overlapped_wrapper)
-            .expect("Failed to write ARP to guest pipe");
+        // SAFETY: safe because the buffer & overlapped wrapper are in scope for
+        // the duration of the overlapped operation.
+        unsafe {
+            guest_pipe
+                .write_overlapped(&VETH_ARP_ANNOUNCEMENT, &mut overlapped_wrapper)
+                .expect("Failed to write ARP to guest pipe");
+        }
         guest_pipe
             .get_overlapped_result(&mut overlapped_wrapper)
             .unwrap();
-        guest_pipe
-            .write_overlapped(&VETH_TCP_SYN, &mut overlapped_wrapper)
-            .expect("Failed to write SYN to guest pipe");
+        // SAFETY: safe because the buffer & overlapped wrapper are in scope for
+        // the duration of the overlapped operation.
+        unsafe {
+            guest_pipe
+                .write_overlapped(&VETH_TCP_SYN, &mut overlapped_wrapper)
+                .expect("Failed to write SYN to guest pipe")
+        };
         guest_pipe
             .get_overlapped_result(&mut overlapped_wrapper)
             .unwrap();

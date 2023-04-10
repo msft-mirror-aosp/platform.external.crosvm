@@ -5,7 +5,7 @@ index 734ab7c1..20f48f53 100644
 @@ -13,7 +13,7 @@ package {
  rust_test {
      name: "base_test_src_lib",
-     defaults: ["crosvm_defaults"],
+     defaults: ["crosvm_inner_defaults"],
 -    host_supported: true,
 +    host_supported: false, // Can't seem to access syslog in TH host tests.
      crate_name: "base",
@@ -37,21 +37,10 @@ index 734ab7c1..20f48f53 100644
  }
  
  rust_test {
-@@ -70,7 +70,9 @@ rust_test {
- rust_test {
-     name: "base_test_tests_process",
-     defaults: ["crosvm_defaults"],
--    host_supported: true,
-+    // Suffers from strange linker error on host when run on Oxygen or non-bazel
-+    // `atest`. See http://b/262748006 discussion.
-+    host_supported: false,
-     crate_name: "process",
-     cargo_env_compat: true,
-     cargo_pkg_version: "0.1.0",
 @@ -86,7 +106,7 @@ rust_test {
  rust_test {
      name: "base_test_tests_unix_main",
-     defaults: ["crosvm_defaults"],
+     defaults: ["crosvm_inner_defaults"],
 -    host_supported: true,
 +    host_supported: false, // Can't seem to access syslog in TH host tests.
      crate_name: "unix",
@@ -106,4 +95,8 @@ index 734ab7c1..20f48f53 100644
 +        },
 +    },
 +    shared_libs: ["libcap"], // specified in src/unix/capabilities.rs
+     visibility: [
+         "//packages/modules/Virtualization/virtualizationmanager",
+         "//vendor:__subpackages__",
+     ],
  }

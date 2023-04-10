@@ -14,7 +14,6 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use data_model::DataInit;
 use data_model::Le16;
 use data_model::Le32;
 use data_model::Le64;
@@ -22,17 +21,16 @@ use data_model::VolatileSlice;
 use virtio_sys::virtio_ring::VRING_DESC_F_WRITE;
 use vm_memory::GuestAddress as IOVA;
 use vm_memory::GuestMemory as QueueMemory;
+use zerocopy::FromBytes;
 
 use crate::virtio::Desc;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, FromBytes)]
 #[repr(C)]
 struct UsedElem {
     id: Le32,
     len: Le32,
 }
-// Safe as there are no implicit offset.
-unsafe impl DataInit for UsedElem {}
 
 const BUF_SIZE: u64 = 1024;
 

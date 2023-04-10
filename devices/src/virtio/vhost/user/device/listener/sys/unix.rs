@@ -6,18 +6,26 @@ use std::pin::Pin;
 use std::str::FromStr;
 
 use anyhow::bail;
+use anyhow::Context;
 use base::AsRawDescriptor;
 use base::RawDescriptor;
+use cros_async::AsyncWrapper;
 use cros_async::Executor;
 use futures::Future;
 use futures::FutureExt;
 use vmm_vhost::connection::socket::Listener as SocketListener;
 use vmm_vhost::connection::vfio::Device;
 use vmm_vhost::connection::vfio::Listener as VfioListener;
+use vmm_vhost::connection::Endpoint;
+use vmm_vhost::connection::Listener;
+use vmm_vhost::message::MasterReq;
+use vmm_vhost::SlaveListener;
+use vmm_vhost::VhostUserSlaveReqHandler;
 
+use crate::virtio::vhost::user::device::handler::sys::unix::run_handler;
 use crate::virtio::vhost::user::device::handler::sys::unix::VvuOps;
-use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
-use crate::virtio::vhost::user::device::handler::VhostUserBackend;
+use crate::virtio::vhost::user::device::handler::VhostUserPlatformOps;
+use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
 use crate::virtio::vhost::user::device::listener::VhostUserListenerTrait;
 use crate::virtio::vhost::user::device::vvu::pci::VvuPciDevice;
 use crate::virtio::vhost::user::device::vvu::VvuDevice;
@@ -118,6 +126,42 @@ impl VhostUserListener {
     }
 }
 
+/// Attaches to an already bound socket via `listener` and handles incoming messages from the
+/// VMM, which are dispatched to the device backend via the `VhostUserBackend` trait methods.
+async fn run_with_handler<L>(
+    listener: L,
+    handler: Box<dyn VhostUserSlaveReqHandler>,
+    ex: &Executor,
+) -> anyhow::Result<()>
+where
+    L::Endpoint: Endpoint<MasterReq> + AsRawDescriptor,
+    L: Listener + AsRawDescriptor,
+{
+    let mut listener = SlaveListener::<L, _>::new(listener, handler)?;
+    listener.set_nonblocking(true)?;
+
+    loop {
+        // If the listener is not ready on the first call to `accept` and returns `None`, we
+        // temporarily convert it into an async I/O source and yield until it signals there is
+        // input data awaiting, before trying again.
+        match listener
+            .accept()
+            .context("failed to accept an incoming connection")?
+        {
+            Some(req_handler) => return run_handler(req_handler, ex).await,
+            None => {
+                // Nobody is on the other end yet, wait until we get a connection.
+                let async_waiter = ex
+                    .async_from(AsyncWrapper::new(listener))
+                    .context("failed to create async waiter")?;
+                async_waiter.wait_readable().await?;
+
+                // Retrieve the listener back so we can use it again.
+                listener = async_waiter.into_source().into_inner();
+            }
+        }
+    }
+}
 impl VhostUserListenerTrait for VhostUserListener {
     /// Infers whether `path` is a PCI address or a socket path, and create the appropriate type
     /// of listener.
@@ -137,27 +181,32 @@ impl VhostUserListenerTrait for VhostUserListener {
         })
     }
 
-    fn run_backend(
+    /// Returns a future that runs a `VhostUserSlaveReqHandler` using this listener.
+    ///
+    /// The request handler is built from the `handler_builder` closure, which is passed the
+    /// `VhostUserPlatformOps` used by this listener. `ex` is the executor on which the request
+    /// handler can schedule its own tasks.
+    fn run_req_handler<'e, F>(
         self,
-        backend: Box<dyn VhostUserBackend>,
-        ex: &Executor,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>>>> {
-        let ex = ex.clone();
-
-        match self {
-            VhostUserListener::Socket(listener) => {
-                let handler = DeviceRequestHandler::new(backend);
-                handler
-                    .run_with_listener::<SocketListener>(listener, ex)
-                    .boxed_local()
-            }
-            VhostUserListener::Vvu(listener, ops) => {
-                let handler = DeviceRequestHandler::new_with_ops(backend, ops);
-                handler
-                    .run_with_listener::<VfioListener<_>>(*listener, ex)
-                    .boxed_local()
+        handler_builder: F,
+        ex: &'e Executor,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'e>>
+    where
+        F: FnOnce(Box<dyn VhostUserPlatformOps>) -> Box<dyn VhostUserSlaveReqHandler> + 'e,
+    {
+        async {
+            match self {
+                VhostUserListener::Socket(listener) => {
+                    let handler = handler_builder(Box::new(VhostUserRegularOps));
+                    run_with_handler(listener, handler, ex).await
+                }
+                VhostUserListener::Vvu(listener, ops) => {
+                    let handler = handler_builder(Box::new(ops));
+                    run_with_handler(*listener, handler, ex).await
+                }
             }
         }
+        .boxed_local()
     }
 
     fn take_parent_process_resources(&mut self) -> Option<Box<dyn std::any::Any>> {

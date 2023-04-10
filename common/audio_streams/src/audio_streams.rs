@@ -61,6 +61,7 @@ pub use async_api::AsyncStream;
 pub use async_api::AudioStreamsExecutor;
 use async_trait::async_trait;
 use remain::sorted;
+use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -125,20 +126,16 @@ pub enum StreamDirection {
 }
 
 /// Valid effects for an audio stream.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum StreamEffect {
+    #[default]
     NoEffect,
+    #[serde(alias = "aec")]
     EchoCancellation,
 }
 
 pub mod capture;
 pub mod shm_streams;
-
-impl Default for StreamEffect {
-    fn default() -> Self {
-        StreamEffect::NoEffect
-    }
-}
 
 /// Errors that can pass across threads.
 pub type BoxError = Box<dyn error::Error + Send + Sync>;
@@ -377,6 +374,13 @@ pub trait BufferCommit {
     /// `write_playback_buffer` or `read_capture_buffer` would trigger this automatically. `nframes`
     /// indicates the number of audio frames that were read or written to the device.
     fn commit(&mut self, nframes: usize);
+    /// `latency_bytes` the current device latency.
+    /// For playback it means how many bytes need to be consumed
+    /// before the current playback buffer will be played.
+    /// For capture it means the latency in terms of bytes that the capture buffer was recorded.
+    fn latency_bytes(&self) -> u32 {
+        0
+    }
 }
 
 /// `AsyncBufferCommit` is a cleanup funcion that must be called before dropping the buffer,
@@ -387,6 +391,13 @@ pub trait AsyncBufferCommit {
     /// automatically. `nframes` indicates the number of audio frames that were read or written to
     /// the device.
     async fn commit(&mut self, nframes: usize);
+    /// `latency_bytes` the current device latency.
+    /// For playback it means how many bytes need to be consumed
+    /// before the current playback buffer will be played.
+    /// For capture it means the latency in terms of bytes that the capture buffer was recorded.
+    fn latency_bytes(&self) -> u32 {
+        0
+    }
 }
 
 /// Errors that are possible from a `PlaybackBuffer`.
@@ -517,6 +528,12 @@ impl<'a> PlaybackBuffer<'a> {
             .commit(self.buffer.offset / self.buffer.frame_size);
     }
 
+    /// It returns how many bytes need to be consumed
+    /// before the current playback buffer will be played.
+    pub fn latency_bytes(&self) -> u32 {
+        self.drop.latency_bytes()
+    }
+
     /// Writes up to `size` bytes directly to this buffer inside of the given callback function
     /// with a buffer size error check.
     ///
@@ -595,6 +612,11 @@ impl<'a> AsyncPlaybackBuffer<'a> {
         self.trigger
             .commit(self.buffer.offset / self.buffer.frame_size)
             .await;
+    }
+
+    /// It returns the latency in terms of bytes that the capture buffer was recorded.
+    pub fn latency_bytes(&self) -> u32 {
+        self.trigger.latency_bytes()
     }
 
     /// Writes up to `size` bytes directly to this buffer inside of the given callback function.

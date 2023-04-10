@@ -27,8 +27,8 @@ git config submodule.recurse true
 git config push.recurseSubmodules no
 ```
 
-Crosvm development best works on Debian derivatives. First install rust via <https://rustup.rs/>.
-Then for the rest, we provide a script to install the necessary packages on Debian:
+Crosvm development best works on Debian derivatives. We provide a script to install the necessary
+packages on Debian, Ubuntu or gLinux:
 
 ```sh
 ./tools/install-deps
@@ -36,33 +36,6 @@ Then for the rest, we provide a script to install the necessary packages on Debi
 
 For other systems, please see below for instructions on
 [Using the development container](#using-the-development-container).
-
-### Setting up for cross-compilation
-
-Crosvm is built and tested on x86, aarch64 and armhf. Your host needs to be set up to allow
-installation of foreign architecture packages.
-
-On Debian this is as easy as:
-
-```sh
-sudo dpkg --add-architecture arm64
-sudo dpkg --add-architecture armhf
-sudo apt update
-```
-
-On ubuntu this is a little harder and needs some
-[manual modifications](https://askubuntu.com/questions/430705/how-to-use-apt-get-to-download-multi-arch-library)
-of APT sources.
-
-For other systems (**including gLinux**), please see below for instructions on
-[Using the development container](#using-the-development-container).
-
-With that enabled, the following scripts will install the needed packages:
-
-```sh
-./tools/install-aarch64-deps
-./tools/install-armhf-deps
-```
 
 ### Using the development container
 
@@ -83,7 +56,7 @@ Instead of using the interactive shell, commands to execute can be provided dire
 ```
 
 Note: The container and build artifacts are preserved between calls to `./tools/dev_container`. If
-you wish to start fresh, use the `--reset` flag.
+you wish to start fresh, use the `--clean` flag.
 
 ## Building a binary
 
@@ -95,57 +68,44 @@ If you want to enable [additional features](running_crosvm/features.md), use the
 
 ## Development
 
-### Iterative development
-
-You can use cargo as usual for crosvm development to `cargo build` and `cargo test` single crates
-that you are working on.
-
-If you are working on aarch64 specific code, you can use the `test_target` tool to instruct cargo to
-build for aarch64 and run tests on a VM:
-
-```sh
-./tools/test_target set vm:aarch64 && source .envrc
-cd mycrate && cargo test
-```
-
-The script will start a VM for testing and write environment variables for cargo to `.envrc`. With
-those `cargo build` will build for aarch64 and `cargo test` will run tests inside the VM.
-
-The aarch64 VM can be managed with the `./tools/aarch64vm` script.
-
 ### Running all tests
 
-Crosvm cannot use `cargo test --workspace` because of various restrictions of cargo. So we have our
-own test runner:
+Crosvm's integration tests have special requirements for execution (see [Testing](./testing.md)), so
+we use a special test runner. By default it will only execute unit tests:
 
 ```sh
 ./tools/run_tests
 ```
 
-Which will run all tests locally. Since we have some architecture-dependent code, we also have the
-option of running tests within an aarch64 VM:
+To execute integration tests as well, you need to specify a device-under-test (DUT). The most
+reliable option is to use the built-in VM for testing:
 
 ```sh
-./tools/run_tests --target=vm:aarch64
+./tools/run_tests --dut=vm
+```
+
+However, you can also use your local host directly. Your mileage may vary depending on your host
+kernel version and permissions.
+
+```sh
+./tools/run_tests --dut=host
+```
+
+Since we have some architecture-dependent code, we also have the option running unit tests for
+aarch64, armh4 or windows (mingw64). These will use an emulator to execute (QEMU or wine):
+
+```sh
+./tools/run_tests --platform=aarch64
+./tools/run_tests --platform=armhf
+./tools/run_tests --platform=mingw64
 ```
 
 When working on a machine that does not support cross-compilation (e.g. gLinux), you can use the dev
 container to build and run the tests.
 
 ```sh
-./tools/dev_container ./tools/run_tests --target=vm:aarch64
+./tools/dev_container ./tools/run_tests --platform=aarch64
 ```
-
-It is also possible to run tests on a remote machine via ssh. The target architecture is
-automatically detected:
-
-```sh
-./tools/run_tests --target=ssh:hostname
-```
-
-However, it is your responsibility to make sure the required libraries for crosvm are installed and
-password-less authentication is set up. See `./tools/impl/testvm/cloud_init.yaml` for hints on what
-the VM has installed.
 
 ### Presubmit checks
 
@@ -155,19 +115,62 @@ To verify changes before submitting, use the `presubmit` script:
 ./tools/presubmit
 ```
 
-This will run clippy, formatters and runs all tests. The presubmits will use the dev container to
-build for other platforms if your host is not set up to do so.
+Note: You probably want to run this in `./tools/dev_container` to ensure the toolchains for all
+platforms are available.
 
-To run checks faster, they can be run in parallel in multiple tmux panes:
+This will run clippy, formatters and runs all tests for all platforms. The same checks will also be
+run by our CI system before changes are merged into `main`.
+
+See `tools/presumit -h` for details on various options for selecting which checks should be run to
+trade off speed and accuracy.
+
+## Cross-compilation
+
+Crosvm is built and tested on x86, aarch64 and armhf. Your system needs some setup work to be able
+to cross-comple for other architectures, hence it is recommended to use the
+[development container](#using-the-development-container), which will have everything configured.
+
+Note: Cross-compilation is **not supported on gLinux**. Please use the development container.
+
+### Enable foreign architectures
+
+Your host needs to be set up to allow installation of foreign architecture packages.
+
+On Debian this is as easy as:
 
 ```sh
-./tools/presubmit --tmux
+sudo dpkg --add-architecture arm64
+sudo dpkg --add-architecture armhf
+sudo apt update
 ```
 
-The `--quick` variant will skip some slower checks, like building for other platforms altogether:
+On ubuntu this is a little harder and needs some
+[manual modifications](https://askubuntu.com/questions/430705/how-to-use-apt-get-to-download-multi-arch-library)
+of APT sources.
+
+With that enabled, the following scripts will install the needed packages:
 
 ```sh
-./tools/presubmit --quick
+./tools/install-aarch64-deps
+./tools/install-armhf-deps
+```
+
+### Configuring wine and mingw64
+
+Crosvm is also compiled and tested on windows. Some limited testing can be done with mingw64 and
+wine on linux machines. Use the provided setup script to install the needed dependencies.
+
+```sh
+./tools/install-mingw64-deps
+```
+
+### Configure cargo for cross-compilation
+
+Cargo requries additional configuration to support cross-compilation. You can copy the provided
+example config to your cargo configuration:
+
+```sh
+cat .cargo/config.debian.toml >> ${CARGO_HOME:-~/.cargo}/config.toml
 ```
 
 ## Known issues

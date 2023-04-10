@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-pub mod fixture;
 use fixture::vm::Config;
 use fixture::vm::TestVm;
 
@@ -15,8 +14,18 @@ use fixture::vm::TestVm;
 // Many changes to PCI devices can cause issues, e.g. some users depend on crosvm always choosing
 // the same PCI slots for particular devices.
 #[test]
-fn backcompat_test_simple_lspci() {
+fn backcompat_test() {
     let mut vm = TestVm::new(Config::new()).unwrap();
+    backcompat_test_simple_lspci(&mut vm);
+}
+
+#[test]
+fn backcompat_test_disable_sandbox() {
+    let mut vm = TestVm::new(Config::new().disable_sandbox()).unwrap();
+    backcompat_test_simple_lspci(&mut vm);
+}
+
+fn backcompat_test_simple_lspci(vm: &mut TestVm) {
     let expected = if cfg!(windows) {
         include_str!("goldens/backcompat_test_simple_lspci_win.txt").trim()
     } else {

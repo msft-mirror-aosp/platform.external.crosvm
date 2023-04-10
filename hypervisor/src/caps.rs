@@ -24,6 +24,18 @@ pub enum HypervisorCap {
     /// capability, which causes crosvm to substitute a calibrated value in leaf
     /// 0x15 that will be accurate enough for use in a clocksource.
     CalibratedTscLeafRequired,
+    // By default, when swiotlb is enabled, crosvm will only specify its size in the device tree
+    // and allow the guest to decide where to allocate the buffer in guest phsyical memory.
+    //
+    // If this capability is declared, then instead crosvm will allocate space for the swiotlb
+    // outside of guest physical memory and specify both the address and size in the device tree.
+    StaticSwiotlbAllocationRequired,
+    /// Some hypervisors (presently: Gunyah) will configure initial boot-time registers
+    /// for vCPUs without need for CrosVM to specify.
+    ///
+    /// If this capability is declared, then crosvm will not try to initialize vcpu
+    /// registers when creating the VM.
+    HypervisorInitializedBootContext,
 }
 
 /// A capability the `Vm` can possibly expose.

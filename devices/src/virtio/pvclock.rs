@@ -13,11 +13,9 @@ use std::arch::x86_64::_rdtsc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::thread;
 use std::time::Instant;
 
 use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use base::error;
@@ -33,15 +31,16 @@ use base::RawDescriptor;
 use base::ReadNotifier;
 use base::Tube;
 use base::WaitContext;
-use data_model::DataInit;
+use base::WorkerThread;
 use data_model::Le32;
 use data_model::Le64;
-use data_model::VolatileRef;
 use vm_control::PvClockCommand;
 use vm_control::PvClockCommandResponse;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
 
 use super::copy_config;
 use super::DeviceType;
@@ -70,7 +69,7 @@ const VIRTIO_PVCLOCK_S_IOERR: u8 = 1;
 
 const VIRTIO_PVCLOCK_CLOCKSOURCE_RATING: u32 = 450;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, AsBytes, FromBytes)]
 #[repr(C)]
 struct virtio_pvclock_config {
     // Number of nanoseconds the VM has been suspended without guest suspension.
@@ -80,10 +79,7 @@ struct virtio_pvclock_config {
     padding: u32,
 }
 
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for virtio_pvclock_config {}
-
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, AsBytes)]
 #[repr(C)]
 struct virtio_pvclock_set_pvclock_page_req {
     // Physical address of pvclock page.
@@ -96,9 +92,6 @@ struct virtio_pvclock_set_pvclock_page_req {
     status: u8,
     padding: [u8; 7],
 }
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for virtio_pvclock_set_pvclock_page_req {}
 
 // Data structure for interacting with pvclock shared memory.
 struct PvclockSharedData {
@@ -205,8 +198,7 @@ pub struct PvClock {
     // by the PvClockWorker thread but read by PvClock from the mmio bus in the main thread.
     total_suspend_ns: Arc<AtomicU64>,
     features: u64,
-    kill_evt: Option<Event>,
-    worker_thread: Option<thread::JoinHandle<Tube>>,
+    worker_thread: Option<WorkerThread<Tube>>,
 }
 
 impl PvClock {
@@ -219,7 +211,6 @@ impl PvClock {
                 | 1 << VIRTIO_PVCLOCK_F_TSC_STABLE
                 | 1 << VIRTIO_PVCLOCK_F_INJECT_SLEEP
                 | 1 << VIRTIO_PVCLOCK_F_CLOCKSOURCE_RATING,
-            kill_evt: None,
             worker_thread: None,
         }
     }
@@ -472,22 +463,14 @@ fn run_worker(
                         }
                     };
 
-                    let mut req = {
-                        // TODO(b/236759218): Use Reader/Writer abstraction. Example:
-                        // https://source.chromium.org/chromium/chromiumos/platform/crosvm/+/main:devices/src/virtio/rng.rs;drc=d4505a7f1c9e4aa502ff49367863aedeadbafb9d;l=41
-                        let req_ref: VolatileRef<virtio_pvclock_set_pvclock_page_req> = match worker
-                            .mem
-                            .get_ref_at_addr(desc.addr)
-                        {
+                    let mut req: virtio_pvclock_set_pvclock_page_req =
+                        match worker.mem.read_obj_from_addr(desc.addr) {
                             Ok(req) => req,
                             Err(e) => {
                                 error!("failed to read request from set_pvclock_page queue: {}", e);
                                 continue;
                             }
                         };
-                        req_ref.load()
-                        // We drop req_ref here so that we can mutable reference to worker below
-                    };
 
                     req.status = match worker.set_pvclock_page(req.pvclock_page_pa.into()) {
                         Err(e) => {
@@ -497,16 +480,10 @@ fn run_worker(
                         Ok(_) => VIRTIO_PVCLOCK_S_OK,
                     };
 
-                    match worker
-                        .mem
-                        .get_ref_at_addr::<virtio_pvclock_set_pvclock_page_req>(desc.addr)
-                    {
-                        Ok(req_ref) => req_ref.store(req),
-                        Err(e) => {
-                            error!("failed to write set_pvclock_page status: {}", e);
-                            continue;
-                        }
-                    };
+                    if let Err(e) = worker.mem.write_obj_at_addr(req, desc.addr) {
+                        error!("failed to write set_pvclock_page status: {}", e);
+                        continue;
+                    }
 
                     set_pvclock_page_queue.add_used(&worker.mem, desc.index, desc.len);
                     set_pvclock_page_queue.trigger_interrupt(&worker.mem, &interrupt);
@@ -583,7 +560,7 @@ impl VirtioDevice for PvClock {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        copy_config(data, 0, self.get_config().as_slice(), offset);
+        copy_config(data, 0, self.get_config().as_bytes(), offset);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
@@ -610,11 +587,6 @@ impl VirtioDevice for PvClock {
 
         let (set_pvclock_page_queue, set_pvclock_page_queue_evt) = queues.remove(0);
 
-        let (self_kill_evt, kill_evt) = Event::new()
-            .and_then(|e| Ok((e.try_clone()?, e)))
-            .context("failed to create kill Event pair")?;
-        self.kill_evt = Some(self_kill_evt);
-
         let suspend_tube = self
             .suspend_tube
             .take()
@@ -622,9 +594,9 @@ impl VirtioDevice for PvClock {
         let tsc_frequency = self.tsc_frequency;
         let total_suspend_ns = self.total_suspend_ns.clone();
 
-        let worker_result = thread::Builder::new()
-            .name("virtio_pvclock".to_string())
-            .spawn(move || {
+        self.worker_thread = Some(WorkerThread::start(
+            "virtio_pvclock".to_string(),
+            move |kill_evt| {
                 let worker = PvClockWorker::new(tsc_frequency, total_suspend_ns, mem);
                 run_worker(
                     worker,
@@ -634,49 +606,18 @@ impl VirtioDevice for PvClock {
                     interrupt,
                     kill_evt,
                 )
-            });
+            },
+        ));
 
-        match worker_result {
-            Err(e) => {
-                bail!("failed to spawn virtio_pvclock worker: {}", e);
-            }
-            Ok(join_handle) => {
-                self.worker_thread = Some(join_handle);
-            }
-        }
         Ok(())
     }
 
     fn reset(&mut self) -> bool {
-        if let Some(kill_evt) = self.kill_evt.take() {
-            if kill_evt.signal().is_err() {
-                error!("{}: failed to notify the kill event", self.debug_label());
-                return false;
-            }
-        }
-
         if let Some(worker_thread) = self.worker_thread.take() {
-            return match worker_thread.join() {
-                Err(e) => {
-                    error!(
-                        "{}: failed to get back resources: {:?}",
-                        self.debug_label(),
-                        e
-                    );
-                    false
-                }
-                Ok(suspend_tube) => {
-                    self.suspend_tube = Some(suspend_tube);
-                    true
-                }
-            };
+            let suspend_tube = worker_thread.stop();
+            self.suspend_tube = Some(suspend_tube);
+            return true;
         }
         false
-    }
-}
-
-impl Drop for PvClock {
-    fn drop(&mut self) {
-        self.reset();
     }
 }

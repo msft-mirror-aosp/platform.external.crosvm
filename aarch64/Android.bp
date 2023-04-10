@@ -12,7 +12,7 @@ package {
 
 rust_library {
     name: "libaarch64",
-    defaults: ["crosvm_defaults"],
+    defaults: ["crosvm_inner_defaults"],
     host_supported: true,
     crate_name: "aarch64",
     cargo_env_compat: true,
@@ -33,6 +33,7 @@ rust_library {
         "libgdbstub",
         "libgdbstub_arch",
         "libhypervisor",
+        "libjail",
         "libkernel_cmdline",
         "libkernel_loader",
         "liblibc",
@@ -46,6 +47,7 @@ rust_library {
         "libvm_memory",
     ],
     proc_macros: ["libremain"],
+    visibility: ["//vendor:__subpackages__"],
     target: {
         // It is necessary to disable this specifically as well as the arch below, because
         // crosvm_defaults enables it and the more specific target apparently takes precedence over

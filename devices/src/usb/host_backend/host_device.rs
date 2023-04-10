@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use base::error;
 use base::warn;
-use data_model::DataInit;
 use sync::Mutex;
 use usb_util::ConfigDescriptorTree;
 use usb_util::ControlRequestDataPhaseTransferDirection;
@@ -17,11 +16,13 @@ use usb_util::ControlRequestRecipient;
 use usb_util::DescriptorHeader;
 use usb_util::DescriptorType;
 use usb_util::Device;
+use usb_util::DeviceSpeed;
 use usb_util::InterfaceDescriptor;
 use usb_util::StandardControlRequest;
 use usb_util::Transfer;
 use usb_util::TransferStatus;
 use usb_util::UsbRequestSetup;
+use zerocopy::AsBytes;
 
 use super::error::*;
 use super::usb_endpoint::UsbEndpoint;
@@ -206,7 +207,7 @@ impl HostDevice {
 
         // Copy the control request header.
         control_buffer[..mem::size_of::<UsbRequestSetup>()]
-            .copy_from_slice(self.control_request_setup.as_slice());
+            .copy_from_slice(self.control_request_setup.as_bytes());
 
         let direction = self.control_request_setup.get_direction();
         let buffer = if direction == ControlRequestDataPhaseTransferDirection::HostToDevice {
@@ -477,7 +478,7 @@ impl HostDevice {
                         interface.offset() + mem::size_of::<DescriptorHeader>() - config_start;
                     let interface_end = interface_start + mem::size_of::<InterfaceDescriptor>();
                     descriptor_data[interface_start..interface_end]
-                        .copy_from_slice(interface_data.as_slice());
+                        .copy_from_slice(interface_data.as_bytes());
                 }
             }
         }
@@ -607,5 +608,14 @@ impl XhciBackendDevice for HostDevice {
     fn reset(&mut self) -> Result<()> {
         usb_debug!("resetting host device");
         self.device.lock().reset().map_err(Error::Reset)
+    }
+
+    fn get_speed(&self) -> Option<DeviceSpeed> {
+        let speed = self.device.lock().get_speed();
+        if let Ok(speed) = speed {
+            speed
+        } else {
+            None
+        }
     }
 }

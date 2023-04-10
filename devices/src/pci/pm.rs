@@ -4,12 +4,14 @@
 
 #![cfg_attr(windows, allow(dead_code))]
 
-use data_model::DataInit;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
 
 use crate::pci::PciCapability;
 use crate::pci::PciCapabilityID;
 
 pub const PM_CAP_CONTROL_STATE_OFFSET: usize = 1;
+pub const PM_CAP_LENGTH: usize = 8;
 const PM_CAP_PME_SUPPORT_D0: u16 = 0x0800;
 const PM_CAP_PME_SUPPORT_D3_HOT: u16 = 0x4000;
 const PM_CAP_PME_SUPPORT_D3_COLD: u16 = 0x8000;
@@ -28,7 +30,7 @@ pub enum PciDevicePower {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AsBytes, FromBytes)]
 pub struct PciPmCap {
     _cap_vndr: u8,
     _cap_next: u8,
@@ -37,12 +39,9 @@ pub struct PciPmCap {
     padding: u16,
 }
 
-// It is safe to implement DataInit; all members are simple numbers and any value is valid.
-unsafe impl DataInit for PciPmCap {}
-
 impl PciCapability for PciPmCap {
     fn bytes(&self) -> &[u8] {
-        self.as_slice()
+        self.as_bytes()
     }
 
     fn id(&self) -> PciCapabilityID {
@@ -56,17 +55,19 @@ impl PciCapability for PciPmCap {
 
 impl PciPmCap {
     pub fn new() -> Self {
-        let pm_cap: u16 = PM_CAP_PME_SUPPORT_D0
-            | PM_CAP_PME_SUPPORT_D3_HOT
-            | PM_CAP_PME_SUPPORT_D3_COLD
-            | PM_CAP_VERSION;
         PciPmCap {
             _cap_vndr: 0,
             _cap_next: 0,
-            pm_cap,
+            pm_cap: Self::default_cap(),
             pm_control_status: 0,
             padding: 0,
         }
+    }
+    pub fn default_cap() -> u16 {
+        PM_CAP_VERSION
+            | PM_CAP_PME_SUPPORT_D0
+            | PM_CAP_PME_SUPPORT_D3_HOT
+            | PM_CAP_PME_SUPPORT_D3_COLD
     }
 }
 

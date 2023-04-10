@@ -25,7 +25,7 @@ use base::UnixSeqpacket;
 use cros_async::AsyncWrapper;
 use cros_async::EventAsync;
 use cros_async::Executor;
-use cros_async::IoSourceExt;
+use cros_async::IoSource;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
 use hypervisor::ProtectionType;
@@ -75,7 +75,7 @@ async fn run_in_queue(
     doorbell: Doorbell,
     kick_evt: EventAsync,
     wlstate: Rc<RefCell<wl::WlState>>,
-    wlstate_ctx: Box<dyn IoSourceExt<AsyncWrapper<SafeDescriptor>>>,
+    wlstate_ctx: IoSource<AsyncWrapper<SafeDescriptor>>,
 ) {
     loop {
         if let Err(e) = wlstate_ctx.wait_readable().await {
@@ -201,7 +201,7 @@ impl VhostUserBackend for WlBackend {
     fn start_queue(
         &mut self,
         idx: usize,
-        mut queue: Queue,
+        queue: Queue,
         mem: GuestMemory,
         doorbell: Doorbell,
         kick_evt: Event,
@@ -210,9 +210,6 @@ impl VhostUserBackend for WlBackend {
             warn!("Starting new queue handler without stopping old handler");
             handle.abort();
         }
-
-        // Enable any virtqueue features that were negotiated (like VIRTIO_RING_F_EVENT_IDX).
-        queue.ack_features(self.acked_features);
 
         let kick_evt = EventAsync::new(kick_evt, &self.ex)
             .context("failed to create EventAsync for kick_evt")?;

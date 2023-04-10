@@ -19,7 +19,7 @@ use base::RawDescriptor;
 use cros_async::EventAsync;
 use cros_async::Executor;
 use cros_async::IntoAsync;
-use cros_async::IoSourceExt;
+use cros_async::IoSource;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
 use hypervisor::ProtectionType;
@@ -137,7 +137,7 @@ where
 async fn run_rx_queue<T: TapT>(
     mut queue: virtio::Queue,
     mem: GuestMemory,
-    mut tap: Box<dyn IoSourceExt<T>>,
+    mut tap: IoSource<T>,
     doorbell: Doorbell,
     kick_evt: EventAsync,
 ) {
@@ -166,7 +166,7 @@ async fn run_rx_queue<T: TapT>(
 pub(in crate::virtio::vhost::user::device::net) fn start_queue<T: 'static + IntoAsync + TapT>(
     backend: &mut NetBackend<T>,
     idx: usize,
-    mut queue: virtio::Queue,
+    queue: virtio::Queue,
     mem: GuestMemory,
     doorbell: Doorbell,
     kick_evt: Event,
@@ -175,9 +175,6 @@ pub(in crate::virtio::vhost::user::device::net) fn start_queue<T: 'static + Into
         warn!("Starting new queue handler without stopping old handler");
         handle.abort();
     }
-
-    // Enable any virtqueue features that were negotiated (like VIRTIO_RING_F_EVENT_IDX).
-    queue.ack_features(backend.acked_features);
 
     NET_EXECUTOR.with(|ex| {
         // Safe because the executor is initialized in main() below.

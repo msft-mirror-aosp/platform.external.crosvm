@@ -31,6 +31,7 @@ use std::os::unix::prelude::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Barrier;
@@ -70,7 +71,6 @@ use devices::virtio::memory_mapper::MemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
 use devices::virtio::vhost::user::VhostUserListener;
 use devices::virtio::vhost::user::VhostUserListenerTrait;
-use devices::virtio::vhost::vsock::VhostVsockConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonFeatures;
 #[cfg(feature = "balloon")]
@@ -85,6 +85,9 @@ use devices::Ac97Dev;
 use devices::Bus;
 use devices::BusDeviceObj;
 use devices::CoIommuDev;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use devices::GeniezoneKernelIrqChip;
 #[cfg(feature = "usb")]
 use devices::HostBackendDeviceProvider;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -127,6 +130,15 @@ use devices::VirtioPciDevice;
 use devices::XhciController;
 #[cfg(feature = "gpu")]
 use gpu::*;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use hypervisor::geniezone::Geniezone;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use hypervisor::geniezone::GeniezoneVcpu;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use hypervisor::geniezone::GeniezoneVm;
 use hypervisor::kvm::Kvm;
 use hypervisor::kvm::KvmVcpu;
 use hypervisor::kvm::KvmVm;
@@ -158,16 +170,13 @@ use serde::Serialize;
 use smallvec::SmallVec;
 #[cfg(feature = "swap")]
 use swap::SwapController;
-#[cfg(feature = "swap")]
-use swap::VmSwapCommand;
-#[cfg(feature = "swap")]
-use swap::VmSwapResponse;
 use sync::Condvar;
 use sync::Mutex;
 use vm_control::*;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::MemoryPolicy;
+use vm_memory::MemoryRegionOptions;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use x86_64::msr::get_override_msr_list;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -189,6 +198,13 @@ use crate::crosvm::gdb::GdbStub;
 use crate::crosvm::ratelimit::Ratelimit;
 use crate::crosvm::sys::cmdline::DevicesCommand;
 
+const KVM_PATH: &str = "/dev/kvm";
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+const GENIEZONE_PATH: &str = "/dev/gzvm";
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+static GUNYAH_PATH: &str = "/dev/gunyah";
+
 fn create_virtio_devices(
     cfg: &Config,
     vm: &mut impl Vm,
@@ -201,9 +217,7 @@ fn create_virtio_devices(
     pmem_device_tubes: &mut Vec<Tube>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
-    #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))] render_server_fd: Option<
-        SafeDescriptor,
-    >,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
     vvu_proxy_max_sibling_mem_size: u64,
     registered_evt_q: &SendTube,
@@ -336,7 +350,6 @@ fn create_virtio_devices(
                 // Use the unnamed socket for GPU display screens.
                 cfg.wayland_socket_paths.get(""),
                 cfg.x_display.clone(),
-                #[cfg(feature = "virgl_renderer_next")]
                 render_server_fd,
                 event_devices,
             )?);
@@ -613,16 +626,10 @@ fn create_virtio_devices(
         }
     }
 
-    if let Some(cid) = cfg.cid {
-        let vhost_config = VhostVsockConfig {
-            device: cfg.vhost_vsock_device.clone(),
-            cid,
-        };
-        devs.push(create_vhost_vsock_device(
-            cfg.protection_type,
-            &cfg.jail_config,
-            &vhost_config,
-        )?);
+    if let Some(vsock_config) = &cfg.vsock {
+        devs.push(
+            vsock_config.create_virtio_device_and_jail(cfg.protection_type, &cfg.jail_config)?,
+        );
     }
 
     for vhost_user_fs in &cfg.vhost_user_fs {
@@ -711,9 +718,7 @@ fn create_devices(
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
-    #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))] render_server_fd: Option<
-        SafeDescriptor,
-    >,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
     vvu_proxy_max_sibling_mem_size: u64,
     iova_max_addr: &mut Option<u64>,
@@ -844,7 +849,7 @@ fn create_devices(
         fs_device_tubes,
         #[cfg(feature = "gpu")]
         gpu_control_tube,
-        #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+        #[cfg(feature = "gpu")]
         render_server_fd,
         vvu_proxy_device_tubes,
         vvu_proxy_max_sibling_mem_size,
@@ -870,12 +875,17 @@ fn create_devices(
                     None
                 };
 
+                let (ioevent_host_tube, ioevent_device_tube) =
+                    Tube::pair().context("failed to create ioevent tube")?;
+                irq_control_tubes.push(ioevent_host_tube);
+
                 let dev = VirtioPciDevice::new(
                     vm.get_memory().clone(),
                     stub.dev,
                     msi_device_tube,
                     cfg.disable_virtio_intx,
                     shared_memory_tube,
+                    ioevent_device_tube,
                 )
                 .context("failed to create virtio pci dev")?;
 
@@ -1251,14 +1261,14 @@ pub enum ExitState {
 // Remove ranges in `guest_mem_layout` that overlap with ranges in `file_backed_mappings`.
 // Returns the updated guest memory layout.
 fn punch_holes_in_guest_mem_layout_for_mappings(
-    guest_mem_layout: Vec<(GuestAddress, u64)>,
+    guest_mem_layout: Vec<(GuestAddress, u64, MemoryRegionOptions)>,
     file_backed_mappings: &[FileBackedMappingParameters],
-) -> Vec<(GuestAddress, u64)> {
+) -> Vec<(GuestAddress, u64, MemoryRegionOptions)> {
     // Create a set containing (start, end) pairs with exclusive end (end = start + size; the byte
     // at end is not included in the range).
     let mut layout_set = BTreeSet::new();
-    for (addr, size) in &guest_mem_layout {
-        layout_set.insert((addr.offset(), addr.offset() + size));
+    for (addr, size, options) in &guest_mem_layout {
+        layout_set.insert((addr.offset(), addr.offset() + size, *options));
     }
 
     for mapping in file_backed_mappings {
@@ -1266,20 +1276,20 @@ fn punch_holes_in_guest_mem_layout_for_mappings(
         let mapping_end = mapping_start + mapping.size;
 
         // Repeatedly split overlapping guest memory regions until no overlaps remain.
-        while let Some((range_start, range_end)) = layout_set
+        while let Some((range_start, range_end, options)) = layout_set
             .iter()
-            .find(|&&(range_start, range_end)| {
+            .find(|&&(range_start, range_end, _)| {
                 mapping_start < range_end && mapping_end > range_start
             })
             .cloned()
         {
-            layout_set.remove(&(range_start, range_end));
+            layout_set.remove(&(range_start, range_end, options));
 
             if range_start < mapping_start {
-                layout_set.insert((range_start, mapping_start));
+                layout_set.insert((range_start, mapping_start, options));
             }
             if range_end > mapping_end {
-                layout_set.insert((mapping_end, range_end));
+                layout_set.insert((mapping_end, range_end, options));
             }
         }
     }
@@ -1287,7 +1297,7 @@ fn punch_holes_in_guest_mem_layout_for_mappings(
     // Build the final guest memory layout from the modified layout_set.
     layout_set
         .iter()
-        .map(|(start, end)| (GuestAddress(*start), end - start))
+        .map(|(start, end, options)| (GuestAddress(*start), end - start, *options))
         .collect()
 }
 
@@ -1302,7 +1312,8 @@ fn create_guest_memory(
     let guest_mem_layout =
         punch_holes_in_guest_mem_layout_for_mappings(guest_mem_layout, &cfg.file_backed_mappings);
 
-    let guest_mem = GuestMemory::new(&guest_mem_layout).context("failed to create guest memory")?;
+    let guest_mem = GuestMemory::new_with_options(&guest_mem_layout)
+        .context("failed to create guest memory")?;
     let mut mem_policy = MemoryPolicy::empty();
     if components.hugepages {
         mem_policy |= MemoryPolicy::USE_HUGEPAGES;
@@ -1326,13 +1337,59 @@ fn create_guest_memory(
     Ok(guest_mem)
 }
 
-fn run_kvm(cfg: Config, components: VmComponents) -> Result<ExitState> {
-    let kvm = Kvm::new_with_path(&cfg.kvm_device_path).with_context(|| {
-        format!(
-            "failed to open KVM device {}",
-            cfg.kvm_device_path.display(),
+#[cfg(any(target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+fn run_gz(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> Result<ExitState> {
+    let device_path = device_path.unwrap_or(Path::new(GENIEZONE_PATH));
+    let gzvm = Geniezone::new_with_path(device_path)
+        .with_context(|| format!("failed to open GenieZone device {}", device_path.display()))?;
+
+    let guest_mem = create_guest_memory(&cfg, &components, &gzvm)?;
+
+    #[cfg(feature = "swap")]
+    let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
+        Some(
+            SwapController::launch(guest_mem.clone(), swap_dir, &cfg.jail_config)
+                .context("launch vmm-swap monitor process")?,
         )
-    })?;
+    } else {
+        None
+    };
+
+    let vm =
+        GeniezoneVm::new(&gzvm, guest_mem, components.hv_cfg).context("failed to create vm")?;
+
+    // Check that the VM was actually created in protected mode as expected.
+    if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
+        bail!("Failed to create protected VM");
+    }
+    let vm_clone = vm.try_clone().context("failed to clone vm")?;
+
+    let ioapic_host_tube;
+    let mut irq_chip = if cfg.split_irqchip {
+        unimplemented!("Geniezone does not support split irqchip mode");
+    } else {
+        ioapic_host_tube = None;
+
+        GeniezoneKernelIrqChip::new(vm_clone, components.vcpu_count)
+            .context("failed to create IRQ chip")?
+    };
+
+    run_vm::<GeniezoneVcpu, GeniezoneVm>(
+        cfg,
+        components,
+        vm,
+        &mut irq_chip,
+        ioapic_host_tube,
+        #[cfg(feature = "swap")]
+        swap_controller,
+    )
+}
+
+fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> Result<ExitState> {
+    let device_path = device_path.unwrap_or(Path::new(KVM_PATH));
+    let kvm = Kvm::new_with_path(device_path)
+        .with_context(|| format!("failed to open KVM device {}", device_path.display()))?;
 
     let guest_mem = create_guest_memory(&cfg, &components, &kvm)?;
 
@@ -1424,8 +1481,86 @@ fn run_kvm(cfg: Config, components: VmComponents) -> Result<ExitState> {
     )
 }
 
-fn get_default_hypervisor() -> Result<HypervisorKind> {
-    Ok(HypervisorKind::Kvm)
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+fn run_gunyah(
+    device_path: Option<&Path>,
+    cfg: Config,
+    components: VmComponents,
+) -> Result<ExitState> {
+    use devices::GunyahIrqChip;
+    use hypervisor::gunyah::{Gunyah, GunyahVcpu, GunyahVm};
+
+    let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
+    let gunyah = Gunyah::new_with_path(device_path)
+        .with_context(|| format!("failed to open Gunyah device {}", device_path.display()))?;
+
+    let guest_mem = create_guest_memory(&cfg, &components, &gunyah)?;
+
+    #[cfg(feature = "swap")]
+    let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
+        Some(
+            SwapController::launch(guest_mem.clone(), swap_dir, &cfg.jail_config)
+                .context("launch vmm-swap monitor process")?,
+        )
+    } else {
+        None
+    };
+
+    let vm = GunyahVm::new(&gunyah, guest_mem, components.hv_cfg).context("failed to create vm")?;
+
+    // Check that the VM was actually created in protected mode as expected.
+    if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
+        bail!("Failed to create protected VM");
+    }
+
+    let vm_clone = vm.try_clone()?;
+
+    run_vm::<GunyahVcpu, GunyahVm>(
+        cfg,
+        components,
+        vm,
+        &mut GunyahIrqChip::new(vm_clone)?,
+        None,
+        #[cfg(feature = "swap")]
+        swap_controller,
+    )
+}
+
+/// Choose a default hypervisor if no `--hypervisor` option was specified.
+fn get_default_hypervisor() -> Option<HypervisorKind> {
+    let kvm_path = Path::new(KVM_PATH);
+    if kvm_path.exists() {
+        return Some(HypervisorKind::Kvm {
+            device: Some(kvm_path.to_path_buf()),
+        });
+    }
+
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(feature = "geniezone")]
+    {
+        let gz_path = Path::new(GENIEZONE_PATH);
+        if gz_path.exists() {
+            return Some(HypervisorKind::Geniezone {
+                device: Some(gz_path.to_path_buf()),
+            });
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        any(target_arch = "arm", target_arch = "aarch64"),
+        feature = "gunyah"
+    ))]
+    {
+        let gunyah_path = Path::new(GUNYAH_PATH);
+        if gunyah_path.exists() {
+            return Some(HypervisorKind::Gunyah {
+                device: Some(gunyah_path.to_path_buf()),
+            });
+        }
+    }
+
+    None
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
@@ -1436,13 +1571,25 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
     let components = setup_vm_components(&cfg)?;
 
-    let default_hypervisor = get_default_hypervisor().context("no enabled hypervisor")?;
-    let hypervisor = cfg.hypervisor.unwrap_or(default_hypervisor);
+    let hypervisor = cfg
+        .hypervisor
+        .clone()
+        .or_else(get_default_hypervisor)
+        .context("no enabled hypervisor")?;
 
-    debug!("creating {:?} hypervisor", hypervisor);
+    debug!("creating hypervisor: {:?}", hypervisor);
 
     match hypervisor {
-        HypervisorKind::Kvm => run_kvm(cfg, components),
+        HypervisorKind::Kvm { device } => run_kvm(device.as_deref(), cfg, components),
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        #[cfg(feature = "geniezone")]
+        HypervisorKind::Geniezone { device } => run_gz(device.as_deref(), cfg, components),
+        #[cfg(all(
+            unix,
+            any(target_arch = "arm", target_arch = "aarch64"),
+            feature = "gunyah"
+        ))]
+        HypervisorKind::Gunyah { device } => run_gunyah(device.as_deref(), cfg, components),
     }
 }
 
@@ -1452,7 +1599,7 @@ fn run_vm<Vcpu, V>(
     mut vm: V,
     irq_chip: &mut dyn IrqChipArch,
     ioapic_host_tube: Option<Tube>,
-    #[cfg(feature = "swap")] swap_controller: Option<(SwapController, Tube)>,
+    #[cfg(feature = "swap")] swap_controller: Option<SwapController>,
 ) -> Result<ExitState>
 where
     Vcpu: VcpuArch + 'static,
@@ -1487,14 +1634,6 @@ where
 
     let mut control_tubes = Vec::new();
     let mut irq_control_tubes = Vec::new();
-
-    #[cfg(feature = "swap")]
-    let swap_controller = if let Some((swap_controller, tube)) = swap_controller {
-        control_tubes.push(TaggedControlTube::SwapMonitor(tube));
-        Some(swap_controller)
-    } else {
-        None
-    };
 
     #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
     if let Some(port) = cfg.gdb {
@@ -1631,7 +1770,7 @@ where
 
     create_file_backed_mappings(&cfg, &mut vm, &mut sys_allocator)?;
 
-    #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+    #[cfg(feature = "gpu")]
     // Hold on to the render server jail so it keeps running until we exit run_vm()
     let (_render_server_jail, render_server_fd) =
         if let Some(parameters) = &cfg.gpu_render_server_parameters {
@@ -1741,7 +1880,7 @@ where
         usb_provider,
         #[cfg(feature = "gpu")]
         gpu_control_device_tube,
-        #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+        #[cfg(feature = "gpu")]
         render_server_fd,
         &mut vvu_proxy_device_tubes,
         components.memory_size,
@@ -1805,12 +1944,16 @@ where
 
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
         irq_control_tubes.push(msi_host_tube);
+        let (ioevent_host_tube, ioevent_device_tube) =
+            Tube::pair().context("failed to create ioevent tube")?;
+        irq_control_tubes.push(ioevent_host_tube);
         let mut dev = VirtioPciDevice::new(
             vm.get_memory().clone(),
             iommu_dev.dev,
             msi_device_tube,
             cfg.disable_virtio_intx,
             None,
+            ioevent_device_tube,
         )
         .context("failed to create virtio pci dev")?;
         // early reservation for viommu.
@@ -1862,6 +2005,10 @@ where
         swap_controller.as_ref(),
     )
     .context("the architecture failed to build the vm")?;
+
+    if let Some(tube) = linux.vm_request_tube.take() {
+        control_tubes.push(TaggedControlTube::Vm(tube));
+    }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let (hp_control_tube, hp_worker_tube) = mpsc::channel();
@@ -2362,35 +2509,6 @@ fn handle_hotplug_command<V: VmArch, Vcpu: VcpuArch>(
     }
 }
 
-#[cfg(feature = "swap")]
-fn handle_swap_suspend_command(
-    tube: &Tube,
-    swap_controller: &SwapController,
-    kick_vcpus: impl Fn(VcpuControl),
-    vcpu_num: usize,
-) -> anyhow::Result<()> {
-    info!("suspending vcpus");
-    let _vcpu_guard = VcpuSuspendGuard::new(&kick_vcpus, vcpu_num).context("suspend vcpus")?;
-    info!("suspending devices");
-    // TODO(b/253386409): Use `devices::Suspendable::sleep()` instead of sending `SIGSTOP` signal.
-    let _devices_guard = swap_controller
-        .suspend_devices()
-        .context("suspend devices")?;
-
-    tube.send(&VmSwapResponse::SuspendCompleted)
-        .context("send completed")?;
-
-    // Wait for a resume command.
-    if !matches!(
-        tube.recv().context("wait for VmSwapCommand::Resume")?,
-        VmSwapCommand::Resume
-    ) {
-        anyhow::bail!("the vmm-swap command is not resume.");
-    }
-    info!("resuming vm");
-    Ok(())
-}
-
 fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     mut linux: RunnableLinuxVm<V, Vcpu>,
     sys_allocator: SystemAllocator,
@@ -2427,7 +2545,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     // Tube keyed on the socket path used to create it.
     struct AddressedTube {
-        tube: Tube,
+        tube: Rc<Tube>,
         socket_addr: String,
     }
 
@@ -2448,6 +2566,53 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     impl AddressedTube {
         pub fn send<T: Serialize>(&self, msg: &T) -> Result<(), base::TubeError> {
             self.tube.send(msg)
+        }
+    }
+
+    fn find_registered_tube<'a>(
+        registered_tubes: &'a HashMap<RegisteredEvent, HashSet<AddressedTube>>,
+        socket_addr: &str,
+        event: RegisteredEvent,
+    ) -> (Option<&'a Rc<Tube>>, bool) {
+        let mut registered_tube: Option<&Rc<Tube>> = None;
+        let mut already_registered = false;
+        'outer: for (evt, addr_tubes) in registered_tubes {
+            for addr_tube in addr_tubes {
+                if addr_tube.socket_addr == socket_addr {
+                    if *evt == event {
+                        already_registered = true;
+                        break 'outer;
+                    }
+                    // Since all tubes of the same addr should
+                    // be an RC to the same tube, it doesn't
+                    // matter which one we get. But we do need
+                    // to check for a registration for the
+                    // current event, so can't break here.
+                    registered_tube = Some(&addr_tube.tube);
+                }
+            }
+        }
+        (registered_tube, already_registered)
+    }
+
+    fn make_addr_tube_from_maybe_existing(
+        tube: Option<&Rc<Tube>>,
+        addr: String,
+    ) -> Result<AddressedTube> {
+        if let Some(registered_tube) = tube {
+            Ok(AddressedTube {
+                tube: registered_tube.clone(),
+                socket_addr: addr,
+            })
+        } else {
+            let sock = UnixSeqpacket::connect(addr.clone()).with_context(|| {
+                format!("failed to connect to registered listening socket {}", addr)
+            })?;
+            let tube = Tube::new_from_unix_seqpacket(sock);
+            Ok(AddressedTube {
+                tube: Rc::new(tube),
+                socket_addr: addr,
+            })
         }
     }
 
@@ -2700,18 +2865,15 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // Restore VM (if applicable).
     // Must happen after the vCPU barrier to avoid deadlock.
     if let Some(path) = &cfg.restore_path {
-        device_ctrl_tube
-            .send(&DeviceControlCommand::RestoreDevices {
-                restore_path: path.clone(),
-            })
-            .context("send command to devices control socket")?;
-        let response = device_ctrl_tube
-            .recv()
-            .context("receive from devices control socket")?;
-        match response {
-            vm_control::VmResponse::Ok => {}
-            _ => bail!("unexpected restore response: {response:?}"),
-        };
+        vm_control::do_restore(
+            path.clone(),
+            |msg| vcpu::kick_all_vcpus(&vcpu_handles, linux.irq_chip.as_irq_chip(), msg),
+            |msg, index| {
+                vcpu::kick_vcpu(&vcpu_handles.get(index), linux.irq_chip.as_irq_chip(), msg)
+            },
+            &device_ctrl_tube,
+            linux.vcpu_count,
+        )?;
         // Allow the vCPUs to start for real.
         vcpu::kick_all_vcpus(
             &vcpu_handles,
@@ -2909,35 +3071,28 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                             }
                                         }
                                         VmRequest::RegisterListener { socket_addr, event } => {
-                                            let mut already_registered = false;
-
-                                            if let Some(tubes) = registered_evt_tubes.get(&event) {
-                                                for addr_tube in tubes {
-                                                    if addr_tube.socket_addr == socket_addr {
-                                                        already_registered = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            let (registered_tube, already_registered) =
+                                                find_registered_tube(
+                                                    &registered_evt_tubes,
+                                                    &socket_addr,
+                                                    event,
+                                                );
 
                                             if !already_registered {
-                                                if let Ok(socket) =
-                                                    UnixSeqpacket::connect(socket_addr.clone())
+                                                let addr_tube = make_addr_tube_from_maybe_existing(
+                                                    registered_tube,
+                                                    socket_addr,
+                                                )?;
+
+                                                if let Some(tubes) =
+                                                    registered_evt_tubes.get_mut(&event)
                                                 {
-                                                    let addr_tube = AddressedTube {
-                                                        tube: Tube::new_from_unix_seqpacket(socket),
-                                                        socket_addr,
-                                                    };
-                                                    if let Some(tubes) =
-                                                        registered_evt_tubes.get_mut(&event)
-                                                    {
-                                                        tubes.insert(addr_tube);
-                                                    } else {
-                                                        registered_evt_tubes.insert(
-                                                            event,
-                                                            vec![addr_tube].into_iter().collect(),
-                                                        );
-                                                    }
+                                                    tubes.insert(addr_tube);
+                                                } else {
+                                                    registered_evt_tubes.insert(
+                                                        event,
+                                                        vec![addr_tube].into_iter().collect(),
+                                                    );
                                                 }
                                             }
                                             VmResponse::Ok
@@ -2979,6 +3134,13 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                 |msg| {
                                                     vcpu::kick_all_vcpus(
                                                         &vcpu_handles,
+                                                        linux.irq_chip.as_irq_chip(),
+                                                        msg,
+                                                    )
+                                                },
+                                                |msg, index| {
+                                                    vcpu::kick_vcpu(
+                                                        &vcpu_handles.get(index),
                                                         linux.irq_chip.as_irq_chip(),
                                                         msg,
                                                     )
@@ -3129,43 +3291,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                     }
                                 }
                             },
-                            #[cfg(feature = "swap")]
-                            TaggedControlTube::SwapMonitor(tube) => {
-                                match tube.recv::<VmSwapCommand>() {
-                                    Ok(VmSwapCommand::Suspend) => {
-                                        if let Err(e) = handle_swap_suspend_command(
-                                            tube,
-                                            // swap_controller must be present if the tube exists.
-                                            swap_controller.as_ref().unwrap(),
-                                            |msg| {
-                                                vcpu::kick_all_vcpus(
-                                                    &vcpu_handles,
-                                                    linux.irq_chip.as_irq_chip(),
-                                                    msg,
-                                                )
-                                            },
-                                            vcpu_handles.len(),
-                                        ) {
-                                            error!("failed to suspend vm: {:?}", e);
-                                            if let Err(e) =
-                                                tube.send(&VmSwapResponse::SuspendFailed)
-                                            {
-                                                error!("failed to send SuspendFailed: {:?}", e);
-                                            }
-                                        }
-                                    }
-                                    Ok(VmSwapCommand::Resume) => {
-                                        // Ignore resume command.
-                                    }
-                                    Err(e) => {
-                                        if let TubeError::Disconnected = e {
-                                            vm_control_indices_to_remove.push(index);
-                                        } else {
-                                            error!("failed to recv VmSwapCommand: {}", e);
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -3773,6 +3898,11 @@ pub fn start_devices(opts: DevicesCommand) -> anyhow::Result<()> {
         add_device(i, disk_config, &params.vhost, &jail, &mut devices_jails)?;
     }
 
+    // Create vsock devices.
+    for (i, params) in opts.vsock.iter().enumerate() {
+        add_device(i, &params.device, &params.vhost, &jail, &mut devices_jails)?;
+    }
+
     let ex = Executor::new()?;
     if let Some(control_server_socket) = control_server_socket {
         // Start the control server in the parent process.
@@ -3852,14 +3982,14 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3867,14 +3997,14 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0xD000_0000, 0x1000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3882,14 +4012,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0, 0x2000)]
             ),
             vec![
-                (GuestAddress(0x2000), 0xD000_0000 - 0x2000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (
+                    GuestAddress(0x2000),
+                    0xD000_0000 - 0x2000,
+                    Default::default()
+                ),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3897,14 +4031,14 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0xD000_0000 - 0x2000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000 - 0x2000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0xD000_0000 - 0x2000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3912,15 +4046,19 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0x1000),
-                (GuestAddress(0x3000), 0xD000_0000 - 0x3000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0x1000, Default::default()),
+                (
+                    GuestAddress(0x3000),
+                    0xD000_0000 - 0x3000,
+                    Default::default()
+                ),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3928,14 +4066,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1_0000_0000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_2000),
+                    0x8_0000 - 0x2000,
+                    Default::default()
+                ),
             ]
         );
 
@@ -3943,14 +4085,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1_0008_0000 - 0x2000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000 - 0x2000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_0000),
+                    0x8_0000 - 0x2000,
+                    Default::default()
+                ),
             ]
         );
 
@@ -3958,15 +4104,19 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1_0000_1000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x1000),
-                (GuestAddress(0x1_0000_3000), 0x8_0000 - 0x3000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x1000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_3000),
+                    0x8_0000 - 0x3000,
+                    Default::default()
+                ),
             ]
         );
 
@@ -3974,14 +4124,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0xA000_0000, 0x60002000)]
             ),
             vec![
-                (GuestAddress(0), 0xA000_0000),
-                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+                (GuestAddress(0), 0xA000_0000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_2000),
+                    0x8_0000 - 0x2000,
+                    Default::default()
+                ),
             ]
         );
     }

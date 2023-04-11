@@ -459,8 +459,11 @@ fn create_balloon_device(
 fn create_vsock_device(cfg: &Config) -> DeviceResult {
     // We only support a single guest, so we can confidently assign a default
     // CID if one isn't provided. We choose the lowest non-reserved value.
-    let dev = virtio::Vsock::new(
-        cfg.cid.unwrap_or(DEFAULT_GUEST_CID),
+    let dev = virtio::vsock::Vsock::new(
+        cfg.vsock
+            .as_ref()
+            .map(|cfg| cfg.cid)
+            .unwrap_or(DEFAULT_GUEST_CID),
         cfg.host_guid.clone(),
         virtio::base_features(cfg.protection_type),
     )
@@ -712,6 +715,10 @@ fn create_devices(
             None
         };
 
+        let (ioevent_host_tube, ioevent_device_tube) =
+            Tube::pair().context("failed to create ioevent tube")?;
+        irq_control_tubes.push(ioevent_host_tube);
+
         let dev = Box::new(
             VirtioPciDevice::new(
                 mem.clone(),
@@ -719,6 +726,7 @@ fn create_devices(
                 msi_device_tube,
                 cfg.disable_virtio_intx,
                 shared_memory_tube,
+                ioevent_device_tube,
             )
             .exit_context(Exit::VirtioPciDev, "failed to create virtio pci dev")?,
         ) as Box<dyn BusDeviceObj>;
@@ -1653,7 +1661,7 @@ fn create_guest_memory(
         Exit::GuestMemoryLayout,
         "failed to create guest memory layout",
     )?;
-    GuestMemory::new(&guest_mem_layout)
+    GuestMemory::new_with_options(&guest_mem_layout)
         .exit_context(Exit::CreateGuestMemory, "failed to create guest memory")
 }
 

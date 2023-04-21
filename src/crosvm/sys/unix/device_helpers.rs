@@ -18,6 +18,7 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use arch::VirtioDeviceStub;
+use base::ReadNotifier;
 use base::*;
 use devices::serial_device::SerialParameters;
 use devices::serial_device::SerialType;
@@ -39,7 +40,8 @@ use devices::virtio::vfio_wrapper::VfioWrapper;
 use devices::virtio::vhost::user::proxy::VirtioVhostUser;
 use devices::virtio::vhost::user::vmm::VhostUserVirtioDevice;
 use devices::virtio::vhost::user::VhostUserDevice;
-use devices::virtio::vhost::vsock::VhostVsockConfig;
+use devices::virtio::vhost::user::VhostUserVsockDevice;
+use devices::virtio::vsock::VsockConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
 use devices::virtio::Console;
@@ -86,7 +88,6 @@ pub enum TaggedControlTube {
         /// See devices::virtio::VirtioDevice.expose_shared_memory_region_with_viommu
         expose_with_viommu: bool,
     },
-    VmIrq(Tube),
     VmMsync(Tube),
 }
 
@@ -94,7 +95,7 @@ impl AsRef<Tube> for TaggedControlTube {
     fn as_ref(&self) -> &Tube {
         use self::TaggedControlTube::*;
         match &self {
-            Fs(tube) | Vm(tube) | VmMemory { tube, .. } | VmIrq(tube) | VmMsync(tube) => tube,
+            Fs(tube) | Vm(tube) | VmMemory { tube, .. } | VmMsync(tube) => tube,
         }
     }
 }
@@ -102,6 +103,12 @@ impl AsRef<Tube> for TaggedControlTube {
 impl AsRawDescriptor for TaggedControlTube {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.as_ref().as_raw_descriptor()
+    }
+}
+
+impl ReadNotifier for TaggedControlTube {
+    fn get_read_notifier(&self) -> &dyn AsRawDescriptor {
+        self.as_ref().get_read_notifier()
     }
 }
 
@@ -224,6 +231,7 @@ impl<'a> VirtioDeviceBuilder for DiskConfig<'a> {
                 self.disk.read_only,
                 self.disk.sparse,
                 self.disk.block_size,
+                self.disk.multiple_workers,
                 self.disk.id,
                 self.device_tube,
                 None,
@@ -247,6 +255,7 @@ impl<'a> VirtioDeviceBuilder for DiskConfig<'a> {
                 disk.read_only,
                 disk.sparse,
                 disk.block_size,
+                false,
                 disk.id,
                 self.device_tube,
                 None,
@@ -430,7 +439,7 @@ pub fn create_virtio_snd_device(
     use virtio::snd::parameters::StreamSourceBackend as Backend;
 
     let policy = match backend {
-        Backend::NULL => "snd_null_device",
+        Backend::NULL | Backend::FILE => "snd_null_device",
         #[cfg(feature = "audio_cras")]
         Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) => "snd_cras_device",
         #[cfg(not(feature = "audio_cras"))]
@@ -696,17 +705,21 @@ pub fn create_balloon_device(
     jail_config: &Option<JailConfig>,
     mode: BalloonMode,
     tube: Tube,
+    wss_tube: Option<Tube>,
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
     enabled_features: u64,
+    registered_evt_q: Option<SendTube>,
 ) -> DeviceResult {
     let dev = virtio::Balloon::new(
         virtio::base_features(protection_type),
         tube,
+        wss_tube,
         inflate_tube,
         init_balloon_size,
         mode,
         enabled_features,
+        registered_evt_q,
     )
     .context("failed to create balloon")?;
 
@@ -813,6 +826,7 @@ pub fn create_virtio_vhost_net_device_from_tap<T: TapT + 'static>(
     vcpu_count: usize,
     vhost_net_device_path: PathBuf,
     tap: T,
+    mac: Option<MacAddress>,
 ) -> DeviceResult {
     create_net_device(
         protection_type,
@@ -821,7 +835,7 @@ pub fn create_virtio_vhost_net_device_from_tap<T: TapT + 'static>(
         vcpu_count,
         "vhost_net_device",
         move |features, _vq_pairs| {
-            virtio::vhost::Net::<T, vhost::Net<T>>::new(&vhost_net_device_path, features, tap)
+            virtio::vhost::Net::<T, vhost::Net<T>>::new(&vhost_net_device_path, features, tap, mac)
                 .context("failed to set up virtio-vhost networking")
         },
     )
@@ -1040,20 +1054,31 @@ pub fn create_vhost_user_video_device(
     })
 }
 
-pub fn create_vhost_vsock_device(
-    protection_type: ProtectionType,
-    jail_config: &Option<JailConfig>,
-    vhost_config: &VhostVsockConfig,
-) -> DeviceResult {
-    let features = virtio::base_features(protection_type);
+impl VirtioDeviceBuilder for &VsockConfig {
+    const NAME: &'static str = "vhost_vsock";
 
-    let dev = virtio::vhost::Vsock::new(features, vhost_config)
-        .context("failed to set up virtual socket device")?;
+    fn create_virtio_device(
+        self,
+        protection_type: ProtectionType,
+    ) -> anyhow::Result<Box<dyn VirtioDevice>> {
+        let features = virtio::base_features(protection_type);
 
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: simple_jail(jail_config, "vhost_vsock_device")?,
-    })
+        let dev = virtio::vhost::Vsock::new(features, self)
+            .context("failed to set up virtual socket device")?;
+
+        Ok(Box::new(dev))
+    }
+
+    fn create_vhost_user_device(
+        self,
+        keep_rds: &mut Vec<RawDescriptor>,
+    ) -> anyhow::Result<Box<dyn VhostUserDevice>> {
+        let vsock_device = VhostUserVsockDevice::new(self.cid, &self.vhost_device)?;
+
+        keep_rds.push(vsock_device.as_raw_descriptor());
+
+        Ok(Box::new(vsock_device))
+    }
 }
 
 pub fn create_fs_device(
@@ -1355,6 +1380,7 @@ pub fn create_vfio_device(
     jail_config: &Option<JailConfig>,
     vm: &impl Vm,
     resources: &mut SystemAllocator,
+    irq_control_tubes: &mut Vec<Tube>,
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     hotplug: bool,
@@ -1389,11 +1415,11 @@ pub fn create_vfio_device(
         VfioDeviceType::Pci => {
             let (vfio_host_tube_msi, vfio_device_tube_msi) =
                 Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(vfio_host_tube_msi));
+            irq_control_tubes.push(vfio_host_tube_msi);
 
             let (vfio_host_tube_msix, vfio_device_tube_msix) =
                 Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(vfio_host_tube_msix));
+            irq_control_tubes.push(vfio_host_tube_msix);
 
             let mut vfio_pci_device = VfioPciDevice::new(
                 vfio_path,

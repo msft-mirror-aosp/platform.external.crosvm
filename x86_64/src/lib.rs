@@ -10,7 +10,6 @@ mod fdt;
 
 const SETUP_DTB: u32 = 2;
 const SETUP_RNG_SEED: u32 = 9;
-const X86_64_FDT_MAX_SIZE: u64 = 0x20_0000;
 
 #[allow(dead_code)]
 #[allow(non_upper_case_globals)]
@@ -55,6 +54,7 @@ use std::sync::Arc;
 use acpi_tables::aml;
 use acpi_tables::aml::Aml;
 use acpi_tables::sdt::SDT;
+use anyhow::Context;
 use arch::get_serial_cmdline;
 use arch::GetSerialCmdlineError;
 use arch::MsrAction;
@@ -65,11 +65,14 @@ use arch::MsrValueFrom;
 use arch::RunnableLinuxVm;
 use arch::VmComponents;
 use arch::VmImage;
+#[cfg(feature = "seccomp_trace")]
+use base::debug;
 use base::warn;
 #[cfg(unix)]
 use base::AsRawDescriptors;
 use base::Event;
 use base::SendTube;
+use base::Tube;
 use base::TubeError;
 use chrono::Utc;
 pub use cpuid::adjust_cpuid;
@@ -115,6 +118,8 @@ use hypervisor::VcpuX86_64;
 use hypervisor::Vm;
 use hypervisor::VmCap;
 use hypervisor::VmX86_64;
+#[cfg(feature = "seccomp_trace")]
+use jail::read_jail_addr;
 #[cfg(windows)]
 use jail::FakeMinijailStub as Minijail;
 #[cfg(unix)]
@@ -133,6 +138,7 @@ use vm_control::BatteryType;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
+use vm_memory::MemoryRegionOptions;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 
@@ -244,6 +250,8 @@ pub enum Error {
     SetLint(interrupts::Error),
     #[error("failed to set tss addr: {0}")]
     SetTssAddr(base::Error),
+    #[error("failed to set up cmos: {0}")]
+    SetupCmos(anyhow::Error),
     #[error("failed to set up cpuid: {0}")]
     SetupCpuid(cpuid::Error),
     #[error("setup data too large")]
@@ -331,6 +339,8 @@ const TSS_ADDR: u64 = 0xfffb_d000;
 pub const KERNEL_START_OFFSET: u64 = 0x20_0000;
 const CMDLINE_OFFSET: u64 = 0x2_0000;
 const CMDLINE_MAX_SIZE: u64 = 0x800; // including terminating zero
+const SETUP_DATA_START: u64 = CMDLINE_OFFSET + CMDLINE_MAX_SIZE;
+const SETUP_DATA_END: u64 = ACPI_HI_RSDP_WINDOW_BASE;
 const X86_64_SERIAL_1_3_IRQ: u32 = 4;
 const X86_64_SERIAL_2_4_IRQ: u32 = 3;
 // X86_64_SCI_IRQ is used to fill the ACPI FACP table.
@@ -510,15 +520,14 @@ fn configure_system(
 /// Returns the guest address of the first entry in the setup_data list, if any.
 fn write_setup_data(
     guest_mem: &GuestMemory,
-    free_addr: &mut u64,
+    setup_data_start: GuestAddress,
+    setup_data_end: GuestAddress,
     setup_data: &[SetupData],
 ) -> Result<Option<GuestAddress>> {
     let mut setup_data_list_head = None;
 
-    // Place the first setup_data at the first 64-bit aligned offset following free_addr.
-    let mut setup_data_addr = GuestAddress(*free_addr)
-        .align(8)
-        .ok_or(Error::SetupDataTooLarge)?;
+    // Place the first setup_data at the first 64-bit aligned offset following setup_data_start.
+    let mut setup_data_addr = setup_data_start.align(8).ok_or(Error::SetupDataTooLarge)?;
 
     let mut entry_iter = setup_data.iter().peekable();
     while let Some(entry) = entry_iter.next() {
@@ -528,9 +537,13 @@ fn write_setup_data(
 
         // Ensure the entry (header plus data) fits into guest memory.
         let entry_size = (mem::size_of::<setup_data_hdr>() + entry.data.len()) as u64;
-        setup_data_addr
+        let entry_end = setup_data_addr
             .checked_add(entry_size)
             .ok_or(Error::SetupDataTooLarge)?;
+
+        if entry_end >= setup_data_end {
+            return Err(Error::SetupDataTooLarge);
+        }
 
         let next_setup_data_addr = if entry_iter.peek().is_some() {
             // Place the next setup_data at a 64-bit aligned address.
@@ -563,7 +576,6 @@ fn write_setup_data(
             )
             .map_err(Error::WritingSetupData)?;
 
-        *free_addr = setup_data_addr.offset() + entry_size;
         setup_data_addr = next_setup_data_addr;
     }
 
@@ -601,7 +613,10 @@ fn add_e820_entry(params: &mut boot_params, range: AddressRange, mem_type: E820T
 /// These should be used to configure the GuestMemory structure for the platform.
 /// For x86_64 all addresses are valid from the start of the kernel except a
 /// carve out at the end of 32bit address space.
-pub fn arch_memory_regions(size: u64, bios_size: Option<u64>) -> Vec<(GuestAddress, u64)> {
+pub fn arch_memory_regions(
+    size: u64,
+    bios_size: Option<u64>,
+) -> Vec<(GuestAddress, u64, MemoryRegionOptions)> {
     let mem_start = START_OF_RAM_32BITS;
     let mem_end = GuestAddress(size + mem_start);
 
@@ -610,21 +625,23 @@ pub fn arch_memory_regions(size: u64, bios_size: Option<u64>) -> Vec<(GuestAddre
 
     let mut regions = Vec::new();
     if mem_end <= end_32bit_gap_start {
-        regions.push((GuestAddress(mem_start), size));
+        regions.push((GuestAddress(mem_start), size, Default::default()));
         if let Some(bios_size) = bios_size {
-            regions.push((bios_start(bios_size), bios_size));
+            regions.push((bios_start(bios_size), bios_size, Default::default()));
         }
     } else {
         regions.push((
             GuestAddress(mem_start),
             end_32bit_gap_start.offset() - mem_start,
+            Default::default(),
         ));
         if let Some(bios_size) = bios_size {
-            regions.push((bios_start(bios_size), bios_size));
+            regions.push((bios_start(bios_size), bios_size, Default::default()));
         }
         regions.push((
             first_addr_past_32bits,
             mem_end.offset_from(end_32bit_gap_start),
+            Default::default(),
         ));
     }
 
@@ -637,7 +654,7 @@ impl arch::LinuxArch for X8664arch {
     fn guest_memory_layout(
         components: &VmComponents,
         _hypervisor: &impl Hypervisor,
-    ) -> std::result::Result<Vec<(GuestAddress, u64)>, Self::Error> {
+    ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
         init_low_memory_layout(components.pcie_ecam, components.pci_low_start);
 
         let bios_size = match &components.vm_image {
@@ -801,9 +818,16 @@ impl arch::LinuxArch for X8664arch {
                 vm_evt_wrtube.try_clone().map_err(Error::CloneTube)?,
             )?;
         }
-        if !components.no_rtc {
-            Self::setup_legacy_cmos_device(&io_bus, components.memory_size)?;
-        }
+        let vm_request_tube = if !components.no_rtc {
+            let (host_tube, device_tube) = Tube::pair()
+                .context("create tube")
+                .map_err(Error::SetupCmos)?;
+            Self::setup_legacy_cmos_device(&io_bus, irq_chip, device_tube, components.memory_size)
+                .map_err(Error::SetupCmos)?;
+            Some(host_tube)
+        } else {
+            None
+        };
         Self::setup_serial_devices(
             components.hv_cfg.protection_type,
             irq_chip.as_irq_chip_mut(),
@@ -1016,6 +1040,7 @@ impl arch::LinuxArch for X8664arch {
             platform_devices: Vec::new(),
             hotplug_bus: BTreeMap::new(),
             devices_thread: None,
+            vm_request_tube,
         })
     }
 
@@ -1589,10 +1614,6 @@ impl X8664arch {
         kernel_loader::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)
             .map_err(Error::LoadCmdline)?;
 
-        // Track the first free address after the kernel - this is where extra
-        // data like the device tree blob and initrd will be loaded.
-        let mut free_addr = kernel_end;
-
         let mut setup_data = Vec::<SetupData>::new();
         if let Some(android_fstab) = android_fstab {
             setup_data.push(
@@ -1601,7 +1622,12 @@ impl X8664arch {
         }
         setup_data.push(setup_data_rng_seed());
 
-        let setup_data = write_setup_data(mem, &mut free_addr, &setup_data)?;
+        let setup_data = write_setup_data(
+            mem,
+            GuestAddress(SETUP_DATA_START),
+            GuestAddress(SETUP_DATA_END),
+            &setup_data,
+        )?;
 
         let initrd = match initrd_file {
             Some(mut initrd_file) => {
@@ -1619,7 +1645,7 @@ impl X8664arch {
                 let (initrd_start, initrd_size) = arch::load_image_high(
                     mem,
                     &mut initrd_file,
-                    GuestAddress(free_addr),
+                    GuestAddress(kernel_end),
                     GuestAddress(initrd_addr_max),
                     base::pagesize() as u64,
                 )
@@ -1702,7 +1728,12 @@ impl X8664arch {
     ///
     /// * - `io_bus` - the IO bus object
     /// * - `mem_size` - the size in bytes of physical ram for the guest
-    pub fn setup_legacy_cmos_device(io_bus: &devices::Bus, mem_size: u64) -> Result<()> {
+    pub fn setup_legacy_cmos_device(
+        io_bus: &devices::Bus,
+        irq_chip: &mut dyn IrqChipX86_64,
+        vm_control: Tube,
+        mem_size: u64,
+    ) -> anyhow::Result<()> {
         let mem_regions = arch_memory_regions(mem_size, None);
 
         let mem_below_4g = mem_regions
@@ -1717,17 +1748,26 @@ impl X8664arch {
             .map(|r| r.1)
             .sum();
 
-        io_bus
-            .insert(
-                Arc::new(Mutex::new(devices::Cmos::new(
-                    mem_below_4g,
-                    mem_above_4g,
-                    Utc::now,
-                ))),
-                0x70,
-                0x2,
+        let irq_evt = devices::IrqEdgeEvent::new().context("cmos irq")?;
+        let cmos = devices::cmos::Cmos::new(
+            mem_below_4g,
+            mem_above_4g,
+            Utc::now,
+            vm_control,
+            irq_evt.try_clone().context("cmos irq clone")?,
+        )
+        .context("create cmos")?;
+
+        irq_chip
+            .register_edge_irq_event(
+                devices::cmos::RTC_IRQ as u32,
+                &irq_evt,
+                IrqEventSource::from_device(&cmos),
             )
-            .unwrap();
+            .context("cmos register irq")?;
+        io_bus
+            .insert(Arc::new(Mutex::new(cmos)), 0x70, 0x2)
+            .context("cmos insert irq")?;
 
         Ok(())
     }
@@ -1771,12 +1811,15 @@ impl X8664arch {
             match battery_type {
                 #[cfg(unix)]
                 BatteryType::Goldfish => {
+                    let irq_num = resources.allocate_irq().ok_or(Error::CreateBatDevices(
+                        arch::DeviceRegistrationError::AllocateIrq,
+                    ))?;
                     let (control_tube, _mmio_base) = arch::sys::unix::add_goldfish_battery(
                         &mut amls,
                         battery.1,
                         mmio_bus,
                         irq_chip,
-                        sci_irq,
+                        irq_num,
                         resources,
                         #[cfg(feature = "swap")]
                         swap_controller,
@@ -2035,16 +2078,25 @@ impl X8664arch {
 
             let con: Arc<Mutex<dyn BusDevice>> = match debugcon_jail.as_ref() {
                 #[cfg(unix)]
-                Some(jail) => Arc::new(Mutex::new(
-                    ProxyDevice::new(
-                        con,
-                        jail.try_clone().map_err(Error::CloneJail)?,
-                        preserved_fds,
-                        #[cfg(feature = "swap")]
-                        swap_controller,
-                    )
-                    .map_err(Error::CreateProxyDevice)?,
-                )),
+                Some(jail) => {
+                    let jail_clone = jail.try_clone().map_err(Error::CloneJail)?;
+                    #[cfg(feature = "seccomp_trace")]
+                    debug!(
+                        "seccomp_trace {{\"event\": \"minijail_clone\", \"src_jail_addr\": \"0x{:x}\", \"dst_jail_addr\": \"0x{:x}\"}}",
+                        read_jail_addr(jail),
+                        read_jail_addr(&jail_clone)
+                    );
+                    Arc::new(Mutex::new(
+                        ProxyDevice::new(
+                            con,
+                            jail_clone,
+                            preserved_fds,
+                            #[cfg(feature = "swap")]
+                            swap_controller,
+                        )
+                        .map_err(Error::CreateProxyDevice)?,
+                    ))
+                }
                 #[cfg(windows)]
                 Some(_) => unreachable!(),
                 None => Arc::new(Mutex::new(con)),
@@ -2187,9 +2239,9 @@ pub fn check_host_hybrid_support(cpuid: &CpuIdCall) -> std::result::Result<(), H
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::mem::size_of;
+
+    use super::*;
 
     const TEST_MEMORY_SIZE: u64 = 2 * GB;
 
@@ -2315,18 +2367,19 @@ mod tests {
     fn write_setup_data_empty() {
         let mem = GuestMemory::new(&[(GuestAddress(0), 0x2_0000)]).unwrap();
         let setup_data = [];
-        let mut free_addr = 0x1000;
-        let setup_data_addr =
-            write_setup_data(&mem, &mut free_addr, &setup_data).expect("write_setup_data");
+        let setup_data_addr = write_setup_data(
+            &mem,
+            GuestAddress(0x1000),
+            GuestAddress(0x2000),
+            &setup_data,
+        )
+        .expect("write_setup_data");
         assert_eq!(setup_data_addr, None);
-        assert_eq!(free_addr, 0x1000);
     }
 
     #[test]
     fn write_setup_data_two_of_them() {
         let mem = GuestMemory::new(&[(GuestAddress(0), 0x2_0000)]).unwrap();
-
-        let mut free_addr = 0x1000;
 
         let entry1_addr = GuestAddress(0x1000);
         let entry1_next_addr = entry1_addr;
@@ -2341,9 +2394,6 @@ mod tests {
         let entry2_len_addr = entry2_addr.checked_add(12).unwrap();
         let entry2_data_addr = entry2_addr.checked_add(16).unwrap();
         let entry2_data = [0xAAu8; 9];
-        let entry2_size = (size_of::<setup_data_hdr>() + entry2_data.len()) as u64;
-
-        let next_free_addr = entry2_addr.checked_add(entry2_size).unwrap();
 
         let setup_data = [
             SetupData {
@@ -2356,10 +2406,14 @@ mod tests {
             },
         ];
 
-        let setup_data_head_addr =
-            write_setup_data(&mem, &mut free_addr, &setup_data).expect("write_setup_data");
+        let setup_data_head_addr = write_setup_data(
+            &mem,
+            GuestAddress(0x1000),
+            GuestAddress(0x2000),
+            &setup_data,
+        )
+        .expect("write_setup_data");
         assert_eq!(setup_data_head_addr, Some(entry1_addr));
-        assert_eq!(free_addr, next_free_addr.offset());
 
         assert_eq!(
             mem.read_obj_from_addr::<u64>(entry1_next_addr).unwrap(),

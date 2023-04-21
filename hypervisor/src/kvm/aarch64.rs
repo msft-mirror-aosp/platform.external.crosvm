@@ -6,6 +6,7 @@
 // taking u32/64 parameters. So on 32 bit platforms we may have needless casts.
 #![allow(clippy::useless_conversion)]
 
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
 use base::errno_result;
@@ -16,6 +17,7 @@ use base::ioctl_with_val;
 use base::warn;
 use base::Error;
 use base::Result;
+use cros_fdt::FdtWriter;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
 #[cfg(feature = "gdb")]
@@ -206,6 +208,23 @@ impl VmAArch64 for KvmVm {
         // or VcpuX86.  But both use the same implementation in KvmVm::create_kvm_vcpu.
         Ok(Box::new(self.create_kvm_vcpu(id)?))
     }
+
+    fn create_fdt(
+        &self,
+        _fdt: &mut FdtWriter,
+        _phandles: &BTreeMap<&str, u32>,
+    ) -> cros_fdt::Result<()> {
+        Ok(())
+    }
+
+    fn init_arch(
+        &self,
+        _payload_entry_address: GuestAddress,
+        _fdt_address: GuestAddress,
+        _fdt_size: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl KvmVcpu {
@@ -220,7 +239,7 @@ impl KvmVcpu {
     /// `event_flags` should be one or more of the `KVM_SYSTEM_EVENT_RESET_FLAG_*` values defined by
     /// KVM.
     pub fn system_event_reset(&self, event_flags: u64) -> Result<VcpuExit> {
-        if event_flags & KVM_SYSTEM_EVENT_RESET_FLAG_PSCI_RESET2 != 0 {
+        if event_flags & u64::from(KVM_SYSTEM_EVENT_RESET_FLAG_PSCI_RESET2) != 0 {
             // Read reset_type and cookie from x1 and x2.
             let reset_type = self.get_one_reg(VcpuRegAArch64::X(1))?;
             let cookie = self.get_one_reg(VcpuRegAArch64::X(2))?;

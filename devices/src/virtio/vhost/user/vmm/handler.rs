@@ -6,7 +6,6 @@ mod sys;
 mod worker;
 
 use std::sync::Mutex;
-use std::thread;
 
 use base::error;
 use base::info;
@@ -14,9 +13,11 @@ use base::AsRawDescriptor;
 use base::Event;
 use base::Protection;
 use base::SafeDescriptor;
+use base::WorkerThread;
 use rutabaga_gfx::DeviceId;
 use vm_control::VmMemorySource;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionInformation;
 use vmm_vhost::message::VhostUserConfigFlags;
 use vmm_vhost::message::VhostUserGpuMapMsg;
 use vmm_vhost::message::VhostUserProtocolFeatures;
@@ -176,13 +177,20 @@ impl VhostUserHandler {
     pub fn set_mem_table(&mut self, mem: &GuestMemory) -> Result<()> {
         let mut regions: Vec<VhostUserMemoryRegionInfo> = Vec::new();
         mem.with_regions::<_, ()>(
-            |_idx, guest_phys_addr, memory_size, userspace_addr, mmap, mmap_offset| {
+            |MemoryRegionInformation {
+                 guest_addr,
+                 size,
+                 host_addr,
+                 shm,
+                 shm_offset,
+                 ..
+             }| {
                 let region = VhostUserMemoryRegionInfo {
-                    guest_phys_addr: guest_phys_addr.0,
-                    memory_size: memory_size as u64,
-                    userspace_addr: userspace_addr as u64,
-                    mmap_offset,
-                    mmap_handle: mmap.as_raw_descriptor(),
+                    guest_phys_addr: guest_addr.0,
+                    memory_size: size as u64,
+                    userspace_addr: host_addr as u64,
+                    mmap_offset: shm_offset as u64,
+                    mmap_handle: shm.as_raw_descriptor(),
                 };
                 regions.push(region);
                 Ok(())
@@ -253,7 +261,7 @@ impl VhostUserHandler {
         interrupt: Interrupt,
         queues: Vec<(Queue, Event)>,
         label: &str,
-    ) -> Result<(thread::JoinHandle<()>, Event)> {
+    ) -> Result<WorkerThread<()>> {
         self.set_mem_table(&mem)?;
 
         let msix_config_opt = interrupt
@@ -273,8 +281,6 @@ impl VhostUserHandler {
         drop(msix_config);
 
         let label = format!("vhost_user_virtio_{}", label);
-        let kill_evt = Event::new().map_err(Error::CreateEvent)?;
-        let self_kill_evt = kill_evt.try_clone().map_err(Error::CreateEvent)?;
 
         let backend_req_handler = self.backend_req_handler.take();
         if let Some(handler) = &backend_req_handler {
@@ -286,23 +292,19 @@ impl VhostUserHandler {
                 .set_interrupt(interrupt.clone());
         }
 
-        thread::Builder::new()
-            .name(label.clone())
-            .spawn(move || {
-                let mut worker = worker::Worker {
-                    queues,
-                    mem,
-                    kill_evt,
-                    non_msix_evt,
-                    backend_req_handler,
-                };
+        Ok(WorkerThread::start(label.clone(), move |kill_evt| {
+            let mut worker = worker::Worker {
+                queues,
+                mem,
+                kill_evt,
+                non_msix_evt,
+                backend_req_handler,
+            };
 
-                if let Err(e) = worker.run(interrupt) {
-                    error!("failed to start {} worker: {}", label, e);
-                }
-            })
-            .map(|worker_result| (worker_result, self_kill_evt))
-            .map_err(Error::SpawnWorker)
+            if let Err(e) = worker.run(interrupt) {
+                error!("failed to start {} worker: {}", label, e);
+            }
+        }))
     }
 
     /// Deactivates all vrings.

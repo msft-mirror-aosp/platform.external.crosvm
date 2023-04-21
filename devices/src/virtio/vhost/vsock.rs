@@ -4,8 +4,6 @@
 
 use std::fs::OpenOptions;
 use std::os::unix::prelude::OpenOptionsExt;
-use std::path::PathBuf;
-use std::thread;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -15,8 +13,8 @@ use base::warn;
 use base::AsRawDescriptor;
 use base::Event;
 use base::RawDescriptor;
+use base::WorkerThread;
 use data_model::Le64;
-use serde::Deserialize;
 use vhost::Vhost;
 use vhost::Vsock as VhostVsockHandle;
 use vm_memory::GuestMemory;
@@ -28,24 +26,15 @@ use super::Result;
 use crate::virtio::copy_config;
 use crate::virtio::device_constants::vsock::NUM_QUEUES;
 use crate::virtio::device_constants::vsock::QUEUE_SIZES;
+use crate::virtio::vsock::VsockConfig;
 use crate::virtio::DeviceType;
 use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 use crate::virtio::VirtioDevice;
 use crate::Suspendable;
 
-static VHOST_VSOCK_DEFAULT_PATH: &str = "/dev/vhost-vsock";
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct VhostVsockConfig {
-    pub device: Option<PathBuf>,
-    pub cid: u64,
-}
-
 pub struct Vsock {
-    worker_kill_evt: Option<Event>,
-    kill_evt: Option<Event>,
+    worker_thread: Option<WorkerThread<()>>,
     vhost_handle: Option<VhostVsockHandle>,
     cid: u64,
     interrupts: Option<Vec<Event>>,
@@ -55,14 +44,9 @@ pub struct Vsock {
 
 impl Vsock {
     /// Create a new virtio-vsock device with the given VM cid.
-    pub fn new(base_features: u64, vhost_config: &VhostVsockConfig) -> anyhow::Result<Vsock> {
-        let vhost_vsock_device_default = PathBuf::from(VHOST_VSOCK_DEFAULT_PATH);
-        let vhost_vsock_device = vhost_config
-            .device
-            .as_ref()
-            .unwrap_or(&vhost_vsock_device_default);
+    pub fn new(base_features: u64, vsock_config: &VsockConfig) -> anyhow::Result<Vsock> {
         let device_file = open_file(
-            vhost_vsock_device,
+            &vsock_config.vhost_device,
             OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -71,11 +55,10 @@ impl Vsock {
         .with_context(|| {
             format!(
                 "failed to open virtual socket device {}",
-                vhost_vsock_device.display(),
+                vsock_config.vhost_device.display(),
             )
         })?;
 
-        let kill_evt = Event::new().map_err(Error::CreateKillEvent)?;
         let handle = VhostVsockHandle::new(device_file);
 
         let avail_features = base_features;
@@ -86,10 +69,9 @@ impl Vsock {
         }
 
         Ok(Vsock {
-            worker_kill_evt: Some(kill_evt.try_clone().map_err(Error::CloneKillEvent)?),
-            kill_evt: Some(kill_evt),
+            worker_thread: None,
             vhost_handle: Some(handle),
-            cid: vhost_config.cid,
+            cid: vsock_config.cid,
             interrupts: Some(interrupts),
             avail_features,
             acked_features: 0,
@@ -98,8 +80,7 @@ impl Vsock {
 
     pub fn new_for_testing(cid: u64, features: u64) -> Vsock {
         Vsock {
-            worker_kill_evt: None,
-            kill_evt: None,
+            worker_thread: None,
             vhost_handle: None,
             cid,
             interrupts: None,
@@ -110,18 +91,6 @@ impl Vsock {
 
     pub fn acked_features(&self) -> u64 {
         self.acked_features
-    }
-}
-
-impl Drop for Vsock {
-    fn drop(&mut self) {
-        // Only kill the child if it claimed its event.
-        if self.worker_kill_evt.is_none() {
-            if let Some(kill_evt) = &self.kill_evt {
-                // Ignore the result because there is nothing we can do about it.
-                let _ = kill_evt.signal();
-            }
-        }
     }
 }
 
@@ -137,10 +106,6 @@ impl VirtioDevice for Vsock {
             for vhost_int in interrupt.iter() {
                 keep_rds.push(vhost_int.as_raw_descriptor());
             }
-        }
-
-        if let Some(worker_kill_evt) = &self.worker_kill_evt {
-            keep_rds.push(worker_kill_evt.as_raw_descriptor());
         }
 
         keep_rds
@@ -193,7 +158,6 @@ impl VirtioDevice for Vsock {
 
         let vhost_handle = self.vhost_handle.take().context("missing vhost_handle")?;
         let interrupts = self.interrupts.take().context("missing interrupts")?;
-        let kill_evt = self.worker_kill_evt.take().context("missing kill_evt")?;
         let acked_features = self.acked_features;
         let cid = self.cid;
         // The third vq is an event-only vq that is not handled by the vhost
@@ -205,7 +169,6 @@ impl VirtioDevice for Vsock {
             interrupts,
             interrupt,
             acked_features,
-            kill_evt,
             None,
             self.supports_iommu(),
         );
@@ -217,16 +180,15 @@ impl VirtioDevice for Vsock {
         worker
             .init(mem, QUEUE_SIZES, activate_vqs)
             .context("vsock worker init exited with error")?;
-        thread::Builder::new()
-            .name("vhost_vsock".to_string())
-            .spawn(move || {
-                let cleanup_vqs = |_handle: &VhostVsockHandle| -> Result<()> { Ok(()) };
-                let result = worker.run(cleanup_vqs);
-                if let Err(e) = result {
-                    error!("vsock worker thread exited with error: {:?}", e);
-                }
-            })
-            .context("failed to spawn vhost_vsock worker")?;
+
+        self.worker_thread = Some(WorkerThread::start("vhost_vsock", move |kill_evt| {
+            let cleanup_vqs = |_handle: &VhostVsockHandle| -> Result<()> { Ok(()) };
+            let result = worker.run(cleanup_vqs, kill_evt);
+            if let Err(e) = result {
+                error!("vsock worker thread exited with error: {:?}", e);
+            }
+        }));
+
         Ok(())
     }
 
@@ -248,9 +210,6 @@ impl Suspendable for Vsock {}
 #[cfg(test)]
 mod tests {
     use std::convert::TryInto;
-    use std::result::Result;
-
-    use serde_keyvalue::*;
 
     use super::*;
 
@@ -324,83 +283,5 @@ mod tests {
 
         let vsock = Vsock::new_for_testing(cid, features);
         assert_eq!(features, vsock.features());
-    }
-
-    fn from_vsock_arg(options: &str) -> Result<VhostVsockConfig, ParseError> {
-        from_key_values(options)
-    }
-
-    #[test]
-    fn params_from_key_values() {
-        // Path device
-        let params = from_vsock_arg("device=/some/path,cid=56").unwrap();
-        assert_eq!(
-            params,
-            VhostVsockConfig {
-                device: Some("/some/path".into()),
-                cid: 56,
-            }
-        );
-        // No key for path device
-        let params = from_vsock_arg("/some/path,cid=56").unwrap();
-        assert_eq!(
-            params,
-            VhostVsockConfig {
-                device: Some("/some/path".into()),
-                cid: 56,
-            }
-        );
-        // Default device
-        let params = from_vsock_arg("cid=56").unwrap();
-        assert_eq!(
-            params,
-            VhostVsockConfig {
-                device: None,
-                cid: 56,
-            }
-        );
-
-        // No argument
-        assert_eq!(
-            from_vsock_arg("").unwrap_err(),
-            ParseError {
-                kind: ErrorKind::SerdeError("missing field `cid`".into()),
-                pos: 0
-            }
-        );
-        // Missing cid
-        assert_eq!(
-            from_vsock_arg("device=42").unwrap_err(),
-            ParseError {
-                kind: ErrorKind::SerdeError("missing field `cid`".into()),
-                pos: 0,
-            }
-        );
-        // Cid passed twice
-        assert_eq!(
-            from_vsock_arg("cid=42,cid=56").unwrap_err(),
-            ParseError {
-                kind: ErrorKind::SerdeError("duplicate field `cid`".into()),
-                pos: 0,
-            }
-        );
-        // Device passed twice
-        assert_eq!(
-            from_vsock_arg("cid=56,device=42,device=/some/path").unwrap_err(),
-            ParseError {
-                kind: ErrorKind::SerdeError("duplicate field `device`".into()),
-                pos: 0,
-            }
-        );
-        // Invalid argument
-        assert_eq!(
-            from_vsock_arg("invalid=foo").unwrap_err(),
-            ParseError {
-                kind: ErrorKind::SerdeError(
-                    "unknown field `invalid`, expected `device` or `cid`".into()
-                ),
-                pos: 0,
-            }
-        );
     }
 }

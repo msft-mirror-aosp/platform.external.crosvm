@@ -6,7 +6,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::thread;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -15,12 +14,13 @@ use base::AsRawDescriptor;
 use base::Event;
 use base::FileSync;
 use base::RawDescriptor;
+use base::WorkerThread;
 use cros_async::select2;
 use cros_async::AsyncResult;
 use cros_async::EventAsync;
 use cros_async::Executor;
 use cros_async::IntoAsync;
-use cros_async::IoSourceExt;
+use cros_async::IoSource;
 use futures::FutureExt;
 use hypervisor::ProtectionType;
 use vm_memory::GuestMemory;
@@ -77,7 +77,7 @@ async fn run_rx_queue<I: SignalableInterrupt>(
     mem: GuestMemory,
     doorbell: I,
     kick_evt: EventAsync,
-    input: &dyn IoSourceExt<AsyncSerialInput>,
+    input: &IoSource<AsyncSerialInput>,
 ) {
     // Staging buffer, required because of `handle_input`'s API. We can probably remove this once
     // the regular virtio device is switched to async.
@@ -149,8 +149,7 @@ impl ConsoleDevice {
 
             Ok(async move {
                 select2(
-                    run_rx_queue(queue, mem, doorbell, kick_evt, async_input.as_ref())
-                        .boxed_local(),
+                    run_rx_queue(queue, mem, doorbell, kick_evt, &async_input).boxed_local(),
                     abort,
                 )
                 .await;
@@ -223,10 +222,7 @@ impl SerialDevice for ConsoleDevice {
 
 enum VirtioConsoleState {
     Stopped(ConsoleDevice),
-    Running {
-        kill_evt: Event,
-        worker_thread: thread::JoinHandle<anyhow::Result<ConsoleDevice>>,
-    },
+    Running(WorkerThread<anyhow::Result<ConsoleDevice>>),
     Broken,
 }
 
@@ -260,12 +256,6 @@ impl SerialDevice for AsyncConsole {
             base_features: base_features(protection_type),
             keep_rds,
         }
-    }
-}
-
-impl Drop for AsyncConsole {
-    fn drop(&mut self) {
-        let _ = self.reset();
     }
 }
 
@@ -320,17 +310,12 @@ impl VirtioDevice for AsyncConsole {
             }
         };
 
-        let (self_kill_evt, kill_evt) = Event::new()
-            .and_then(|e| Ok((e.try_clone()?, e)))
-            .context("failed creating kill Event pair")?;
-
         let ex = Executor::new().expect("failed to create an executor");
         let (receive_queue, receive_evt) = queues.remove(0);
         let (transmit_queue, transmit_evt) = queues.remove(0);
 
-        let worker_thread = thread::Builder::new()
-            .name("v_console".to_string())
-            .spawn(move || {
+        self.state =
+            VirtioConsoleState::Running(WorkerThread::start("v_console", move |kill_evt| {
                 let mut console = console;
 
                 console.start_receive_queue(
@@ -353,13 +338,7 @@ impl VirtioDevice for AsyncConsole {
 
                     Ok(console)
                 })?
-            })
-            .context("failed to spawn virtio_console worker")?;
-
-        self.state = VirtioConsoleState::Running {
-            kill_evt: self_kill_evt,
-            worker_thread,
-        };
+            }));
 
         Ok(())
     }
@@ -372,36 +351,19 @@ impl VirtioDevice for AsyncConsole {
                 true
             }
             // Stop the worker thread and go back to `Stopped` state.
-            VirtioConsoleState::Running {
-                kill_evt,
-                worker_thread,
-            } => match kill_evt.signal() {
-                Ok(_) => {
-                    let thread_res = match worker_thread.join() {
-                        Ok(thread_res) => thread_res,
-                        Err(_) => {
-                            error!("worker thread has panicked");
-                            return false;
-                        }
-                    };
-
-                    match thread_res {
-                        Ok(console) => {
-                            self.state = VirtioConsoleState::Stopped(console);
-                            true
-                        }
-                        Err(e) => {
-                            error!("worker thread returned an error: {}", e);
-                            false
-                        }
+            VirtioConsoleState::Running(worker_thread) => {
+                let thread_res = worker_thread.stop();
+                match thread_res {
+                    Ok(console) => {
+                        self.state = VirtioConsoleState::Stopped(console);
+                        true
+                    }
+                    Err(e) => {
+                        error!("worker thread returned an error: {}", e);
+                        false
                     }
                 }
-                Err(e) => {
-                    error!("error while requesting worker thread to stop: {}", e);
-                    error!("the worker thread will keep running");
-                    false
-                }
-            },
+            }
             // We are broken and cannot reset properly.
             VirtioConsoleState::Broken => false,
         }

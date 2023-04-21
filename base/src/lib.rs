@@ -142,8 +142,6 @@ pub use log::trace;
 pub use log::warn;
 pub use mmap::Protection;
 pub use platform::deserialize_with_descriptors;
-pub(crate) use platform::file_punch_hole;
-pub(crate) use platform::file_write_zeroes_at;
 pub use platform::get_cpu_affinity;
 pub use platform::get_filesystem_type;
 pub use platform::getpid;
@@ -182,7 +180,7 @@ pub trait EnabledHighResTimer {}
 pub fn generate_uuid() -> String {
     let mut buf = Uuid::encode_buffer();
     Uuid::new_v4()
-        .to_hyphenated()
+        .as_hyphenated()
         .encode_lower(&mut buf)
         .to_owned()
 }

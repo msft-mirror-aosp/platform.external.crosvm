@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use audio_streams::AsyncPlaybackBufferStream;
 use audio_streams::StreamSource;
 use audio_streams::StreamSourceGenerator;
+#[cfg(feature = "audio_cras")]
+use base::error;
 use base::set_rt_prio_limit;
 use base::set_rt_round_robin;
 use base::warn;
@@ -13,6 +15,10 @@ use cros_async::Executor;
 use futures::channel::mpsc::UnboundedSender;
 #[cfg(feature = "audio_cras")]
 use libcras::CrasStreamSourceGenerator;
+#[cfg(feature = "audio_cras")]
+use libcras::CrasStreamType;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::virtio::common_backend::PcmResponse;
 use crate::virtio::snd::common_backend::async_funcs::PlaybackBufferWriter;
@@ -38,10 +44,20 @@ pub(crate) struct SysAsyncStreamObjects {
     pub(crate) pcm_sender: UnboundedSender<PcmResponse>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum StreamSourceBackend {
     #[cfg(feature = "audio_cras")]
     CRAS,
+}
+
+// Implemented to make backend serialization possible, since we deserialize from str.
+impl From<StreamSourceBackend> for String {
+    fn from(backend: StreamSourceBackend) -> Self {
+        match backend {
+            #[cfg(feature = "audio_cras")]
+            StreamSourceBackend::CRAS => "cras".to_owned(),
+        }
+    }
 }
 
 impl TryFrom<&str> for StreamSourceBackend {
@@ -61,14 +77,22 @@ pub(crate) fn create_cras_stream_source_generators(
     params: &Parameters,
     snd_data: &SndData,
 ) -> Vec<Box<dyn StreamSourceGenerator>> {
-    let mut generators: Vec<Box<dyn StreamSourceGenerator>> = Vec::new();
-    generators.resize_with(snd_data.pcm_info_len(), || {
-        Box::new(CrasStreamSourceGenerator::new(
+    let mut generators: Vec<Box<dyn StreamSourceGenerator>> =
+        Vec::with_capacity(snd_data.pcm_info_len());
+    for pcm_info in snd_data.pcm_info_iter() {
+        let device_params = params.get_device_params(pcm_info).unwrap_or_else(|err| {
+            error!("Create cras stream source generator error: {}", err);
+            Default::default()
+        });
+        generators.push(Box::new(CrasStreamSourceGenerator::with_stream_type(
             params.capture,
-            params.client_type,
+            device_params.client_type.unwrap_or(params.client_type),
             params.socket_type,
-        ))
-    });
+            device_params
+                .stream_type
+                .unwrap_or(CrasStreamType::CRAS_STREAM_TYPE_DEFAULT),
+        )));
+    }
     generators
 }
 

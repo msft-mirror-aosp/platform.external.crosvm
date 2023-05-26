@@ -53,7 +53,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::result;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -86,6 +85,7 @@ use base::SharedMemoryUnix;
 use base::Tube;
 use base::TubeError;
 use base::WaitContext;
+use base::WorkerThread;
 use data_model::*;
 #[cfg(feature = "minigbm")]
 use libc::EBADF;
@@ -102,11 +102,15 @@ use rutabaga_gfx::ImageAllocationInfo;
 #[cfg(feature = "minigbm")]
 use rutabaga_gfx::ImageMemoryRequirements;
 #[cfg(feature = "minigbm")]
+use rutabaga_gfx::RutabagaDescriptor;
+#[cfg(feature = "minigbm")]
 use rutabaga_gfx::RutabagaError;
 #[cfg(feature = "minigbm")]
 use rutabaga_gfx::RutabagaGralloc;
 #[cfg(feature = "minigbm")]
 use rutabaga_gfx::RutabagaGrallocFlags;
+#[cfg(feature = "minigbm")]
+use rutabaga_gfx::RutabagaIntoRawDescriptor;
 use thiserror::Error as ThisError;
 use vm_control::VmMemorySource;
 use vm_memory::GuestAddress;
@@ -435,6 +439,13 @@ struct VmRequester {
     state: Rc<RefCell<VmRequesterState>>,
 }
 
+// The following are wrappers to avoid base dependencies in the rutabaga crate
+#[cfg(feature = "minigbm")]
+fn to_safe_descriptor(r: RutabagaDescriptor) -> SafeDescriptor {
+    // Safe because we own the SafeDescriptor at this point.
+    unsafe { SafeDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
+}
+
 impl VmRequester {
     fn new(
         mapper: Box<dyn SharedMemoryMapper>,
@@ -507,15 +518,15 @@ impl VmRequester {
             .map_err(WlError::GrallocError)?;
         drop(state);
 
+        let safe_descriptor = to_safe_descriptor(handle.os_handle);
         self.register_memory(
-            handle
-                .os_handle
+            safe_descriptor
                 .try_clone()
                 .context("failed to dup gfx handle")
                 .map_err(WlError::ShmemMapperError)?,
             reqs.size,
         )
-        .map(|info| (info, handle.os_handle, reqs))
+        .map(|info| (info, safe_descriptor, reqs))
     }
 
     fn register_shmem(&self, shm: &SharedMemory) -> WlResult<u64> {
@@ -1910,8 +1921,7 @@ impl Worker {
 }
 
 pub struct Wl {
-    kill_evt: Option<Event>,
-    worker_thread: Option<thread::JoinHandle<anyhow::Result<VirtioDeviceSaved>>>,
+    worker_thread: Option<WorkerThread<anyhow::Result<VirtioDeviceSaved>>>,
     wayland_paths: Map<String, PathBuf>,
     mapper: Option<Box<dyn SharedMemoryMapper>>,
     resource_bridge: Option<Tube>,
@@ -1931,7 +1941,6 @@ impl Wl {
         resource_bridge: Option<Tube>,
     ) -> Result<Wl> {
         Ok(Wl {
-            kill_evt: None,
             worker_thread: None,
             wayland_paths,
             mapper: None,
@@ -1944,14 +1953,6 @@ impl Wl {
             gralloc: None,
             address_offset: None,
         })
-    }
-}
-
-impl Drop for Wl {
-    fn drop(&mut self) {
-        if let Err(e) = self.stop() {
-            error!("{}", e);
-        }
     }
 }
 
@@ -2023,11 +2024,6 @@ impl VirtioDevice for Wl {
             ));
         }
 
-        let (self_kill_evt, kill_evt) = Event::new()
-            .and_then(|e| Ok((e.try_clone()?, e)))
-            .context("failed creating kill Event pair")?;
-        self.kill_evt = Some(self_kill_evt);
-
         let mapper = self.mapper.take().context("missing mapper")?;
 
         let wayland_paths = self.wayland_paths.clone();
@@ -2044,28 +2040,25 @@ impl VirtioDevice for Wl {
         } else {
             None
         };
-        let worker_thread = thread::Builder::new()
-            .name("v_wl".to_string())
-            .spawn(move || {
-                Worker::new(
-                    mem,
-                    interrupt,
-                    queues.remove(0),
-                    queues.remove(0),
-                    wayland_paths,
-                    mapper,
-                    use_transition_flags,
-                    use_send_vfd_v2,
-                    resource_bridge,
-                    #[cfg(feature = "minigbm")]
-                    gralloc,
-                    address_offset,
-                )
-                .run(kill_evt)
-            })
-            .context("failed to spawn virtio_wl worker")?;
 
-        self.worker_thread = Some(worker_thread);
+        self.worker_thread = Some(WorkerThread::start("v_wl", move |kill_evt| {
+            Worker::new(
+                mem,
+                interrupt,
+                queues.remove(0),
+                queues.remove(0),
+                wayland_paths,
+                mapper,
+                use_transition_flags,
+                use_send_vfd_v2,
+                resource_bridge,
+                #[cfg(feature = "minigbm")]
+                gralloc,
+                address_offset,
+            )
+            .run(kill_evt)
+        }));
+
         Ok(())
     }
 
@@ -2085,17 +2078,8 @@ impl VirtioDevice for Wl {
     }
 
     fn stop(&mut self) -> std::result::Result<Option<VirtioDeviceSaved>, VirtioError> {
-        if let Some(kill_evt) = self.kill_evt.take() {
-            if let Err(e) = kill_evt.signal() {
-                return Err(VirtioError::KillEventFailure(e));
-            }
-        }
-
         if let Some(worker_thread) = self.worker_thread.take() {
-            let state = (worker_thread
-                .join()
-                .map_err(|e| VirtioError::ThreadJoinFailure(format!("{:?}", e)))?)
-            .map_err(VirtioError::InThreadFailure)?;
+            let state = worker_thread.stop().map_err(VirtioError::InThreadFailure)?;
             return Ok(Some(state));
         }
         Ok(None)

@@ -68,6 +68,15 @@ macro_rules! syscall_bail {
     };
 }
 
+#[macro_export]
+macro_rules! fail_if_zero {
+    ($syscall:expr) => {
+        if $syscall == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    };
+}
+
 /// Returns the lower 32 bits of a u64 as a u32 (c_ulong/DWORD)
 pub fn get_low_order(number: u64) -> c_ulong {
     (number & (u32::max_value() as u64)) as c_ulong
@@ -334,6 +343,9 @@ pub enum ProcessType {
     Net = 4,
     Slirp = 5,
     Gpu = 6,
+    Snd = 7,
+    Broker = 8,
+    Spu = 9,
 }
 
 #[cfg(test)]

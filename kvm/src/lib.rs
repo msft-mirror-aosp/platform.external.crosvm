@@ -85,6 +85,7 @@ use libc::O_RDWR;
 use sync::Mutex;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionInformation;
 
 pub use crate::cap::*;
 
@@ -348,20 +349,28 @@ impl Vm {
         if ret >= 0 {
             // Safe because we verify the value of ret and we are the owners of the fd.
             let vm_file = unsafe { File::from_raw_descriptor(ret) };
-            guest_mem.with_regions(|index, guest_addr, size, host_addr, _, _| {
-                unsafe {
-                    // Safe because the guest regions are guaranteed not to overlap.
-                    set_user_memory_region(
-                        &vm_file,
-                        index as u32,
-                        false,
-                        false,
-                        guest_addr.offset() as u64,
-                        size as u64,
-                        host_addr as *mut u8,
-                    )
-                }
-            })?;
+            guest_mem.with_regions(
+                |MemoryRegionInformation {
+                     index,
+                     guest_addr,
+                     size,
+                     host_addr,
+                     ..
+                 }| {
+                    unsafe {
+                        // Safe because the guest regions are guaranteed not to overlap.
+                        set_user_memory_region(
+                            &vm_file,
+                            index as u32,
+                            false,
+                            false,
+                            guest_addr.offset() as u64,
+                            size as u64,
+                            host_addr as *mut u8,
+                        )
+                    }
+                },
+            )?;
 
             Ok(Vm {
                 vm: vm_file,
@@ -1693,7 +1702,8 @@ impl RunnableVcpu {
                     // Safe because we know the exit reason told us this union
                     // field is valid
                     let event_type = unsafe { run.__bindgen_anon_1.system_event.type_ };
-                    let event_flags = unsafe { run.__bindgen_anon_1.system_event.flags };
+                    let event_flags =
+                        unsafe { run.__bindgen_anon_1.system_event.__bindgen_anon_1.flags };
                     Ok(VcpuExit::SystemEvent(event_type, event_flags))
                 }
                 r => panic!("unknown kvm exit reason: {}", r),

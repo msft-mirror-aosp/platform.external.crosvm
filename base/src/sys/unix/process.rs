@@ -11,6 +11,8 @@ use std::mem::ManuallyDrop;
 use std::os::unix::process::ExitStatusExt;
 use std::process;
 
+#[cfg(feature = "seccomp_trace")]
+use log::debug;
 use log::warn;
 use minijail::Minijail;
 
@@ -26,11 +28,11 @@ pub struct Child {
 }
 
 impl Child {
-    /// wait for the child process exit using `waitpid(2)`.
+    /// Wait for the child process exit using `waitpid(2)`.
     pub fn wait(self) -> crate::Result<u8> {
-        let (_, status) = wait_for_pid(self.pid, 0)?;
-        // suppress warning from the drop().
-        let _ = ManuallyDrop::new(self);
+        // Suppress warning from the drop().
+        let pid = self.into_pid();
+        let (_, status) = wait_for_pid(pid, 0)?;
         if let Some(exit_code) = status.code() {
             Ok(exit_code as u8)
         } else if let Some(signal) = status.signal() {
@@ -44,6 +46,20 @@ impl Child {
         } else {
             unreachable!("waitpid with option 0 only waits for exited and signaled status");
         }
+    }
+
+    /// Convert [Child] into [Pid].
+    ///
+    /// If [Child] is dropped without `Child::wait()`, it logs warning message. Users who wait
+    /// processes in other ways should suppress the warning by unwrapping [Child] into [Pid].
+    ///
+    /// The caller of this method now owns the process and is responsible for managing the
+    /// termination of the process.
+    pub fn into_pid(self) -> Pid {
+        let pid = self.pid;
+        // Suppress warning from the drop().
+        let _ = ManuallyDrop::new(self);
+        pid
     }
 }
 
@@ -80,7 +96,9 @@ where
     keep_rds.sort_unstable();
     keep_rds.dedup();
 
-    // safe because the program is still single threaded.
+    let tz = std::env::var("TZ").unwrap_or_default();
+
+    // Safe because the program is still single threaded.
     // We own the jail object and nobody else will try to reuse it.
     let pid = match unsafe { jail.fork(Some(&keep_rds)) }? {
         0 => {
@@ -101,7 +119,7 @@ where
                     [..std::cmp::min(MAX_THREAD_LABEL_LEN, debug_label.len())];
                 match CString::new(debug_label_trimmed) {
                     Ok(thread_name) => {
-                        // safe because thread_name is a valid pointer and setting name of this
+                        // Safe because thread_name is a valid pointer and setting name of this
                         // thread should be safe.
                         let _ = unsafe {
                             libc::pthread_setname_np(libc::pthread_self(), thread_name.as_ptr())
@@ -113,11 +131,27 @@ where
                 }
             }
 
+            // Preserve TZ for `chrono::Local` (b/257987535).
+            std::env::set_var("TZ", tz);
+
             post_fork_cb();
             // ! Never returns
             process::exit(0);
         }
         pid => pid,
     };
+    #[cfg(feature = "seccomp_trace")]
+    debug!(
+            // Proxy and swap devices fork here
+            "seccomp_trace {{\"event\": \"minijail_fork\", \"pid\": \"{}\", \"name\": \"{}\", \"jail_addr\": \"0x{:x}\"}}",
+            pid,
+            match debug_label {
+                Some(debug_label) => debug_label,
+                None => "process.rs: no debug label".to_owned(),
+            },
+            // Can't use safe wrapper because jail crate depends on base
+            // Safe because it's only doing a read within bound checked by static assert
+            unsafe {*(&jail as *const Minijail as *const usize)}
+        );
     Ok(Child { pid })
 }

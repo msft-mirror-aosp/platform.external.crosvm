@@ -3,6 +3,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+import copy
 import os
 from pathlib import Path
 import sys
@@ -22,14 +23,9 @@ from impl.common import (
     run_main,
     sudo_is_passwordless,
     verbose,
+    Triple,
 )
-from impl.test_target import Triple
-from impl.test_config import (
-    ROOT_TESTS,
-    DO_NOT_RUN,
-    DO_NOT_RUN_AARCH64,
-    DO_NOT_RUN_WIN64,
-)
+from impl.test_config import ROOT_TESTS, DO_NOT_RUN, DO_NOT_RUN_AARCH64, DO_NOT_RUN_WIN64, E2E_TESTS
 from impl import testvm
 
 rsync = cmd("rsync")
@@ -55,6 +51,10 @@ class TestFilter(object):
 
     def exclude(self, *exclude_exprs: str):
         return self.subset(f"not ({join_filters(exclude_exprs, '|')})")
+
+    def include(self, *include_exprs: str):
+        include_expr = join_filters(include_exprs, "|")
+        return TestFilter(f"({self.expression}) | ({include_expr})")
 
     def subset(self, *subset_exprs: str):
         subset_expr = join_filters(subset_exprs, "|")
@@ -119,6 +119,18 @@ def check_host_prerequisites(run_root_tests: bool):
         if not os.access(device, os.R_OK | os.W_OK):
             console.print(f"{device} access is required", style="red")
             sys.exit(1)
+
+
+def check_build_prerequisites(triple: Triple):
+    installed_toolchains = cmd("rustup target list --installed").lines()
+    if str(triple) not in installed_toolchains:
+        console.print(f"Your host is not configured to build for [green]{triple}[/green]")
+        console.print(f"[green]Tip:[/green] Run tests in the dev container with:")
+        console.print()
+        console.print(
+            f"  [blue]$ tools/dev_container tools/run_tests {' '.join(sys.argv[1:])}[/blue]"
+        )
+        sys.exit(1)
 
 
 def get_vm_arch(triple: Triple):
@@ -253,6 +265,8 @@ def main(
     console.print(f"  Integration tests: [bold]{integration_test_str}[/bold]")
     console.print()
 
+    check_build_prerequisites(triple)
+
     # Print tips in certain configurations.
     if dut and not run_root_tests:
         console.print(
@@ -294,6 +308,9 @@ def main(
             sys.exit(returncode)
 
     if not no_unit_tests:
+        unit_test_filter = copy.deepcopy(test_filter)
+        unit_test_filter.include("kind(bench)")
+        unit_test_filter.exclude(*E2E_TESTS)
         console.print()
         console.rule("Running unit tests")
         with record_time("Unit Tests"):
@@ -301,9 +318,9 @@ def main(
                 if repetitions > 1:
                     console.rule(f"Round {i}", style="grey")
 
-                returncode = nextest_run.with_args(
-                    "--lib --bins --benches", *test_filter.to_args()
-                ).fg(style=Styles.live_truncated(), check=False)
+                returncode = nextest_run.with_args("--lib --bins", *unit_test_filter.to_args()).fg(
+                    style=Styles.live_truncated(), check=False
+                )
                 if returncode != 0:
                     sys.exit(returncode)
 

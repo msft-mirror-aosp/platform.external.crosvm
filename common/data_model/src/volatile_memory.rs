@@ -33,6 +33,9 @@ use std::usize;
 
 use remain::sorted;
 use thiserror::Error;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
+use zerocopy::LayoutVerified;
 
 use crate::sys::IoBufMut;
 use crate::DataInit;
@@ -83,8 +86,8 @@ pub trait VolatileMemory {
     fn get_slice(&self, offset: usize, count: usize) -> Result<VolatileSlice>;
 }
 
-/// A slice of raw memory that supports volatile access. Like `std::io::IoBufMut`, this type is
-/// guaranteed to be ABI-compatible with `libc::iovec` but unlike `IoBufMut`, it doesn't
+/// A slice of raw memory that supports volatile access. Like `std::io::IoSliceMut`, this type is
+/// guaranteed to be ABI-compatible with `libc::iovec` but unlike `IoSliceMut`, it doesn't
 /// automatically deref to `&mut [u8]`.
 #[derive(Copy, Clone, Debug)]
 #[repr(transparent)]
@@ -296,16 +299,69 @@ impl<'a> VolatileSlice<'a> {
     /// ```
     pub fn copy_from<T>(&self, buf: &[T])
     where
-        T: DataInit,
+        T: FromBytes + AsBytes,
     {
         let mut addr = self.as_mut_ptr();
-        for &v in buf.iter().take(self.size() / size_of::<T>()) {
+        for v in buf.iter().take(self.size() / size_of::<T>()) {
             unsafe {
-                write_volatile(addr as *mut T, v);
+                write_volatile(
+                    addr as *mut T,
+                    LayoutVerified::<_, T>::new(v.as_bytes()).unwrap().read(),
+                );
                 addr = addr.add(size_of::<T>());
             }
         }
     }
+
+    /// Returns whether all bytes in this slice are zero or not.
+    ///
+    /// This is optimized for [VolatileSlice] aligned with 16 bytes.
+    ///
+    /// TODO(b/274840085): Use SIMD for better performance.
+    pub fn is_all_zero(&self) -> bool {
+        const MASK_4BIT: usize = 0x0f;
+        let head_addr = self.as_ptr() as usize;
+        // Round up by 16
+        let aligned_head_addr = (head_addr + MASK_4BIT) & !MASK_4BIT;
+        let tail_addr = head_addr + self.size();
+        // Round down by 16
+        let aligned_tail_addr = tail_addr & !MASK_4BIT;
+
+        // Check 16 bytes at once. The addresses should be 16 bytes aligned for better performance.
+        // SAFETY: Each aligned_addr is within VolatileSlice
+        if (aligned_head_addr..aligned_tail_addr)
+            .step_by(16)
+            .any(|aligned_addr| unsafe { *(aligned_addr as *const u128) } != 0)
+        {
+            return false;
+        }
+
+        if head_addr == aligned_head_addr && tail_addr == aligned_tail_addr {
+            // If head_addr and tail_addr are aligned, we can skip the unaligned part which contains
+            // at least 2 conditional branches.
+            true
+        } else {
+            // Check unaligned part.
+            // SAFETY: The range [head_addr, aligned_head_addr) and [aligned_tail_addr, tail_addr)
+            // are within VolatileSlice.
+            unsafe {
+                is_all_zero_naive(head_addr, aligned_head_addr)
+                    && is_all_zero_naive(aligned_tail_addr, tail_addr)
+            }
+        }
+    }
+}
+
+/// Check whether every byte is zero.
+///
+/// This checks byte by byte.
+///
+/// ## Safety
+///
+/// * `head_addr` <= `tail_addr`
+/// * Bytes between `head_addr` and `tail_addr` is valid to access.
+unsafe fn is_all_zero_naive(head_addr: usize, tail_addr: usize) -> bool {
+    (head_addr..tail_addr).all(|addr| *(addr as *const u8) == 0)
 }
 
 impl<'a> VolatileMemory for VolatileSlice<'a> {
@@ -313,6 +369,23 @@ impl<'a> VolatileMemory for VolatileSlice<'a> {
         self.sub_slice(offset, count)
     }
 }
+
+impl PartialEq<VolatileSlice<'_>> for VolatileSlice<'_> {
+    fn eq(&self, other: &VolatileSlice) -> bool {
+        let size = self.size();
+        if size != other.size() {
+            return false;
+        }
+
+        // SAFETY: We pass pointers into valid VolatileSlice regions, and size is checked above.
+        let cmp = unsafe { libc::memcmp(self.as_ptr() as _, other.as_ptr() as _, size) };
+
+        cmp == 0
+    }
+}
+
+/// The `PartialEq` implementation for `VolatileSlice` is reflexive, symmetric, and transitive.
+impl Eq for VolatileSlice<'_> {}
 
 /// A memory location that supports volatile access of a `T`.
 ///
@@ -484,5 +557,62 @@ mod tests {
         a.get_slice(50, 50).unwrap();
         let res = a.get_slice(55, 50).unwrap_err();
         assert_eq!(res, Error::OutOfBounds { addr: 105 });
+    }
+
+    #[test]
+    fn is_all_zero_16bytes_aligned() {
+        let a = VecMem::new(1024);
+        let slice = a.get_slice(0, 1024).unwrap();
+
+        assert!(slice.is_all_zero());
+        a.get_slice(129, 1).unwrap().write_bytes(1);
+        assert!(!slice.is_all_zero());
+    }
+
+    #[test]
+    fn is_all_zero_head_not_aligned() {
+        let a = VecMem::new(1024);
+        let slice = a.get_slice(1, 1023).unwrap();
+
+        assert!(slice.is_all_zero());
+        a.get_slice(0, 1).unwrap().write_bytes(1);
+        assert!(slice.is_all_zero());
+        a.get_slice(1, 1).unwrap().write_bytes(1);
+        assert!(!slice.is_all_zero());
+        a.get_slice(1, 1).unwrap().write_bytes(0);
+        a.get_slice(129, 1).unwrap().write_bytes(1);
+        assert!(!slice.is_all_zero());
+    }
+
+    #[test]
+    fn is_all_zero_tail_not_aligned() {
+        let a = VecMem::new(1024);
+        let slice = a.get_slice(0, 1023).unwrap();
+
+        assert!(slice.is_all_zero());
+        a.get_slice(1023, 1).unwrap().write_bytes(1);
+        assert!(slice.is_all_zero());
+        a.get_slice(1022, 1).unwrap().write_bytes(1);
+        assert!(!slice.is_all_zero());
+        a.get_slice(1022, 1).unwrap().write_bytes(0);
+        a.get_slice(0, 1).unwrap().write_bytes(1);
+        assert!(!slice.is_all_zero());
+    }
+
+    #[test]
+    fn is_all_zero_no_aligned_16bytes() {
+        let a = VecMem::new(1024);
+        let slice = a.get_slice(1, 16).unwrap();
+
+        assert!(slice.is_all_zero());
+        a.get_slice(0, 1).unwrap().write_bytes(1);
+        assert!(slice.is_all_zero());
+        for i in 1..17 {
+            a.get_slice(i, 1).unwrap().write_bytes(1);
+            assert!(!slice.is_all_zero());
+            a.get_slice(i, 1).unwrap().write_bytes(0);
+        }
+        a.get_slice(17, 1).unwrap().write_bytes(1);
+        assert!(slice.is_all_zero());
     }
 }

@@ -1173,6 +1173,15 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "cpu-capacity" => {
             parse_cpu_capacity(value.unwrap(), &mut cfg.cpu_capacity)?;
         }
+        "core-scheduling" => {
+            let val_str = value.unwrap_or("true");
+            cfg.core_scheduling =
+                val_str.parse()
+                    .map_err(|_| argument::Error::InvalidValue {
+                        value: val_str.to_owned(),
+                        expected: String::from("core-scheduling must be a boolean"),
+                    })?;
+        }
         "per-vm-core-scheduling" => {
             cfg.per_vm_core_scheduling = true;
         }
@@ -2574,6 +2583,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                               or colon-separated list of assignments of guest to host CPU assignments (e.g. 0=0:1=1:2=2) (default: no mask)"),
           Argument::value("cpu-cluster", "CPUSET", "Group the given CPUs into a cluster (default: no clusters)"),
           Argument::value("cpu-capacity", "CPU=CAP[,CPU=CAP[,...]]", "Set the relative capacity of the given CPU (default: no capacity)"),
+          Argument::value("core-scheduling", "true", "Enable core scheduling feature to protect against hyperthread attacks. This option is
+                                                      a prerequisite for per-vm-core-scheduling."),
           Argument::flag("per-vm-core-scheduling", "Enable per-VM core scheduling intead of the default one (per-vCPU core scheduing) by
               making all vCPU threads share same cookie for core scheduling.
               This option is no-op on devices that have neither MDS nor L1TF vulnerability."),

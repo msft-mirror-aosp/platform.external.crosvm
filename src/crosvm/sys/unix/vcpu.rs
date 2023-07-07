@@ -122,6 +122,7 @@ fn bus_io_handler(bus: &Bus) -> impl FnMut(IoParams) -> Option<[u8; 8]> + '_ {
 /// This function will be called from each VCPU thread at startup.
 pub fn set_vcpu_thread_scheduling(
     vcpu_affinity: CpuSet,
+    core_scheduling: bool,
     enable_per_vm_core_scheduling: bool,
     vcpu_cgroup_tasks_file: Option<File>,
     run_rt: bool,
@@ -132,7 +133,7 @@ pub fn set_vcpu_thread_scheduling(
         }
     }
 
-    if !enable_per_vm_core_scheduling {
+    if core_scheduling && !enable_per_vm_core_scheduling {
         // Do per-vCPU core scheduling by setting a unique cookie to each vCPU.
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
@@ -285,7 +286,6 @@ fn vcpu_loop<V>(
     guest_suspended_cvar: Arc<(Mutex<bool>, Condvar)>,
     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
     bus_lock_ratelimit_ctrl: Arc<Mutex<Ratelimit>>,
-    to_vm_control: mpsc::Sender<VmRunMode>,
 ) -> ExitState
 where
     V: VcpuArch + 'static,
@@ -380,10 +380,26 @@ where
                                 }
                             }
                         }
-                        VcpuControl::GetStates => {
-                            if let Err(e) = to_vm_control.send(run_mode) {
+                        VcpuControl::GetStates(response_chan) => {
+                            if let Err(e) = response_chan.send(run_mode) {
                                 error!("Failed to send GetState: {}", e);
                             };
+                        }
+                        VcpuControl::Snapshot(response_chan) => {
+                            let resp = vcpu
+                                .snapshot()
+                                .with_context(|| format!("Failed to snapshot Vcpu #{}", vcpu.id()));
+                            if let Err(e) = response_chan.send(resp) {
+                                error!("Failed to send snapshot response: {}", e);
+                            }
+                        }
+                        VcpuControl::Restore(response_chan, vcpu_data) => {
+                            let resp = vcpu
+                                .restore(&vcpu_data)
+                                .with_context(|| format!("Failed to restore Vcpu #{}", vcpu.id()));
+                            if let Err(e) = response_chan.send(resp) {
+                                error!("Failed to send restore response: {}", e);
+                            }
                         }
                     }
                 }
@@ -533,6 +549,7 @@ pub fn run_vcpu<V>(
     #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))] to_gdb_tube: Option<
         mpsc::Sender<VcpuDebugStatusMessage>,
     >,
+    enable_core_scheduling: bool,
     enable_per_vm_core_scheduling: bool,
     cpu_config: Option<CpuConfigArch>,
     privileged_vm: bool,
@@ -541,7 +558,7 @@ pub fn run_vcpu<V>(
     guest_suspended_cvar: Arc<(Mutex<bool>, Condvar)>,
     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
     bus_lock_ratelimit_ctrl: Arc<Mutex<Ratelimit>>,
-    to_vm_control: mpsc::Sender<VmRunMode>,
+    run_mode: VmRunMode,
 ) -> Result<JoinHandle<()>>
 where
     V: VcpuArch + 'static,
@@ -555,6 +572,7 @@ where
             let vcpu_fn = || -> ExitState {
                 if let Err(e) = set_vcpu_thread_scheduling(
                     vcpu_affinity,
+                    enable_core_scheduling,
                     enable_per_vm_core_scheduling,
                     vcpu_cgroup_tasks_file,
                     run_rt && !delay_rt,
@@ -601,14 +619,6 @@ where
                     }
                 };
 
-                #[allow(unused_mut)]
-                let mut run_mode = VmRunMode::Running;
-                #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
-                if to_gdb_tube.is_some() {
-                    // Wait until a GDB client attaches
-                    run_mode = VmRunMode::Breakpoint;
-                }
-
                 mmio_bus.set_access_id(cpu_id);
                 io_bus.set_access_id(cpu_id);
 
@@ -640,7 +650,6 @@ where
                     guest_suspended_cvar,
                     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
                     bus_lock_ratelimit_ctrl,
-                    to_vm_control,
                 )
             };
 
@@ -673,6 +682,24 @@ pub fn kick_all_vcpus(
 ) {
     for (handle, tube) in vcpu_handles {
         if let Err(e) = tube.send(message.clone()) {
+            error!("failed to send VcpuControl: {}", e);
+        }
+        let _ = handle.kill(SIGRTMIN() + 0);
+    }
+    irq_chip.kick_halted_vcpus();
+}
+
+/// Signals specific running VCPUs to vmexit, sends VcpuControl message to the VCPU tube, and tells
+/// `irq_chip` to stop blocking halted VCPUs. The channel message is set first because both the
+/// signal and the irq_chip kick could cause the VCPU thread to continue through the VCPU run
+/// loop.
+pub fn kick_vcpu(
+    vcpu_handle: &Option<&(JoinHandle<()>, mpsc::Sender<vm_control::VcpuControl>)>,
+    irq_chip: &dyn IrqChip,
+    message: VcpuControl,
+) {
+    if let Some((handle, tube)) = vcpu_handle {
+        if let Err(e) = tube.send(message) {
             error!("failed to send VcpuControl: {}", e);
         }
         let _ = handle.kill(SIGRTMIN() + 0);

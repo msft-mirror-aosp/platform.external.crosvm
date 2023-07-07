@@ -15,10 +15,13 @@ use std::cmp::max;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::ffi::CString;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::hash::Hash;
 use std::io::prelude::*;
 use std::io::stdin;
 use std::iter;
@@ -28,6 +31,7 @@ use std::os::unix::prelude::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Barrier;
@@ -47,6 +51,7 @@ use arch::VcpuAffinity;
 use arch::VirtioDeviceStub;
 use arch::VmComponents;
 use arch::VmImage;
+use base::ReadNotifier;
 #[cfg(feature = "balloon")]
 use base::UnixSeqpacket;
 use base::UnixSeqpacketListener;
@@ -66,21 +71,21 @@ use devices::virtio::memory_mapper::MemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
 use devices::virtio::vhost::user::VhostUserListener;
 use devices::virtio::vhost::user::VhostUserListenerTrait;
-use devices::virtio::vhost::vsock::VhostVsockConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonFeatures;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
 #[cfg(feature = "gpu")]
 use devices::virtio::EventDevice;
-use devices::virtio::NetParameters;
-use devices::virtio::NetParametersMode;
 use devices::virtio::VirtioTransportType;
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
 use devices::Bus;
 use devices::BusDeviceObj;
 use devices::CoIommuDev;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use devices::GeniezoneKernelIrqChip;
 #[cfg(feature = "usb")]
 use devices::HostBackendDeviceProvider;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -123,6 +128,15 @@ use devices::VirtioPciDevice;
 use devices::XhciController;
 #[cfg(feature = "gpu")]
 use gpu::*;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use hypervisor::geniezone::Geniezone;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use hypervisor::geniezone::GeniezoneVcpu;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+use hypervisor::geniezone::GeniezoneVm;
 use hypervisor::kvm::Kvm;
 use hypervisor::kvm::KvmVcpu;
 use hypervisor::kvm::KvmVm;
@@ -150,6 +164,8 @@ use resources::Alloc;
 use resources::Error as ResourceError;
 use resources::SystemAllocator;
 use rutabaga_gfx::RutabagaGralloc;
+use serde::Serialize;
+use smallvec::SmallVec;
 #[cfg(feature = "swap")]
 use swap::SwapController;
 use sync::Condvar;
@@ -158,6 +174,7 @@ use vm_control::*;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::MemoryPolicy;
+use vm_memory::MemoryRegionOptions;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use x86_64::msr::get_override_msr_list;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -179,23 +196,30 @@ use crate::crosvm::gdb::GdbStub;
 use crate::crosvm::ratelimit::Ratelimit;
 use crate::crosvm::sys::cmdline::DevicesCommand;
 
+const KVM_PATH: &str = "/dev/kvm";
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+const GENIEZONE_PATH: &str = "/dev/gzvm";
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+static GUNYAH_PATH: &str = "/dev/gunyah";
+
 fn create_virtio_devices(
     cfg: &Config,
     vm: &mut impl Vm,
     resources: &mut SystemAllocator,
     #[cfg_attr(not(feature = "gpu"), allow(unused_variables))] vm_evt_wrtube: &SendTube,
     #[cfg(feature = "balloon")] balloon_device_tube: Option<Tube>,
+    #[cfg(feature = "balloon")] balloon_wss_device_tube: Option<Tube>,
     #[cfg(feature = "balloon")] balloon_inflate_tube: Option<Tube>,
     #[cfg(feature = "balloon")] init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
-    #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))] render_server_fd: Option<
-        SafeDescriptor,
-    >,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
     vvu_proxy_max_sibling_mem_size: u64,
+    #[cfg_attr(not(feature = "balloon"), allow(unused_variables))] registered_evt_q: &SendTube,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -325,7 +349,6 @@ fn create_virtio_devices(
                 // Use the unnamed socket for GPU display screens.
                 cfg.wayland_socket_paths.get(""),
                 cfg.x_display.clone(),
-                #[cfg(feature = "virgl_renderer_next")]
                 render_server_fd,
                 event_devices,
             )?);
@@ -460,8 +483,9 @@ fn create_virtio_devices(
 
     #[cfg(feature = "balloon")]
     if let Some(balloon_device_tube) = balloon_device_tube {
-        let balloon_features =
-            (cfg.balloon_page_reporting as u64) << BalloonFeatures::PageReporting as u64;
+        let balloon_features = (cfg.balloon_page_reporting as u64)
+            << BalloonFeatures::PageReporting as u64
+            | (cfg.balloon_wss_reporting as u64) << BalloonFeatures::WSSReporting as u64;
         devs.push(create_balloon_device(
             cfg.protection_type,
             &cfg.jail_config,
@@ -471,48 +495,20 @@ fn create_virtio_devices(
                 BalloonMode::Relaxed
             },
             balloon_device_tube,
+            balloon_wss_device_tube,
             balloon_inflate_tube,
             init_balloon_size,
             balloon_features,
+            Some(
+                registered_evt_q
+                    .try_clone()
+                    .context("failed to clone registered_evt_q tube")?,
+            ),
         )?);
     }
 
-    let mut net_cfg_extra: Vec<_> = cfg
-        .tap_fd
-        .iter()
-        .map(|fd| NetParameters {
-            vhost_net: cfg.vhost_net,
-            mode: NetParametersMode::TapFd {
-                tap_fd: *fd,
-                mac: None,
-            },
-        })
-        .collect();
-
-    if let (Some(host_ip), Some(netmask), Some(mac)) = (cfg.host_ip, cfg.netmask, cfg.mac_address) {
-        if !cfg.vhost_user_net.is_empty() {
-            bail!("vhost-user-net cannot be used with any of --host-ip, --netmask or --mac");
-        }
-        net_cfg_extra.push(NetParameters {
-            vhost_net: cfg.vhost_net,
-            mode: NetParametersMode::RawConfig {
-                host_ip,
-                netmask,
-                mac,
-            },
-        });
-    }
-
-    net_cfg_extra.extend(cfg.tap_name.iter().map(|tap_name| NetParameters {
-        vhost_net: cfg.vhost_net,
-        mode: NetParametersMode::TapName {
-            mac: None,
-            tap_name: tap_name.to_owned(),
-        },
-    }));
-
-    for opt in [&cfg.net, &net_cfg_extra].into_iter().flatten() {
-        let vq_pairs = cfg.net_vq_pairs.unwrap_or(1);
+    for opt in &cfg.net {
+        let vq_pairs = opt.vq_pairs.unwrap_or(1);
         let vcpu_count = cfg.vcpu_count.unwrap_or(1);
         let multi_vq = vq_pairs > 1 && !opt.vhost_net;
         let (tap, mac) = create_tap_for_net_device(&opt.mode, multi_vq)?;
@@ -524,6 +520,7 @@ fn create_virtio_devices(
                 vcpu_count,
                 cfg.vhost_net_device_path.clone(),
                 tap,
+                mac,
             )
         } else {
             create_virtio_net_device_from_tap(
@@ -596,16 +593,10 @@ fn create_virtio_devices(
         }
     }
 
-    if let Some(cid) = cfg.cid {
-        let vhost_config = VhostVsockConfig {
-            device: cfg.vhost_vsock_device.clone(),
-            cid,
-        };
-        devs.push(create_vhost_vsock_device(
-            cfg.protection_type,
-            &cfg.jail_config,
-            &vhost_config,
-        )?);
+    if let Some(vsock_config) = &cfg.vsock {
+        devs.push(
+            vsock_config.create_virtio_device_and_jail(cfg.protection_type, &cfg.jail_config)?,
+        );
     }
 
     for vhost_user_fs in &cfg.vhost_user_fs {
@@ -685,20 +676,21 @@ fn create_devices(
     resources: &mut SystemAllocator,
     vm_evt_wrtube: &SendTube,
     iommu_attached_endpoints: &mut BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
+    irq_control_tubes: &mut Vec<Tube>,
     control_tubes: &mut Vec<TaggedControlTube>,
     #[cfg(feature = "balloon")] balloon_device_tube: Option<Tube>,
+    #[cfg(feature = "balloon")] balloon_wss_device_tube: Option<Tube>,
     #[cfg(feature = "balloon")] init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
-    #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))] render_server_fd: Option<
-        SafeDescriptor,
-    >,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
     vvu_proxy_max_sibling_mem_size: u64,
     iova_max_addr: &mut Option<u64>,
+    registered_evt_q: &SendTube,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -711,6 +703,7 @@ fn create_devices(
                 &cfg.jail_config,
                 vm,
                 resources,
+                irq_control_tubes,
                 control_tubes,
                 &vfio_dev.path,
                 false,
@@ -816,6 +809,8 @@ fn create_devices(
         #[cfg(feature = "balloon")]
         balloon_device_tube,
         #[cfg(feature = "balloon")]
+        balloon_wss_device_tube,
+        #[cfg(feature = "balloon")]
         balloon_inflate_tube,
         #[cfg(feature = "balloon")]
         init_balloon_size,
@@ -824,10 +819,11 @@ fn create_devices(
         fs_device_tubes,
         #[cfg(feature = "gpu")]
         gpu_control_tube,
-        #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+        #[cfg(feature = "gpu")]
         render_server_fd,
         vvu_proxy_device_tubes,
         vvu_proxy_max_sibling_mem_size,
+        registered_evt_q,
     )?;
 
     for stub in stubs {
@@ -835,7 +831,7 @@ fn create_devices(
             VirtioTransportType::Pci => {
                 let (msi_host_tube, msi_device_tube) =
                     Tube::pair().context("failed to create tube")?;
-                control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+                irq_control_tubes.push(msi_host_tube);
 
                 let shared_memory_tube = if stub.dev.get_shared_memory_region().is_some() {
                     let (host_tube, device_tube) =
@@ -849,12 +845,20 @@ fn create_devices(
                     None
                 };
 
+                let (ioevent_host_tube, ioevent_device_tube) =
+                    Tube::pair().context("failed to create ioevent tube")?;
+                control_tubes.push(TaggedControlTube::VmMemory {
+                    tube: ioevent_host_tube,
+                    expose_with_viommu: false,
+                });
+
                 let dev = VirtioPciDevice::new(
                     vm.get_memory().clone(),
                     stub.dev,
                     msi_device_tube,
                     cfg.disable_virtio_intx,
                     shared_memory_tube,
+                    ioevent_device_tube,
                 )
                 .context("failed to create virtio pci dev")?;
 
@@ -958,6 +962,7 @@ fn create_file_backed_mappings(
 fn create_pcie_root_port(
     host_pcie_rp: Vec<HostPcieRootPortParameters>,
     sys_allocator: &mut SystemAllocator,
+    irq_control_tubes: &mut Vec<Tube>,
     control_tubes: &mut Vec<TaggedControlTube>,
     devices: &mut Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
     hp_vec: &mut Vec<(u8, Arc<Mutex<dyn HotPlugBus>>)>,
@@ -983,7 +988,7 @@ fn create_pcie_root_port(
             let pcie_root_port = Arc::new(Mutex::new(PcieRootPort::new(i, false)));
             pme_notify_devs.push((i, pcie_root_port.clone() as Arc<Mutex<dyn PmeNotify>>));
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+            irq_control_tubes.push(msi_host_tube);
             let pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
             // no ipc is used if the root port disables hotplug
             devices.push((pci_bridge, None));
@@ -999,7 +1004,7 @@ fn create_pcie_root_port(
             pcie_root_port.clone() as Arc<Mutex<dyn PmeNotify>>,
         ));
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-        control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+        irq_control_tubes.push(msi_host_tube);
         let pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
 
         hp_endpoints_ranges.push(RangeInclusive::new(
@@ -1045,7 +1050,7 @@ fn create_pcie_root_port(
             control_tubes.push(TaggedControlTube::Vm(vm_host_tube));
 
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+            irq_control_tubes.push(msi_host_tube);
             let mut pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
             // early reservation for host pcie root port devices.
             let rootport_addr = pci_bridge.allocate_address(sys_allocator);
@@ -1229,14 +1234,14 @@ pub enum ExitState {
 // Remove ranges in `guest_mem_layout` that overlap with ranges in `file_backed_mappings`.
 // Returns the updated guest memory layout.
 fn punch_holes_in_guest_mem_layout_for_mappings(
-    guest_mem_layout: Vec<(GuestAddress, u64)>,
+    guest_mem_layout: Vec<(GuestAddress, u64, MemoryRegionOptions)>,
     file_backed_mappings: &[FileBackedMappingParameters],
-) -> Vec<(GuestAddress, u64)> {
+) -> Vec<(GuestAddress, u64, MemoryRegionOptions)> {
     // Create a set containing (start, end) pairs with exclusive end (end = start + size; the byte
     // at end is not included in the range).
     let mut layout_set = BTreeSet::new();
-    for (addr, size) in &guest_mem_layout {
-        layout_set.insert((addr.offset(), addr.offset() + size));
+    for (addr, size, options) in &guest_mem_layout {
+        layout_set.insert((addr.offset(), addr.offset() + size, *options));
     }
 
     for mapping in file_backed_mappings {
@@ -1244,20 +1249,20 @@ fn punch_holes_in_guest_mem_layout_for_mappings(
         let mapping_end = mapping_start + mapping.size;
 
         // Repeatedly split overlapping guest memory regions until no overlaps remain.
-        while let Some((range_start, range_end)) = layout_set
+        while let Some((range_start, range_end, options)) = layout_set
             .iter()
-            .find(|&&(range_start, range_end)| {
+            .find(|&&(range_start, range_end, _)| {
                 mapping_start < range_end && mapping_end > range_start
             })
             .cloned()
         {
-            layout_set.remove(&(range_start, range_end));
+            layout_set.remove(&(range_start, range_end, options));
 
             if range_start < mapping_start {
-                layout_set.insert((range_start, mapping_start));
+                layout_set.insert((range_start, mapping_start, options));
             }
             if range_end > mapping_end {
-                layout_set.insert((mapping_end, range_end));
+                layout_set.insert((mapping_end, range_end, options));
             }
         }
     }
@@ -1265,28 +1270,23 @@ fn punch_holes_in_guest_mem_layout_for_mappings(
     // Build the final guest memory layout from the modified layout_set.
     layout_set
         .iter()
-        .map(|(start, end)| (GuestAddress(*start), end - start))
+        .map(|(start, end, options)| (GuestAddress(*start), end - start, *options))
         .collect()
-}
-
-struct CreateGuestMemoryResult {
-    guest_mem: GuestMemory,
-    #[cfg(feature = "swap")]
-    swap_controller: Option<SwapController>,
 }
 
 fn create_guest_memory(
     cfg: &Config,
     components: &VmComponents,
     hypervisor: &impl Hypervisor,
-) -> Result<CreateGuestMemoryResult> {
+) -> Result<GuestMemory> {
     let guest_mem_layout = Arch::guest_memory_layout(components, hypervisor)
         .context("failed to create guest memory layout")?;
 
     let guest_mem_layout =
         punch_holes_in_guest_mem_layout_for_mappings(guest_mem_layout, &cfg.file_backed_mappings);
 
-    let guest_mem = GuestMemory::new(&guest_mem_layout).context("failed to create guest memory")?;
+    let guest_mem = GuestMemory::new_with_options(&guest_mem_layout)
+        .context("failed to create guest memory")?;
     let mut mem_policy = MemoryPolicy::empty();
     if components.hugepages {
         mem_policy |= MemoryPolicy::USE_HUGEPAGES;
@@ -1307,35 +1307,74 @@ fn create_guest_memory(
         guest_mem.use_dontfork().context("use_dontfork failed")?;
     }
 
-    // Setup page fault handlers for vmm-swap.
-    // This should be called before device processes are forked.
-    #[cfg(feature = "swap")]
-    let swap_controller = cfg
-        .swap_dir
-        .as_ref()
-        .map(|swap_dir| SwapController::launch(guest_mem.clone(), swap_dir.clone()))
-        .transpose()?;
-
-    Ok(CreateGuestMemoryResult {
-        guest_mem,
-        #[cfg(feature = "swap")]
-        swap_controller,
-    })
+    Ok(guest_mem)
 }
 
-fn run_kvm(cfg: Config, components: VmComponents) -> Result<ExitState> {
-    let kvm = Kvm::new_with_path(&cfg.kvm_device_path).with_context(|| {
-        format!(
-            "failed to open KVM device {}",
-            cfg.kvm_device_path.display(),
-        )
-    })?;
+#[cfg(any(target_arch = "aarch64"))]
+#[cfg(feature = "geniezone")]
+fn run_gz(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> Result<ExitState> {
+    let device_path = device_path.unwrap_or(Path::new(GENIEZONE_PATH));
+    let gzvm = Geniezone::new_with_path(device_path)
+        .with_context(|| format!("failed to open GenieZone device {}", device_path.display()))?;
 
-    let CreateGuestMemoryResult {
-        guest_mem,
+    let guest_mem = create_guest_memory(&cfg, &components, &gzvm)?;
+
+    #[cfg(feature = "swap")]
+    let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
+        Some(
+            SwapController::launch(guest_mem.clone(), swap_dir, &cfg.jail_config)
+                .context("launch vmm-swap monitor process")?,
+        )
+    } else {
+        None
+    };
+
+    let vm =
+        GeniezoneVm::new(&gzvm, guest_mem, components.hv_cfg).context("failed to create vm")?;
+
+    // Check that the VM was actually created in protected mode as expected.
+    if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
+        bail!("Failed to create protected VM");
+    }
+    let vm_clone = vm.try_clone().context("failed to clone vm")?;
+
+    let ioapic_host_tube;
+    let mut irq_chip = if cfg.split_irqchip {
+        unimplemented!("Geniezone does not support split irqchip mode");
+    } else {
+        ioapic_host_tube = None;
+
+        GeniezoneKernelIrqChip::new(vm_clone, components.vcpu_count)
+            .context("failed to create IRQ chip")?
+    };
+
+    run_vm::<GeniezoneVcpu, GeniezoneVm>(
+        cfg,
+        components,
+        vm,
+        &mut irq_chip,
+        ioapic_host_tube,
         #[cfg(feature = "swap")]
         swap_controller,
-    } = create_guest_memory(&cfg, &components, &kvm)?;
+    )
+}
+
+fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> Result<ExitState> {
+    let device_path = device_path.unwrap_or(Path::new(KVM_PATH));
+    let kvm = Kvm::new_with_path(device_path)
+        .with_context(|| format!("failed to open KVM device {}", device_path.display()))?;
+
+    let guest_mem = create_guest_memory(&cfg, &components, &kvm)?;
+
+    #[cfg(feature = "swap")]
+    let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
+        Some(
+            SwapController::launch(guest_mem.clone(), swap_dir, &cfg.jail_config)
+                .context("launch vmm-swap monitor process")?,
+        )
+    } else {
+        None
+    };
 
     let vm = KvmVm::new(&kvm, guest_mem, components.hv_cfg).context("failed to create vm")?;
 
@@ -1415,8 +1454,86 @@ fn run_kvm(cfg: Config, components: VmComponents) -> Result<ExitState> {
     )
 }
 
-fn get_default_hypervisor() -> Result<HypervisorKind> {
-    Ok(HypervisorKind::Kvm)
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+fn run_gunyah(
+    device_path: Option<&Path>,
+    cfg: Config,
+    components: VmComponents,
+) -> Result<ExitState> {
+    use devices::GunyahIrqChip;
+    use hypervisor::gunyah::{Gunyah, GunyahVcpu, GunyahVm};
+
+    let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
+    let gunyah = Gunyah::new_with_path(device_path)
+        .with_context(|| format!("failed to open Gunyah device {}", device_path.display()))?;
+
+    let guest_mem = create_guest_memory(&cfg, &components, &gunyah)?;
+
+    #[cfg(feature = "swap")]
+    let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
+        Some(
+            SwapController::launch(guest_mem.clone(), swap_dir, &cfg.jail_config)
+                .context("launch vmm-swap monitor process")?,
+        )
+    } else {
+        None
+    };
+
+    let vm = GunyahVm::new(&gunyah, guest_mem, components.hv_cfg).context("failed to create vm")?;
+
+    // Check that the VM was actually created in protected mode as expected.
+    if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
+        bail!("Failed to create protected VM");
+    }
+
+    let vm_clone = vm.try_clone()?;
+
+    run_vm::<GunyahVcpu, GunyahVm>(
+        cfg,
+        components,
+        vm,
+        &mut GunyahIrqChip::new(vm_clone)?,
+        None,
+        #[cfg(feature = "swap")]
+        swap_controller,
+    )
+}
+
+/// Choose a default hypervisor if no `--hypervisor` option was specified.
+fn get_default_hypervisor() -> Option<HypervisorKind> {
+    let kvm_path = Path::new(KVM_PATH);
+    if kvm_path.exists() {
+        return Some(HypervisorKind::Kvm {
+            device: Some(kvm_path.to_path_buf()),
+        });
+    }
+
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(feature = "geniezone")]
+    {
+        let gz_path = Path::new(GENIEZONE_PATH);
+        if gz_path.exists() {
+            return Some(HypervisorKind::Geniezone {
+                device: Some(gz_path.to_path_buf()),
+            });
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        any(target_arch = "arm", target_arch = "aarch64"),
+        feature = "gunyah"
+    ))]
+    {
+        let gunyah_path = Path::new(GUNYAH_PATH);
+        if gunyah_path.exists() {
+            return Some(HypervisorKind::Gunyah {
+                device: Some(gunyah_path.to_path_buf()),
+            });
+        }
+    }
+
+    None
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
@@ -1427,13 +1544,25 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
     let components = setup_vm_components(&cfg)?;
 
-    let default_hypervisor = get_default_hypervisor().context("no enabled hypervisor")?;
-    let hypervisor = cfg.hypervisor.unwrap_or(default_hypervisor);
+    let hypervisor = cfg
+        .hypervisor
+        .clone()
+        .or_else(get_default_hypervisor)
+        .context("no enabled hypervisor")?;
 
-    debug!("creating {:?} hypervisor", hypervisor);
+    debug!("creating hypervisor: {:?}", hypervisor);
 
     match hypervisor {
-        HypervisorKind::Kvm => run_kvm(cfg, components),
+        HypervisorKind::Kvm { device } => run_kvm(device.as_deref(), cfg, components),
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        #[cfg(feature = "geniezone")]
+        HypervisorKind::Geniezone { device } => run_gz(device.as_deref(), cfg, components),
+        #[cfg(all(
+            unix,
+            any(target_arch = "arm", target_arch = "aarch64"),
+            feature = "gunyah"
+        ))]
+        HypervisorKind::Gunyah { device } => run_gunyah(device.as_deref(), cfg, components),
     }
 }
 
@@ -1477,6 +1606,7 @@ where
     };
 
     let mut control_tubes = Vec::new();
+    let mut irq_control_tubes = Vec::new();
 
     #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
     if let Some(port) = cfg.gdb {
@@ -1514,6 +1644,16 @@ where
         (None, None)
     };
 
+    #[cfg(feature = "balloon")]
+    let (balloon_wss_host_tube, balloon_wss_device_tube) = if cfg.balloon_wss_reporting {
+        let (host, device) = Tube::pair().context("failed to create tube")?;
+        host.set_recv_timeout(Some(Duration::from_millis(100)))
+            .context("failed to set timeout")?;
+        (Some(host), Some(device))
+    } else {
+        (None, None)
+    };
+
     // Create one control socket per disk.
     let mut disk_device_tubes = Vec::new();
     let mut disk_host_tubes = Vec::new();
@@ -1533,7 +1673,7 @@ where
     }
 
     if let Some(ioapic_host_tube) = ioapic_host_tube {
-        control_tubes.push(TaggedControlTube::VmIrq(ioapic_host_tube));
+        irq_control_tubes.push(ioapic_host_tube);
     }
 
     let battery = if cfg.battery_config.is_some() {
@@ -1613,7 +1753,7 @@ where
 
     create_file_backed_mappings(&cfg, &mut vm, &mut sys_allocator)?;
 
-    #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+    #[cfg(feature = "gpu")]
     // Hold on to the render server jail so it keeps running until we exit run_vm()
     let (_render_server_jail, render_server_fd) =
         if let Some(parameters) = &cfg.gpu_render_server_parameters {
@@ -1700,15 +1840,22 @@ where
     let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>> =
         BTreeMap::new();
     let mut iova_max_addr: Option<u64> = None;
+
+    let (reg_evt_wrtube, reg_evt_rdtube) =
+        Tube::directional_pair().context("failed to create registered event tube")?;
+
     let mut devices = create_devices(
         &cfg,
         &mut vm,
         &mut sys_allocator,
         &vm_evt_wrtube,
         &mut iommu_attached_endpoints,
+        &mut irq_control_tubes,
         &mut control_tubes,
         #[cfg(feature = "balloon")]
         balloon_device_tube,
+        #[cfg(feature = "balloon")]
+        balloon_wss_device_tube,
         #[cfg(feature = "balloon")]
         init_balloon_size,
         &mut disk_device_tubes,
@@ -1718,11 +1865,12 @@ where
         usb_provider,
         #[cfg(feature = "gpu")]
         gpu_control_device_tube,
-        #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+        #[cfg(feature = "gpu")]
         render_server_fd,
         &mut vvu_proxy_device_tubes,
         components.memory_size,
         &mut iova_max_addr,
+        &reg_evt_wrtube,
     )?;
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -1746,6 +1894,7 @@ where
         create_pcie_root_port(
             rp_host,
             &mut sys_allocator,
+            &mut irq_control_tubes,
             &mut control_tubes,
             &mut devices,
             &mut hotplug_buses,
@@ -1779,13 +1928,20 @@ where
         )?;
 
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-        control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+        irq_control_tubes.push(msi_host_tube);
+        let (ioevent_host_tube, ioevent_device_tube) =
+            Tube::pair().context("failed to create ioevent tube")?;
+        control_tubes.push(TaggedControlTube::VmMemory {
+            tube: ioevent_host_tube,
+            expose_with_viommu: false,
+        });
         let mut dev = VirtioPciDevice::new(
             vm.get_memory().clone(),
             iommu_dev.dev,
             msi_device_tube,
             cfg.disable_virtio_intx,
             None,
+            ioevent_device_tube,
         )
         .context("failed to create virtio pci dev")?;
         // early reservation for viommu.
@@ -1837,6 +1993,10 @@ where
         swap_controller.as_ref(),
     )
     .context("the architecture failed to build the vm")?;
+
+    if let Some(tube) = linux.vm_request_tube.take() {
+        control_tubes.push(TaggedControlTube::Vm(tube));
+    }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let (hp_control_tube, hp_worker_tube) = mpsc::channel();
@@ -1897,9 +2057,12 @@ where
         sys_allocator,
         cfg,
         control_server_socket,
+        irq_control_tubes,
         control_tubes,
         #[cfg(feature = "balloon")]
         balloon_host_tube,
+        #[cfg(feature = "balloon")]
+        balloon_wss_host_tube,
         &disk_host_tubes,
         #[cfg(feature = "gpu")]
         gpu_control_host_tube,
@@ -1917,6 +2080,7 @@ where
         hp_thread,
         #[cfg(feature = "swap")]
         swap_controller,
+        reg_evt_rdtube,
     )
 }
 
@@ -1971,11 +2135,12 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &mut RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
     cfg: &Config,
+    irq_control_tubes: &mut Vec<Tube>,
     control_tubes: &mut Vec<TaggedControlTube>,
     hp_control_tube: &mpsc::Sender<PciRootCommand>,
     iommu_host_tube: &Option<Tube>,
     device: &HotPlugDeviceInfo,
-    #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
+    #[cfg(feature = "swap")] swap_controller: Option<&SwapController>,
 ) -> Result<()> {
     let host_addr = PciAddress::from_path(&device.path)
         .context("failed to parse hotplug device's PCI address")?;
@@ -1986,7 +2151,7 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
             let (vm_host_tube, vm_device_tube) = Tube::pair().context("failed to create tube")?;
             control_tubes.push(TaggedControlTube::Vm(vm_host_tube));
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+            irq_control_tubes.push(msi_host_tube);
             let pcie_host = PcieHostPort::new(device.path.as_path(), vm_device_tube)?;
             let (host_key, pci_bridge) = match device.device_type {
                 HotPlugDeviceType::UpstreamPort => {
@@ -2037,6 +2202,7 @@ fn add_hotplug_device<V: VmArch, Vcpu: VcpuArch>(
                 &cfg.jail_config,
                 &linux.vm,
                 sys_allocator,
+                irq_control_tubes,
                 control_tubes,
                 &device.path,
                 true,
@@ -2292,23 +2458,26 @@ fn handle_hotplug_command<V: VmArch, Vcpu: VcpuArch>(
     linux: &mut RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
     cfg: &Config,
+    add_irq_control_tubes: &mut Vec<Tube>,
     add_tubes: &mut Vec<TaggedControlTube>,
     hp_control_tube: &mpsc::Sender<PciRootCommand>,
     iommu_host_tube: &Option<Tube>,
     device: &HotPlugDeviceInfo,
     add: bool,
-    #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
+    #[cfg(feature = "swap")] swap_controller: Option<&SwapController>,
 ) -> VmResponse {
     let iommu_host_tube = if cfg.vfio_isolate_hotplug {
         iommu_host_tube
     } else {
         &None
     };
+
     let ret = if add {
         add_hotplug_device(
             linux,
             sys_allocator,
             cfg,
+            add_irq_control_tubes,
             add_tubes,
             hp_control_tube,
             iommu_host_tube,
@@ -2332,11 +2501,13 @@ fn handle_hotplug_command<V: VmArch, Vcpu: VcpuArch>(
 
 fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     mut linux: RunnableLinuxVm<V, Vcpu>,
-    mut sys_allocator: SystemAllocator,
+    sys_allocator: SystemAllocator,
     cfg: Config,
     control_server_socket: Option<UnlinkUnixSeqpacketListener>,
+    irq_control_tubes: Vec<Tube>,
     mut control_tubes: Vec<TaggedControlTube>,
     #[cfg(feature = "balloon")] balloon_host_tube: Option<Tube>,
+    #[cfg(feature = "balloon")] balloon_wss_host_tube: Option<Tube>,
     disk_host_tubes: &[Tube],
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
     #[cfg(feature = "usb")] usb_control_tube: Tube,
@@ -2351,16 +2522,89 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     >,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] hp_thread: std::thread::JoinHandle<()>,
     #[cfg(feature = "swap")] swap_controller: Option<SwapController>,
+    reg_evt_rdtube: RecvTube,
 ) -> Result<ExitState> {
     #[derive(EventToken)]
     enum Token {
         VmEvent,
         Suspend,
         ChildSignal,
-        IrqFd { index: IrqEventIndex },
         VmControlServer,
         VmControl { index: usize },
-        DelayedIrqFd,
+        RegisteredEvent,
+    }
+
+    // Tube keyed on the socket path used to create it.
+    struct AddressedTube {
+        tube: Rc<Tube>,
+        socket_addr: String,
+    }
+
+    impl PartialEq for AddressedTube {
+        fn eq(&self, other: &Self) -> bool {
+            self.socket_addr == other.socket_addr
+        }
+    }
+
+    impl Eq for AddressedTube {}
+
+    impl Hash for AddressedTube {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.socket_addr.hash(state);
+        }
+    }
+
+    impl AddressedTube {
+        pub fn send<T: Serialize>(&self, msg: &T) -> Result<(), base::TubeError> {
+            self.tube.send(msg)
+        }
+    }
+
+    fn find_registered_tube<'a>(
+        registered_tubes: &'a HashMap<RegisteredEvent, HashSet<AddressedTube>>,
+        socket_addr: &str,
+        event: RegisteredEvent,
+    ) -> (Option<&'a Rc<Tube>>, bool) {
+        let mut registered_tube: Option<&Rc<Tube>> = None;
+        let mut already_registered = false;
+        'outer: for (evt, addr_tubes) in registered_tubes {
+            for addr_tube in addr_tubes {
+                if addr_tube.socket_addr == socket_addr {
+                    if *evt == event {
+                        already_registered = true;
+                        break 'outer;
+                    }
+                    // Since all tubes of the same addr should
+                    // be an RC to the same tube, it doesn't
+                    // matter which one we get. But we do need
+                    // to check for a registration for the
+                    // current event, so can't break here.
+                    registered_tube = Some(&addr_tube.tube);
+                }
+            }
+        }
+        (registered_tube, already_registered)
+    }
+
+    fn make_addr_tube_from_maybe_existing(
+        tube: Option<&Rc<Tube>>,
+        addr: String,
+    ) -> Result<AddressedTube> {
+        if let Some(registered_tube) = tube {
+            Ok(AddressedTube {
+                tube: registered_tube.clone(),
+                socket_addr: addr,
+            })
+        } else {
+            let sock = UnixSeqpacket::connect(addr.clone()).with_context(|| {
+                format!("failed to connect to registered listening socket {}", addr)
+            })?;
+            let tube = Tube::new_from_unix_seqpacket(sock);
+            Ok(AddressedTube {
+                tube: Rc::new(tube),
+                socket_addr: addr,
+            })
+        }
     }
 
     let mut iommu_client = iommu_host_tube
@@ -2371,12 +2615,15 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .set_raw_mode()
         .expect("failed to set terminal raw mode");
 
+    let sys_allocator_mutex = Arc::new(Mutex::new(sys_allocator));
+
     let wait_ctx = WaitContext::build_with(&[
         (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
         (&vm_evt_rdtube, Token::VmEvent),
+        (&reg_evt_rdtube, Token::RegisteredEvent),
     ])
-    .context("failed to add descriptor to wait context")?;
+    .context("failed to build wait context")?;
 
     if let Some(socket_server) = &control_server_socket {
         wait_ctx
@@ -2386,23 +2633,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     for (index, socket) in control_tubes.iter().enumerate() {
         wait_ctx
             .add(socket.as_ref(), Token::VmControl { index })
-            .context("failed to add descriptor to wait context")?;
-    }
-
-    let events = linux
-        .irq_chip
-        .irq_event_tokens()
-        .context("failed to add descriptor to wait context")?;
-
-    for (index, _gsi, evt) in events {
-        wait_ctx
-            .add(&evt, Token::IrqFd { index })
-            .context("failed to add descriptor to wait context")?;
-    }
-
-    if let Some(delayed_ioapic_irq_trigger) = linux.irq_chip.irq_delayed_event_token()? {
-        wait_ctx
-            .add(&delayed_ioapic_irq_trigger, Token::DelayedIrqFd)
             .context("failed to add descriptor to wait context")?;
     }
 
@@ -2433,13 +2663,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             return Err(anyhow!("Failed to start devices thread: {}", e));
         }
     };
-    if let Some(path) = cfg.restore_path.clone() {
-        if let Err(e) =
-            device_ctrl_tube.send(&DeviceControlCommand::RestoreDevices { restore_path: path })
-        {
-            error!("fail to send command to devices control socket: {}", e);
-        };
-    }
 
     let mut vcpu_handles = Vec::with_capacity(linux.vcpu_count);
     let vcpu_thread_barrier = Arc::new(Barrier::new(linux.vcpu_count + 1));
@@ -2457,7 +2680,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // shared by all vCPU threads.
     // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process
     // itself for even better performance. Only vCPUs need the feature.
-    if cfg.per_vm_core_scheduling {
+    if cfg.core_scheduling && cfg.per_vm_core_scheduling {
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
         }
@@ -2501,10 +2724,23 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     let guest_suspended_cvar = Arc::new((Mutex::new(false), Condvar::new()));
 
+    #[allow(unused_mut)]
+    let mut run_mode = VmRunMode::Running;
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
+    if to_gdb_channel.is_some() {
+        // Wait until a GDB client attaches
+        run_mode = VmRunMode::Breakpoint;
+    }
+    // If we are restoring from a snapshot, then start suspended.
+    let (run_mode, post_restore_run_mode) = if cfg.restore_path.is_some() {
+        (VmRunMode::Suspending, run_mode)
+    } else {
+        (run_mode, run_mode)
+    };
+
     // Architecture-specific code must supply a vcpu_init element for each VCPU.
     assert_eq!(vcpus.len(), linux.vcpu_init.len());
 
-    let (to_vm_control, state_from_vcpu_channel) = mpsc::channel();
     for ((cpu_id, vcpu), vcpu_init) in vcpus.into_iter().enumerate().zip(linux.vcpu_init.drain(..))
     {
         let (to_vcpu_channel, from_main_channel) = mpsc::channel();
@@ -2563,6 +2799,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             use_hypervisor_signals,
             #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
             to_gdb_channel.clone(),
+            cfg.core_scheduling,
             cfg.per_vm_core_scheduling,
             cpu_config,
             cfg.privileged_vm,
@@ -2577,7 +2814,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             guest_suspended_cvar.clone(),
             #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
             bus_lock_ratelimit_ctrl,
-            to_vm_control.clone(),
+            run_mode,
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
     }
@@ -2600,12 +2837,50 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             .context("failed to spawn GDB thread")?;
     };
 
+    let (irq_handler_control, irq_handler_control_for_thread) = Tube::pair()?;
+    let sys_allocator_for_thread = sys_allocator_mutex.clone();
+    let irq_chip_for_thread = linux.irq_chip.try_box_clone()?;
+    let irq_handler_thread = std::thread::Builder::new()
+        .name("irq_handler_thread".into())
+        .spawn(move || {
+            irq_handler_thread(
+                irq_control_tubes,
+                irq_chip_for_thread,
+                sys_allocator_for_thread,
+                irq_handler_control_for_thread,
+            )
+        })
+        .unwrap();
+
     vcpu_thread_barrier.wait();
+
+    // Restore VM (if applicable).
+    // Must happen after the vCPU barrier to avoid deadlock.
+    if let Some(path) = &cfg.restore_path {
+        vm_control::do_restore(
+            path.clone(),
+            |msg| vcpu::kick_all_vcpus(&vcpu_handles, linux.irq_chip.as_irq_chip(), msg),
+            |msg, index| {
+                vcpu::kick_vcpu(&vcpu_handles.get(index), linux.irq_chip.as_irq_chip(), msg)
+            },
+            &device_ctrl_tube,
+            linux.vcpu_count,
+        )?;
+        // Allow the vCPUs to start for real.
+        vcpu::kick_all_vcpus(
+            &vcpu_handles,
+            linux.irq_chip.as_irq_chip(),
+            VcpuControl::RunState(post_restore_run_mode),
+        )
+    }
 
     let mut exit_state = ExitState::Stop;
     let mut pvpanic_code = PvPanicCode::Unknown;
     #[cfg(feature = "balloon")]
     let mut balloon_stats_id: u64 = 0;
+    #[cfg(feature = "balloon")]
+    let mut balloon_wss_id: u64 = 0;
+    let mut registered_evt_tubes: HashMap<RegisteredEvent, HashSet<AddressedTube>> = HashMap::new();
 
     'wait: loop {
         let events = {
@@ -2621,6 +2896,32 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         let mut vm_control_indices_to_remove = Vec::new();
         for event in events.iter().filter(|e| e.is_readable) {
             match event.token {
+                Token::RegisteredEvent => match reg_evt_rdtube.recv::<RegisteredEvent>() {
+                    Ok(reg_evt) => {
+                        let mut tubes_to_remove: Vec<String> = Vec::new();
+                        if let Some(tubes) = registered_evt_tubes.get_mut(&reg_evt) {
+                            for tube in tubes.iter() {
+                                if let Err(e) = tube.send(&reg_evt) {
+                                    warn!(
+                                        "failed to send registered event {:?} to {}, removing from \
+                                         registrations: {}",
+                                        reg_evt, tube.socket_addr, e
+                                    );
+                                    tubes_to_remove.push(tube.socket_addr.clone());
+                                }
+                            }
+                        }
+                        for tube_addr in tubes_to_remove {
+                            for tubes in registered_evt_tubes.values_mut() {
+                                tubes.retain(|t| t.socket_addr != tube_addr);
+                            }
+                        }
+                        registered_evt_tubes.retain(|_, tubes| !tubes.is_empty());
+                    }
+                    Err(e) => {
+                        warn!("failed to recv RegisteredEvent: {}", e);
+                    }
+                },
                 Token::VmEvent => {
                     let mut break_to_wait: bool = true;
                     match vm_evt_rdtube.recv::<VmEventType>() {
@@ -2700,16 +3001,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         break 'wait;
                     }
                 }
-                Token::IrqFd { index } => {
-                    if let Err(e) = linux.irq_chip.service_irq_event(index) {
-                        error!("failed to signal irq {}: {}", index, e);
-                    }
-                }
-                Token::DelayedIrqFd => {
-                    if let Err(e) = linux.irq_chip.process_delayed_irq_events() {
-                        warn!("can't deliver delayed irqs: {}", e);
-                    }
-                }
                 Token::VmControlServer => {
                     if let Some(socket_server) = &control_server_socket {
                         match socket_server.accept() {
@@ -2733,6 +3024,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 Token::VmControl { index } => {
                     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                     let mut add_tubes = Vec::new();
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    let mut add_irq_control_tubes = Vec::new();
                     if let Some(socket) = control_tubes.get(index) {
                         match socket {
                             TaggedControlTube::Vm(tube) => match tube.recv::<VmRequest>() {
@@ -2748,8 +3041,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                             {
                                                 handle_hotplug_command(
                                                     &mut linux,
-                                                    &mut sys_allocator,
+                                                    &mut sys_allocator_mutex.lock(),
                                                     &cfg,
+                                                    &mut add_irq_control_tubes,
                                                     &mut add_tubes,
                                                     &hp_control_tube,
                                                     &iommu_host_tube,
@@ -2770,13 +3064,62 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                 VmResponse::Ok
                                             }
                                         }
+                                        VmRequest::RegisterListener { socket_addr, event } => {
+                                            let (registered_tube, already_registered) =
+                                                find_registered_tube(
+                                                    &registered_evt_tubes,
+                                                    &socket_addr,
+                                                    event,
+                                                );
+
+                                            if !already_registered {
+                                                let addr_tube = make_addr_tube_from_maybe_existing(
+                                                    registered_tube,
+                                                    socket_addr,
+                                                )?;
+
+                                                if let Some(tubes) =
+                                                    registered_evt_tubes.get_mut(&event)
+                                                {
+                                                    tubes.insert(addr_tube);
+                                                } else {
+                                                    registered_evt_tubes.insert(
+                                                        event,
+                                                        vec![addr_tube].into_iter().collect(),
+                                                    );
+                                                }
+                                            }
+                                            VmResponse::Ok
+                                        }
+                                        VmRequest::UnregisterListener { socket_addr, event } => {
+                                            if let Some(tubes) =
+                                                registered_evt_tubes.get_mut(&event)
+                                            {
+                                                tubes.retain(|t| t.socket_addr != socket_addr);
+                                            }
+                                            registered_evt_tubes
+                                                .retain(|_, tubes| !tubes.is_empty());
+                                            VmResponse::Ok
+                                        }
+                                        VmRequest::Unregister { socket_addr } => {
+                                            for (_, tubes) in registered_evt_tubes.iter_mut() {
+                                                tubes.retain(|t| t.socket_addr != socket_addr);
+                                            }
+                                            registered_evt_tubes
+                                                .retain(|_, tubes| !tubes.is_empty());
+                                            VmResponse::Ok
+                                        }
                                         _ => {
                                             let response = request.execute(
                                                 &mut run_mode_opt,
                                                 #[cfg(feature = "balloon")]
                                                 balloon_host_tube.as_ref(),
                                                 #[cfg(feature = "balloon")]
+                                                balloon_wss_host_tube.as_ref(),
+                                                #[cfg(feature = "balloon")]
                                                 &mut balloon_stats_id,
+                                                #[cfg(feature = "balloon")]
+                                                &mut balloon_wss_id,
                                                 disk_host_tubes,
                                                 &mut linux.pm,
                                                 #[cfg(feature = "gpu")]
@@ -2793,12 +3136,19 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                         msg,
                                                     )
                                                 },
+                                                |msg, index| {
+                                                    vcpu::kick_vcpu(
+                                                        &vcpu_handles.get(index),
+                                                        linux.irq_chip.as_irq_chip(),
+                                                        msg,
+                                                    )
+                                                },
                                                 cfg.force_s2idle,
                                                 #[cfg(feature = "swap")]
                                                 swap_controller.as_ref(),
                                                 &device_ctrl_tube,
-                                                &state_from_vcpu_channel,
                                                 vcpu_handles.len(),
+                                                &irq_handler_control,
                                             );
 
                                             // For non s2idle guest suspension we are done
@@ -2886,7 +3236,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                 Ok(request) => {
                                     let response = request.execute(
                                         &mut linux.vm,
-                                        &mut sys_allocator,
+                                        &mut sys_allocator_mutex.lock(),
                                         &mut gralloc,
                                         if *expose_with_viommu {
                                             iommu_client.as_mut()
@@ -2903,61 +3253,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         vm_control_indices_to_remove.push(index);
                                     } else {
                                         error!("failed to recv VmMemoryControlRequest: {}", e);
-                                    }
-                                }
-                            },
-                            TaggedControlTube::VmIrq(tube) => match tube.recv::<VmIrqRequest>() {
-                                Ok(request) => {
-                                    let response = {
-                                        let irq_chip = &mut linux.irq_chip;
-                                        request.execute(
-                                            |setup| match setup {
-                                                IrqSetup::Event(irq, ev, device_id, queue_id, device_name) => {
-                                                    let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
-                                                    let source = IrqEventSource{
-                                                        device_id: device_id.try_into().expect("Invalid device_id"),
-                                                        queue_id,
-                                                        device_name,
-                                                    };
-                                                    if let Some(event_index) = irq_chip
-                                                        .register_edge_irq_event(irq, &irq_evt, source)?
-                                                    {
-                                                        match wait_ctx.add(
-                                                            ev,
-                                                            Token::IrqFd {
-                                                                index: event_index
-                                                            },
-                                                        ) {
-                                                            Err(e) => {
-                                                                warn!("failed to add IrqFd to poll context: {}", e);
-                                                                Err(e)
-                                                            },
-                                                            Ok(_) => {
-                                                                Ok(())
-                                                            }
-                                                        }
-                                                    } else {
-                                                        Ok(())
-                                                    }
-                                                }
-                                                IrqSetup::Route(route) => irq_chip.route_irq(route),
-                                                IrqSetup::UnRegister(irq, ev) => {
-                                                    let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
-                                                    irq_chip.unregister_edge_irq_event(irq, &irq_evt)
-                                                }
-                                            },
-                                            &mut sys_allocator,
-                                        )
-                                    };
-                                    if let Err(e) = tube.send(&response) {
-                                        error!("failed to send VmIrqResponse: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    if let TubeError::Disconnected = e {
-                                        vm_control_indices_to_remove.push(index);
-                                    } else {
-                                        error!("failed to recv VmIrqRequest: {}", e);
                                     }
                                 }
                             },
@@ -2980,8 +3275,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                             }
                             TaggedControlTube::Fs(tube) => match tube.recv::<FsMappingRequest>() {
                                 Ok(request) => {
-                                    let response =
-                                        request.execute(&mut linux.vm, &mut sys_allocator);
+                                    let response = request
+                                        .execute(&mut linux.vm, &mut sys_allocator_mutex.lock());
                                     if let Err(e) = tube.send(&response) {
                                         error!("failed to send VmResponse: {}", e);
                                     }
@@ -3012,54 +3307,29 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         }
                         control_tubes.append(&mut add_tubes);
                     }
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    if !add_irq_control_tubes.is_empty() {
+                        irq_handler_control.send(&IrqHandlerRequest::AddIrqControlTubes(
+                            add_irq_control_tubes,
+                        ))?;
+                    }
                 }
             }
         }
 
-        // It's possible more data is readable and buffered while the socket is hungup,
-        // so don't delete the tube from the poll context until we're sure all the
-        // data is read.
-        // Below case covers a condition where we have received a hungup event and the tube is not
-        // readable.
-        // In case of readable tube, once all data is read, any attempt to read more data on hungup
-        // tube should fail. On such failure, we get Disconnected error and index gets added to
-        // vm_control_indices_to_remove by the time we reach here.
-        for event in events.iter().filter(|e| e.is_hungup && !e.is_readable) {
-            if let Token::VmControl { index } = event.token {
-                vm_control_indices_to_remove.push(index);
-            }
-        }
-
-        // Sort in reverse so the highest indexes are removed first. This removal algorithm
-        // preserves correct indexes as each element is removed.
-        vm_control_indices_to_remove.sort_unstable_by_key(|&k| Reverse(k));
-        vm_control_indices_to_remove.dedup();
-        for index in vm_control_indices_to_remove {
-            // Delete the socket from the `wait_ctx` synchronously. Otherwise, the kernel will do
-            // this automatically when the FD inserted into the `wait_ctx` is closed after this
-            // if-block, but this removal can be deferred unpredictably. In some instances where the
-            // system is under heavy load, we can even get events returned by `wait_ctx` for an FD
-            // that has already been closed. Because the token associated with that spurious event
-            // now belongs to a different socket, the control loop will start to interact with
-            // sockets that might not be ready to use. This can cause incorrect hangup detection or
-            // blocking on a socket that will never be ready. See also: crbug.com/1019986
-            if let Some(socket) = control_tubes.get(index) {
-                wait_ctx
-                    .delete(socket)
-                    .context("failed to remove descriptor from wait context")?;
-            }
-
-            // This line implicitly drops the socket at `index` when it gets returned by
-            // `swap_remove`. After this line, the socket at `index` is not the one from
-            // `vm_control_indices_to_remove`. Because of this socket's change in index, we need to
-            // use `wait_ctx.modify` to change the associated index in its `Token::VmControl`.
-            control_tubes.swap_remove(index);
-            if let Some(tube) = control_tubes.get(index) {
-                wait_ctx
-                    .modify(tube, EventType::Read, Token::VmControl { index })
-                    .context("failed to add descriptor to wait context")?;
-            }
-        }
+        remove_hungup_and_drained_tubes(
+            &events,
+            &wait_ctx,
+            &mut control_tubes,
+            vm_control_indices_to_remove,
+            |token: &Token| {
+                if let Token::VmControl { index } = token {
+                    return Some(*index);
+                }
+                None
+            },
+            |index: usize| Token::VmControl { index },
+        )?;
     }
 
     vcpu::kick_all_vcpus(
@@ -3101,6 +3371,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         }
     }
 
+    // Shut down the IRQ handler thread.
+    if let Err(e) = irq_handler_control.send(&IrqHandlerRequest::Exit) {
+        error!("failed to request exit from IRQ handler thread: {}", e);
+    }
+    if let Err(e) = irq_handler_thread.join() {
+        error!("failed to exit irq handler thread: {:?}", e);
+    }
+
     // At this point, the only remaining `Arc` references to the `Bus` objects should be the ones
     // inside `linux`. If the checks below fail, then some other thread is probably still running
     // and needs to be explicitly stopped before dropping `linux` to ensure devices actually get
@@ -3123,6 +3401,280 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .expect("failed to restore canonical mode for terminal");
 
     Ok(exit_state)
+}
+
+#[derive(EventToken)]
+enum IrqHandlerToken {
+    IrqFd { index: IrqEventIndex },
+    VmIrq { index: usize },
+    DelayedIrqFd,
+    HandlerControl,
+}
+
+/// Handles IRQs and requests from devices to add additional IRQ lines.
+fn irq_handler_thread(
+    mut irq_control_tubes: Vec<Tube>,
+    mut irq_chip: Box<dyn IrqChipArch + 'static>,
+    sys_allocator_mutex: Arc<Mutex<SystemAllocator>>,
+    handler_control: Tube,
+) -> anyhow::Result<()> {
+    let wait_ctx = WaitContext::build_with(&[(
+        handler_control.get_read_notifier(),
+        IrqHandlerToken::HandlerControl,
+    )])
+    .context("failed to build wait context")?;
+
+    if let Some(delayed_ioapic_irq_trigger) = irq_chip.irq_delayed_event_token()? {
+        wait_ctx
+            .add(&delayed_ioapic_irq_trigger, IrqHandlerToken::DelayedIrqFd)
+            .context("failed to add descriptor to wait context")?;
+    }
+
+    let events = irq_chip
+        .irq_event_tokens()
+        .context("failed get event tokens from irqchip")?;
+
+    for (index, _gsi, evt) in events {
+        wait_ctx
+            .add(&evt, IrqHandlerToken::IrqFd { index })
+            .context("failed to add irq chip event tokens to wait context")?;
+    }
+
+    for (index, socket) in irq_control_tubes.iter().enumerate() {
+        wait_ctx
+            .add(socket.get_read_notifier(), IrqHandlerToken::VmIrq { index })
+            .context("irq control tubes to wait context")?;
+    }
+
+    'wait: loop {
+        let events = {
+            match wait_ctx.wait() {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("failed to poll: {}", e);
+                    break 'wait;
+                }
+            }
+        };
+        let token_count = events.len();
+        let mut vm_irq_tubes_to_remove = Vec::new();
+        let mut notify_control_on_iteration_end = false;
+
+        for event in events.iter().filter(|e| e.is_readable) {
+            match event.token {
+                IrqHandlerToken::HandlerControl => {
+                    match handler_control.recv::<IrqHandlerRequest>() {
+                        Ok(request) => {
+                            match request {
+                                IrqHandlerRequest::Exit => break 'wait,
+                                IrqHandlerRequest::AddIrqControlTubes(mut tubes) => {
+                                    for (index, socket) in tubes.iter().enumerate() {
+                                        wait_ctx
+                                        .add(
+                                            socket.get_read_notifier(),
+                                            IrqHandlerToken::VmIrq {
+                                                index: irq_control_tubes.len() + index,
+                                            },
+                                        )
+                                        .context("failed to add new IRQ control Tube to wait context")?;
+                                    }
+                                    irq_control_tubes.append(&mut tubes);
+                                }
+                                IrqHandlerRequest::WakeAndNotifyIteration => {
+                                    notify_control_on_iteration_end = true;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if let TubeError::Disconnected = e {
+                                panic!("irq handler control tube disconnected.");
+                            } else {
+                                error!("failed to recv IrqHandlerRequest: {}", e);
+                            }
+                        }
+                    }
+                }
+                IrqHandlerToken::VmIrq { index } => {
+                    if let Some(tube) = irq_control_tubes.get(index) {
+                        handle_irq_tube_request(
+                            &sys_allocator_mutex,
+                            &mut irq_chip,
+                            &mut vm_irq_tubes_to_remove,
+                            &wait_ctx,
+                            tube,
+                            index,
+                        );
+                    }
+                }
+                IrqHandlerToken::IrqFd { index } => {
+                    if let Err(e) = irq_chip.service_irq_event(index) {
+                        error!("failed to signal irq {}: {}", index, e);
+                    }
+                }
+                IrqHandlerToken::DelayedIrqFd => {
+                    if let Err(e) = irq_chip.process_delayed_irq_events() {
+                        warn!("can't deliver delayed irqs: {}", e);
+                    }
+                }
+            }
+        }
+
+        if notify_control_on_iteration_end {
+            if let Err(e) = handler_control.send(&IrqHandlerResponse::HandlerIterationComplete(
+                token_count - 1,
+            )) {
+                error!(
+                    "failed to notify on iteration completion (snapshotting may fail): {}",
+                    e
+                );
+            }
+        }
+
+        remove_hungup_and_drained_tubes(
+            &events,
+            &wait_ctx,
+            &mut irq_control_tubes,
+            vm_irq_tubes_to_remove,
+            |token: &IrqHandlerToken| {
+                if let IrqHandlerToken::VmIrq { index } = token {
+                    return Some(*index);
+                }
+                None
+            },
+            |index: usize| IrqHandlerToken::VmIrq { index },
+        )?;
+        if events.iter().any(|e| {
+            e.is_hungup && !e.is_readable && matches!(e.token, IrqHandlerToken::HandlerControl)
+        }) {
+            error!("IRQ handler control hung up but did not request an exit.");
+            break 'wait;
+        }
+    }
+    Ok(())
+}
+
+fn handle_irq_tube_request(
+    sys_allocator_mutex: &Arc<Mutex<SystemAllocator>>,
+    irq_chip: &mut Box<dyn IrqChipArch + 'static>,
+    vm_irq_tubes_to_remove: &mut Vec<usize>,
+    wait_ctx: &WaitContext<IrqHandlerToken>,
+    tube: &Tube,
+    tube_index: usize,
+) {
+    match tube.recv::<VmIrqRequest>() {
+        Ok(request) => {
+            let response = {
+                request.execute(
+                    |setup| match setup {
+                        IrqSetup::Event(irq, ev, device_id, queue_id, device_name) => {
+                            let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
+                            let source = IrqEventSource {
+                                device_id: device_id.try_into().expect("Invalid device_id"),
+                                queue_id,
+                                device_name,
+                            };
+                            if let Some(event_index) =
+                                irq_chip.register_edge_irq_event(irq, &irq_evt, source)?
+                            {
+                                if let Err(e) =
+                                    wait_ctx.add(ev, IrqHandlerToken::IrqFd { index: event_index })
+                                {
+                                    warn!("failed to add IrqFd to poll context: {}", e);
+                                    return Err(e);
+                                }
+                            }
+                            Ok(())
+                        }
+                        IrqSetup::Route(route) => irq_chip.route_irq(route),
+                        IrqSetup::UnRegister(irq, ev) => {
+                            let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
+                            irq_chip.unregister_edge_irq_event(irq, &irq_evt)
+                        }
+                    },
+                    &mut sys_allocator_mutex.lock(),
+                )
+            };
+            if let Err(e) = tube.send(&response) {
+                error!("failed to send VmIrqResponse: {}", e);
+            }
+        }
+        Err(e) => {
+            if let TubeError::Disconnected = e {
+                vm_irq_tubes_to_remove.push(tube_index);
+            } else {
+                error!("failed to recv VmIrqRequest: {}", e);
+            }
+        }
+    }
+}
+
+/// When control tubes hang up, we want to make sure that we've fully drained
+/// the underlying socket before removing it. This function also handles
+/// removing closed sockets in such a way that avoids phantom events.
+///
+/// `tube_indices_to_remove` is the set of indices that we already know should
+/// be removed (e.g. from getting a disconnect error on read).
+fn remove_hungup_and_drained_tubes<T, U>(
+    events: &SmallVec<[TriggeredEvent<T>; 16]>,
+    wait_ctx: &WaitContext<T>,
+    tubes: &mut Vec<U>,
+    mut tube_indices_to_remove: Vec<usize>,
+    get_tube_index: fn(token: &T) -> Option<usize>,
+    make_token_for_tube: fn(usize) -> T,
+) -> anyhow::Result<()>
+where
+    T: EventToken,
+    U: ReadNotifier,
+{
+    // It's possible more data is readable and buffered while the socket is hungup,
+    // so don't delete the tube from the poll context until we're sure all the
+    // data is read.
+    // Below case covers a condition where we have received a hungup event and the tube is not
+    // readable.
+    // In case of readable tube, once all data is read, any attempt to read more data on hungup
+    // tube should fail. On such failure, we get Disconnected error and index gets added to
+    // vm_control_indices_to_remove by the time we reach here.
+    for event in events.iter().filter(|e| e.is_hungup && !e.is_readable) {
+        if let Some(index) = get_tube_index(&event.token) {
+            tube_indices_to_remove.push(index);
+        }
+    }
+
+    // Sort in reverse so the highest indexes are removed first. This removal algorithm
+    // preserves correct indexes as each element is removed.
+    tube_indices_to_remove.sort_unstable_by_key(|&k| Reverse(k));
+    tube_indices_to_remove.dedup();
+    for index in tube_indices_to_remove {
+        // Delete the socket from the `wait_ctx` synchronously. Otherwise, the kernel will do
+        // this automatically when the FD inserted into the `wait_ctx` is closed after this
+        // if-block, but this removal can be deferred unpredictably. In some instances where the
+        // system is under heavy load, we can even get events returned by `wait_ctx` for an FD
+        // that has already been closed. Because the token associated with that spurious event
+        // now belongs to a different socket, the control loop will start to interact with
+        // sockets that might not be ready to use. This can cause incorrect hangup detection or
+        // blocking on a socket that will never be ready. See also: crbug.com/1019986
+        if let Some(socket) = tubes.get(index) {
+            wait_ctx
+                .delete(socket.get_read_notifier())
+                .context("failed to remove descriptor from wait context")?;
+        }
+
+        // This line implicitly drops the socket at `index` when it gets returned by
+        // `swap_remove`. After this line, the socket at `index` is not the one from
+        // `tube_indices_to_remove`. Because of this socket's change in index, we need to
+        // use `wait_ctx.modify` to change the associated index in its `Token::VmControl`.
+        tubes.swap_remove(index);
+        if let Some(tube) = tubes.get(index) {
+            wait_ctx
+                .modify(
+                    tube.get_read_notifier(),
+                    EventType::Read,
+                    make_token_for_tube(index),
+                )
+                .context("failed to add descriptor to wait context")?;
+        }
+    }
+    Ok(())
 }
 
 /// Start and jail a vhost-user device according to its configuration and a vhost listener string.
@@ -3216,6 +3768,13 @@ fn jail_and_start_vu_device<T: VirtioDeviceBuilder>(
             // to clean up ourselves.
 
             info!("process for device {} (PID {}) started", &name, pid);
+            #[cfg(feature = "seccomp_trace")]
+            debug!(
+                    "seccomp_trace {{\"event\": \"minijail_fork\", \"pid\": {}, \"name\": \"{}\", \"jail_addr\": \"0x{:x}\"}}",
+                    pid,
+                    &name,
+                    read_jail_addr(&jail)
+                );
             Ok((pid, parent_resources))
         }
     }
@@ -3337,6 +3896,11 @@ pub fn start_devices(opts: DevicesCommand) -> anyhow::Result<()> {
         add_device(i, disk_config, &params.vhost, &jail, &mut devices_jails)?;
     }
 
+    // Create vsock devices.
+    for (i, params) in opts.vsock.iter().enumerate() {
+        add_device(i, &params.device, &params.vhost, &jail, &mut devices_jails)?;
+    }
+
     let ex = Executor::new()?;
     if let Some(control_server_socket) = control_server_socket {
         // Start the control server in the parent process.
@@ -3416,14 +3980,14 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3431,14 +3995,14 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0xD000_0000, 0x1000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3446,14 +4010,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0, 0x2000)]
             ),
             vec![
-                (GuestAddress(0x2000), 0xD000_0000 - 0x2000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (
+                    GuestAddress(0x2000),
+                    0xD000_0000 - 0x2000,
+                    Default::default()
+                ),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3461,14 +4029,14 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0xD000_0000 - 0x2000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000 - 0x2000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0xD000_0000 - 0x2000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3476,15 +4044,19 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0x1000),
-                (GuestAddress(0x3000), 0xD000_0000 - 0x3000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000),
+                (GuestAddress(0), 0x1000, Default::default()),
+                (
+                    GuestAddress(0x3000),
+                    0xD000_0000 - 0x3000,
+                    Default::default()
+                ),
+                (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
             ]
         );
 
@@ -3492,14 +4064,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1_0000_0000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_2000),
+                    0x8_0000 - 0x2000,
+                    Default::default()
+                ),
             ]
         );
 
@@ -3507,14 +4083,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1_0008_0000 - 0x2000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x8_0000 - 0x2000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_0000),
+                    0x8_0000 - 0x2000,
+                    Default::default()
+                ),
             ]
         );
 
@@ -3522,15 +4102,19 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0x1_0000_1000, 0x2000)]
             ),
             vec![
-                (GuestAddress(0), 0xD000_0000),
-                (GuestAddress(0x1_0000_0000), 0x1000),
-                (GuestAddress(0x1_0000_3000), 0x8_0000 - 0x3000),
+                (GuestAddress(0), 0xD000_0000, Default::default()),
+                (GuestAddress(0x1_0000_0000), 0x1000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_3000),
+                    0x8_0000 - 0x3000,
+                    Default::default()
+                ),
             ]
         );
 
@@ -3538,14 +4122,18 @@ mod tests {
         assert_eq!(
             punch_holes_in_guest_mem_layout_for_mappings(
                 vec![
-                    (GuestAddress(0), 0xD000_0000),
-                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                    (GuestAddress(0), 0xD000_0000, Default::default()),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000, Default::default()),
                 ],
                 &[test_file_backed_mapping(0xA000_0000, 0x60002000)]
             ),
             vec![
-                (GuestAddress(0), 0xA000_0000),
-                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+                (GuestAddress(0), 0xA000_0000, Default::default()),
+                (
+                    GuestAddress(0x1_0000_2000),
+                    0x8_0000 - 0x2000,
+                    Default::default()
+                ),
             ]
         );
     }

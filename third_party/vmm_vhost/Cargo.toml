@@ -19,14 +19,16 @@ vfio-device = []
 [dependencies]
 anyhow = "*"
 base = { path = "../../base" }
-bitflags = ">=1.0.1"
+bitflags = "2.2.1"
 cfg-if = "1.0.0"
 data_model = { path = "../../common/data_model" }
 libc = ">=0.2.39"
 remain = "*"
 tempfile = "*"
 thiserror = { version = "1.0.20" }
+zerocopy = "*"
 
 [target.'cfg(windows)'.dependencies]
 serde = { version = "1", features = [ "derive" ] }
 serde_json = "*"
+tube_transporter = { path = "../../tube_transporter" }

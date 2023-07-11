@@ -2680,7 +2680,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // shared by all vCPU threads.
     // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process
     // itself for even better performance. Only vCPUs need the feature.
-    if cfg.per_vm_core_scheduling {
+    if cfg.core_scheduling && cfg.per_vm_core_scheduling {
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
         }
@@ -2799,6 +2799,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             use_hypervisor_signals,
             #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "gdb"))]
             to_gdb_channel.clone(),
+            cfg.core_scheduling,
             cfg.per_vm_core_scheduling,
             cpu_config,
             cfg.privileged_vm,

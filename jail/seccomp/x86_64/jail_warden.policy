@@ -44,6 +44,7 @@ setsockopt: 1
 socket: arg0 == AF_INET || arg0 == AF_UNIX
 socketpair: 1
 statx: 1
-tgkill: 1
+# ANDROID: already exists in common_device.policy
+# tgkill: 1
 umount2: 1 # Create jail
 unshare: 1

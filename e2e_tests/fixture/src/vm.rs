@@ -178,6 +178,12 @@ pub struct Config {
     /// Url to rootfs image
     pub(super) rootfs_url: Option<Url>,
 
+    /// If rootfs image is writable
+    pub(super) rootfs_rw: bool,
+
+    /// If rootfs image is zstd compressed
+    pub(super) rootfs_compressed: bool,
+
     /// Console hardware type
     pub(super) console_hardware: String,
 }
@@ -193,6 +199,8 @@ impl Default for Config {
             kernel_url: kernel_prebuilt_url_string(),
             initrd_url: None,
             rootfs_url: Some(rootfs_prebuilt_url_string()),
+            rootfs_rw: false,
+            rootfs_compressed: false,
             console_hardware: "virtio-console".to_owned(),
         }
     }
@@ -251,6 +259,16 @@ impl Config {
 
     pub fn with_rootfs(mut self, url: &str) -> Self {
         self.rootfs_url = Some(Url::parse(url).unwrap());
+        self
+    }
+
+    pub fn rootfs_is_rw(mut self) -> Self {
+        self.rootfs_rw = true;
+        self
+    }
+
+    pub fn rootfs_is_compressed(mut self) -> Self {
+        self.rootfs_compressed = true;
         self
     }
 
@@ -317,12 +335,30 @@ impl TestVm {
         }
 
         if let Some(rootfs_url) = &cfg.rootfs_url {
-            let rootfs_path = local_path_from_url(rootfs_url);
-            if !rootfs_path.exists() && rootfs_url.scheme() != "file" {
-                download_file(rootfs_url.as_str(), &rootfs_path).unwrap();
+            let rootfs_download_path = local_path_from_url(rootfs_url);
+            if !rootfs_download_path.exists() && rootfs_url.scheme() != "file" {
+                download_file(rootfs_url.as_str(), &rootfs_download_path).unwrap();
             }
-            assert!(rootfs_path.exists(), "{:?} does not exist", rootfs_path);
-            TestVmSys::check_rootfs_file(&rootfs_path);
+            assert!(
+                rootfs_download_path.exists(),
+                "{:?} does not exist",
+                rootfs_download_path
+            );
+
+            if cfg.rootfs_compressed {
+                let rootfs_raw_path = rootfs_download_path.with_extension("raw");
+                Command::new("zstd")
+                    .arg("-d")
+                    .arg(&rootfs_download_path)
+                    .arg("-o")
+                    .arg(&rootfs_raw_path)
+                    .arg("-f")
+                    .output()
+                    .expect("Failed to decompress rootfs");
+                TestVmSys::check_rootfs_file(&rootfs_raw_path);
+            } else {
+                TestVmSys::check_rootfs_file(&rootfs_download_path);
+            }
         }
     }
 
@@ -459,66 +495,87 @@ impl TestVm {
 
     /// Hotplug a tap device.
     pub fn hotplug_tap(&mut self, tap_name: &str) -> Result<()> {
-        self.sys.crosvm_command(
-            "virtio-net",
-            vec!["add".to_owned(), tap_name.to_owned()],
-            self.sudo,
-        )
+        self.sys
+            .crosvm_command(
+                "virtio-net",
+                vec!["add".to_owned(), tap_name.to_owned()],
+                self.sudo,
+            )
+            .map(|_| ())
     }
 
     /// Remove hotplugged device on bus.
     pub fn remove_pci_device(&mut self, bus_num: u8) -> Result<()> {
-        self.sys.crosvm_command(
-            "virtio-net",
-            vec!["remove".to_owned(), bus_num.to_string()],
-            self.sudo,
-        )
+        self.sys
+            .crosvm_command(
+                "virtio-net",
+                vec!["remove".to_owned(), bus_num.to_string()],
+                self.sudo,
+            )
+            .map(|_| ())
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        self.sys.crosvm_command("stop", vec![], self.sudo)
+        self.sys
+            .crosvm_command("stop", vec![], self.sudo)
+            .map(|_| ())
     }
 
     pub fn suspend(&mut self) -> Result<()> {
-        self.sys.crosvm_command("suspend", vec![], self.sudo)
+        self.sys
+            .crosvm_command("suspend", vec![], self.sudo)
+            .map(|_| ())
     }
 
     pub fn suspend_full(&mut self) -> Result<()> {
         self.sys
             .crosvm_command("suspend", vec!["--full".to_string()], self.sudo)
+            .map(|_| ())
     }
 
     pub fn resume(&mut self) -> Result<()> {
-        self.sys.crosvm_command("resume", vec![], self.sudo)
+        self.sys
+            .crosvm_command("resume", vec![], self.sudo)
+            .map(|_| ())
     }
 
     pub fn resume_full(&mut self) -> Result<()> {
         self.sys
             .crosvm_command("resume", vec!["--full".to_string()], self.sudo)
+            .map(|_| ())
     }
 
     pub fn disk(&mut self, args: Vec<String>) -> Result<()> {
-        self.sys.crosvm_command("disk", args, self.sudo)
+        self.sys.crosvm_command("disk", args, self.sudo).map(|_| ())
     }
 
     pub fn snapshot(&mut self, filename: &std::path::Path) -> Result<()> {
-        self.sys.crosvm_command(
-            "snapshot",
-            vec!["take".to_string(), String::from(filename.to_str().unwrap())],
-            self.sudo,
-        )
+        self.sys
+            .crosvm_command(
+                "snapshot",
+                vec!["take".to_string(), String::from(filename.to_str().unwrap())],
+                self.sudo,
+            )
+            .map(|_| ())
     }
 
     // No argument is passed in restore as we will always restore snapshot.bkp for testing.
     pub fn restore(&mut self, filename: &std::path::Path) -> Result<()> {
-        self.sys.crosvm_command(
-            "snapshot",
-            vec![
-                "restore".to_string(),
-                String::from(filename.to_str().unwrap()),
-            ],
-            self.sudo,
-        )
+        self.sys
+            .crosvm_command(
+                "snapshot",
+                vec![
+                    "restore".to_string(),
+                    String::from(filename.to_str().unwrap()),
+                ],
+                self.sudo,
+            )
+            .map(|_| ())
+    }
+
+    pub fn swap_command(&mut self, command: &str) -> Result<Vec<u8>> {
+        self.sys
+            .crosvm_command("swap", vec![command.to_string()], self.sudo)
     }
 }
 

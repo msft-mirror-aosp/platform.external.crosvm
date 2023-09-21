@@ -26,7 +26,6 @@ use hypervisor::MemRegion;
 #[cfg(feature = "balloon")]
 mod balloon_tube;
 pub mod client;
-pub mod display;
 pub mod sys;
 
 use std::collections::BTreeMap;
@@ -2204,10 +2203,11 @@ impl Display for VmResponse {
     }
 }
 
-/// Enum to send control requests to all Ac97 audio devices.
-#[derive(Serialize, Deserialize, Debug)]
-pub enum Ac97Control {
-    Mute(bool),
+/// Enum that allows remote control of a wait context (used between the Windows GpuDisplay & the
+/// GPU worker).
+#[derive(Serialize, Deserialize)]
+pub enum ModifyWaitContext {
+    Add(#[serde(with = "with_as_descriptor")] Descriptor),
 }
 
 #[sorted]

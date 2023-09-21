@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::OpenOptions;
 use std::ops::RangeInclusive;
-use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
@@ -35,11 +34,12 @@ use devices::virtio::ipc_memory_mapper::create_ipc_mapper;
 use devices::virtio::ipc_memory_mapper::CreateIpcMapperRet;
 use devices::virtio::memory_mapper::BasicMemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
+use devices::virtio::scsi::ScsiOption;
 #[cfg(feature = "audio")]
 use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vfio_wrapper::VfioWrapper;
-use devices::virtio::vhost::user::proxy::VirtioVhostUser;
 use devices::virtio::vhost::user::vmm::VhostUserVirtioDevice;
+#[cfg(feature = "net")]
 use devices::virtio::vhost::user::NetBackend;
 use devices::virtio::vhost::user::VhostUserDevice;
 use devices::virtio::vhost::user::VhostUserVsockDevice;
@@ -47,8 +47,11 @@ use devices::virtio::vsock::VsockConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonMode;
 use devices::virtio::Console;
+#[cfg(feature = "net")]
 use devices::virtio::NetError;
+#[cfg(feature = "net")]
 use devices::virtio::NetParameters;
+#[cfg(feature = "net")]
 use devices::virtio::NetParametersMode;
 use devices::virtio::VirtioDevice;
 use devices::virtio::VirtioDeviceType;
@@ -62,14 +65,17 @@ use devices::VfioDevice;
 use devices::VfioDeviceType;
 use devices::VfioPciDevice;
 use devices::VfioPlatformDevice;
-#[cfg(all(feature = "vtpm", target_arch = "x86_64"))]
+#[cfg(feature = "vtpm")]
 use devices::VtpmProxy;
 use hypervisor::ProtectionType;
 use hypervisor::Vm;
 use jail::*;
 use minijail::Minijail;
+#[cfg(feature = "net")]
 use net_util::sys::unix::Tap;
+#[cfg(feature = "net")]
 use net_util::MacAddress;
+#[cfg(feature = "net")]
 use net_util::TapTCommon;
 use resources::Alloc;
 use resources::AllocOptions;
@@ -81,7 +87,6 @@ use vm_memory::GuestAddress;
 use crate::crosvm::config::TouchDeviceOption;
 use crate::crosvm::config::VhostUserFsOption;
 use crate::crosvm::config::VhostUserOption;
-use crate::crosvm::config::VvuOption;
 
 pub enum TaggedControlTube {
     Fs(Tube),
@@ -251,15 +256,9 @@ impl<'a> VirtioDeviceBuilder for DiskConfig<'a> {
             virtio::BlockAsync::new(
                 base_features,
                 disk_image,
-                self.disk.read_only,
-                self.disk.sparse,
-                self.disk.packed_queue,
-                self.disk.block_size,
-                self.disk.multiple_workers,
-                self.disk.id,
+                self.disk,
                 self.device_tube,
                 None,
-                self.disk.async_executor,
                 None,
             )
             .context("failed to create block device")?,
@@ -278,15 +277,9 @@ impl<'a> VirtioDeviceBuilder for DiskConfig<'a> {
             virtio::BlockAsync::new(
                 base_features,
                 disk_image,
-                disk.read_only,
-                disk.sparse,
-                disk.packed_queue,
-                disk.block_size,
-                false,
-                disk.id,
+                disk,
                 self.device_tube,
                 None,
-                disk.async_executor,
                 None,
             )
             .context("failed to create block device")?,
@@ -294,6 +287,18 @@ impl<'a> VirtioDeviceBuilder for DiskConfig<'a> {
         keep_rds.extend(block.keep_rds());
 
         Ok(block)
+    }
+}
+
+impl<'a> VirtioDeviceBuilder for &'a ScsiOption {
+    const NAME: &'static str = "scsi";
+
+    fn create_virtio_device(
+        self,
+        _protection_type: ProtectionType,
+    ) -> anyhow::Result<Box<dyn VirtioDevice>> {
+        // TODO(b/300042376): create a SCSI device.
+        bail!("SCSI device creation is not supported yet.")
     }
 }
 
@@ -411,32 +416,6 @@ pub fn create_vhost_user_gpu_device(
     })
 }
 
-pub fn create_vvu_proxy_device(
-    protection_type: ProtectionType,
-    jail_config: &Option<JailConfig>,
-    opt: &VvuOption,
-    tube: Tube,
-    max_sibling_mem_size: u64,
-) -> DeviceResult {
-    let listener =
-        UnixListener::bind(&opt.socket).context("failed to bind listener for vvu proxy device")?;
-
-    let dev = VirtioVhostUser::new(
-        virtio::base_features(protection_type),
-        listener,
-        VmMemoryClient::new(tube),
-        opt.addr,
-        opt.uuid,
-        max_sibling_mem_size,
-    )
-    .context("failed to create VVU proxy device")?;
-
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: simple_jail(jail_config, "vvu_proxy_device")?,
-    })
-}
-
 pub fn create_rng_device(
     protection_type: ProtectionType,
     jail_config: &Option<JailConfig>,
@@ -543,7 +522,7 @@ pub fn create_software_tpm_device(
     })
 }
 
-#[cfg(all(feature = "vtpm", target_arch = "x86_64"))]
+#[cfg(feature = "vtpm")]
 pub fn create_vtpm_proxy_device(
     protection_type: ProtectionType,
     jail_config: &Option<JailConfig>,
@@ -776,6 +755,7 @@ pub fn create_balloon_device(
     })
 }
 
+#[cfg(feature = "net")]
 impl VirtioDeviceBuilder for &NetParameters {
     const NAME: &'static str = "net";
 
@@ -839,6 +819,7 @@ impl VirtioDeviceBuilder for &NetParameters {
 }
 
 /// Create a new tap interface based on NetParametersMode.
+#[cfg(feature = "net")]
 fn create_tap_for_net_device(
     mode: &NetParametersMode,
     multi_vq: bool,
@@ -1010,7 +991,7 @@ pub fn create_video_device(
             jail_mount_bind_drm(&mut jail, /* render_node_only= */ true)?;
         }
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         {
             // Device nodes used by libdrm through minigbm in libvda on AMD devices.
             let sys_dev_char_path = Path::new("/sys/dev/char");
@@ -1314,7 +1295,7 @@ pub fn create_pmem_device(
         GuestAddress(mapping_address),
         slot,
         arena_size,
-        Some(pmem_device_tube),
+        pmem_device_tube,
     )
     .context("failed to create pmem device")?;
 

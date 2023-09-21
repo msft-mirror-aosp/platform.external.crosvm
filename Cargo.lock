@@ -731,7 +731,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tube_transporter",
- "uuid",
  "vhost",
  "vm_control",
  "vm_memory",
@@ -920,7 +919,6 @@ dependencies = [
  "tpm2",
  "tube_transporter",
  "usb_util",
- "uuid",
  "vfio_sys",
  "vhost",
  "virtio_sys",
@@ -984,6 +982,8 @@ dependencies = [
  "net_util",
  "prebuilts",
  "rand",
+ "serde_json",
+ "swap",
  "tempfile",
 ]
 
@@ -2115,15 +2115,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qcow_utils"
-version = "0.1.0"
-dependencies = [
- "base",
- "disk",
- "libc",
-]
-
-[[package]]
 name = "quote"
 version = "0.3.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2295,11 +2286,10 @@ dependencies = [
 
 [[package]]
 name = "rutabaga_gfx"
-version = "0.1.1-alpha.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "cfg-if",
- "data_model 0.1.1-alpha.1",
  "libc",
  "log",
  "nix",
@@ -2733,7 +2723,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1674845326ee10d37ca60470760d4288a6f80f304007d92e5c53bab78c9cfd79"
 dependencies = [
  "getrandom",
- "serde",
 ]
 
 [[package]]
@@ -2842,6 +2831,7 @@ dependencies = [
  "bitflags 2.3.2",
  "cfg-if",
  "data_model 0.1.1-alpha.1",
+ "enumn",
  "libc",
  "remain",
  "serde",

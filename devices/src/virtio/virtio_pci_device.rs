@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use acpi_tables::sdt::SDT;
 use anyhow::anyhow;
 use anyhow::Context;
@@ -561,10 +561,6 @@ impl VirtioPciDevice {
             })
             .collect::<anyhow::Result<BTreeMap<usize, Queue>>>()?;
 
-        if let Some(iommu) = &self.iommu {
-            self.device.set_iommu(iommu);
-        }
-
         if let Err(e) = self.device.activate(self.mem.clone(), interrupt, queues) {
             error!("{} activate failed: {:#}", self.debug_label(), e);
             self.common_config.driver_status |= VIRTIO_CONFIG_S_NEEDS_RESET as u8;
@@ -593,13 +589,17 @@ impl VirtioPciDevice {
         }
         Ok(())
     }
+
+    pub fn virtio_device(&self) -> &dyn VirtioDevice {
+        self.device.as_ref()
+    }
+
+    pub fn pci_address(&self) -> Option<PciAddress> {
+        self.pci_address
+    }
 }
 
 impl PciDevice for VirtioPciDevice {
-    fn supports_iommu(&self) -> bool {
-        self.device.supports_iommu()
-    }
-
     fn debug_label(&self) -> String {
         format!("pci{}", self.device.debug_label())
     }
@@ -856,12 +856,6 @@ impl PciDevice for VirtioPciDevice {
         }
 
         if !self.device_activated && self.is_driver_ready() {
-            if let Some(iommu) = &self.iommu {
-                for q in &mut self.queues {
-                    q.set_iommu(Arc::clone(iommu));
-                }
-            }
-
             if let Err(e) = self.activate() {
                 error!("failed to activate device: {:#}", e);
             }
@@ -884,15 +878,13 @@ impl PciDevice for VirtioPciDevice {
         self.device.on_device_sandboxed();
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
         self.device.generate_acpi(&self.pci_address, sdts)
     }
 
-    fn set_iommu(&mut self, iommu: IpcMemoryMapper) -> anyhow::Result<()> {
-        assert!(self.supports_iommu());
-        self.iommu = Some(Arc::new(Mutex::new(iommu)));
-        Ok(())
+    fn as_virtio_pci_device(&self) -> Option<&VirtioPciDevice> {
+        Some(self)
     }
 }
 

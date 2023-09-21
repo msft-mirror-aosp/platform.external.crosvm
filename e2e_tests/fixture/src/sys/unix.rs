@@ -225,7 +225,29 @@ impl TestVmSys {
         command.args(["--socket", test_dir.join(CONTROL_PIPE).to_str().unwrap()]);
 
         if let Some(rootfs_url) = &cfg.rootfs_url {
-            TestVmSys::configure_rootfs(command, cfg.o_direct, &local_path_from_url(rootfs_url));
+            if cfg.rootfs_rw {
+                std::fs::copy(
+                    match cfg.rootfs_compressed {
+                        true => local_path_from_url(rootfs_url).with_extension("raw"),
+                        false => local_path_from_url(rootfs_url),
+                    },
+                    test_dir.join("rw_rootfs.img"),
+                )
+                .unwrap();
+                TestVmSys::configure_rootfs(command, cfg.o_direct, &test_dir.join("rw_rootfs.img"));
+            } else if cfg.rootfs_compressed {
+                TestVmSys::configure_rootfs(
+                    command,
+                    cfg.o_direct,
+                    &local_path_from_url(rootfs_url).with_extension("raw"),
+                );
+            } else {
+                TestVmSys::configure_rootfs(
+                    command,
+                    cfg.o_direct,
+                    &local_path_from_url(rootfs_url),
+                );
+            }
         };
 
         // Set initrd if being requested
@@ -318,7 +340,12 @@ impl TestVmSys {
         Ok(())
     }
 
-    pub fn crosvm_command(&self, command: &str, mut args: Vec<String>, sudo: bool) -> Result<()> {
+    pub fn crosvm_command(
+        &self,
+        command: &str,
+        mut args: Vec<String>,
+        sudo: bool,
+    ) -> Result<Vec<u8>> {
         args.push(self.control_socket_path.to_str().unwrap().to_string());
 
         println!("$ crosvm {} {:?}", command, &args.join(" "));
@@ -337,7 +364,7 @@ impl TestVmSys {
         if !output.status.success() {
             Err(anyhow!("Command failed with exit code {}", output.status))
         } else {
-            Ok(())
+            Ok(output.stdout)
         }
     }
 }

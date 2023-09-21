@@ -14,7 +14,9 @@ pub mod device_constants;
 pub mod input;
 mod interrupt;
 mod iommu;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(feature = "net")]
+pub mod net;
+#[cfg(target_arch = "x86_64")]
 pub mod pvclock;
 mod queue;
 mod rng;
@@ -32,6 +34,7 @@ pub mod console;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod resource_bridge;
+pub mod scsi;
 #[cfg(feature = "audio")]
 pub mod snd;
 pub mod vhost;
@@ -69,9 +72,16 @@ pub use self::interrupt::Interrupt;
 pub use self::interrupt::InterruptSnapshot;
 pub use self::iommu::ipc_memory_mapper;
 pub use self::iommu::memory_mapper;
-pub use self::iommu::memory_util;
 pub use self::iommu::Iommu;
 pub use self::iommu::IommuError;
+#[cfg(feature = "net")]
+pub use self::net::Net;
+#[cfg(feature = "net")]
+pub use self::net::NetError;
+#[cfg(feature = "net")]
+pub use self::net::NetParameters;
+#[cfg(feature = "net")]
+pub use self::net::NetParametersMode;
 pub use self::queue::split_descriptor_chain::Desc;
 pub use self::queue::split_descriptor_chain::SplitDescriptorChain;
 pub use self::queue::Queue;
@@ -100,14 +110,11 @@ cfg_if::cfg_if! {
 
         pub mod wl;
         pub mod fs;
-        pub mod net;
 
         pub use self::iommu::sys::unix::vfio_wrapper;
-        pub use self::net::Net;
-        pub use self::net::NetError;
-        pub use self::net::NetParameters;
-        pub use self::net::NetParametersMode;
+        #[cfg(feature = "net")]
         pub use self::net::VhostNetParameters;
+        #[cfg(feature = "net")]
         pub use self::net::VHOST_NET_DEFAULT_PATH;
         pub use self::p9::P9;
         pub use self::pmem::Pmem;
@@ -115,23 +122,16 @@ cfg_if::cfg_if! {
         pub use self::snd::new_sound;
         pub use self::wl::Wl;
     } else if #[cfg(windows)] {
-        #[cfg(feature = "slirp")]
-        pub mod net;
-
-        #[cfg(feature = "slirp")]
-        pub use self::net::Net;
-        #[cfg(feature = "slirp")]
-        pub use self::net::NetParameters;
         pub use self::vsock::Vsock;
     } else {
         compile_error!("Unsupported platform");
     }
 }
 
-use futures::channel::oneshot;
 use std::cmp;
 use std::convert::TryFrom;
 
+use futures::channel::oneshot;
 use hypervisor::ProtectionType;
 use virtio_sys::virtio_config::VIRTIO_F_ACCESS_PLATFORM;
 use virtio_sys::virtio_config::VIRTIO_F_VERSION_1;
@@ -254,8 +254,6 @@ pub enum VirtioDeviceType {
     Regular,
     /// Socket-backed vhost-user device.
     VhostUser,
-    /// Virtio-backed vhost-user device, aka virtio-vhost-user.
-    Vvu,
 }
 
 impl VirtioDeviceType {
@@ -265,7 +263,6 @@ impl VirtioDeviceType {
         match self {
             VirtioDeviceType::Regular => format!("{base}_device"),
             VirtioDeviceType::VhostUser => format!("{base}_device_vhost_user"),
-            VirtioDeviceType::Vvu => format!("{base}_device_vvu"),
         }
     }
 }

@@ -3,10 +3,7 @@
 // found in the LICENSE file.
 
 // These tests are only implemented for kvm & gvm. Other hypervisors may be added in the future.
-#![cfg(all(
-    any(feature = "gvm", unix),
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#![cfg(all(any(feature = "gvm", unix), target_arch = "x86_64"))]
 
 mod sys;
 
@@ -270,7 +267,7 @@ where
                 .add_vcpu(0, &vcpu)
                 .expect("failed to add vcpu to irqchip");
 
-            let cpu_config = CpuConfigX86_64::new(false, false, false, false, false, false, None);
+            let cpu_config = CpuConfigX86_64::new(false, false, false, false, false, None);
             if !vm.check_capability(VmCap::EarlyInitCpuid) {
                 setup_cpuid(&hyp, &irq_chip, &vcpu, 0, 1, cpu_config).unwrap();
             }

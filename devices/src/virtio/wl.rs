@@ -88,7 +88,9 @@ use base::WaitContext;
 use base::WorkerThread;
 use data_model::*;
 #[cfg(feature = "minigbm")]
-use libc::{EBADF, EINVAL};
+use libc::EBADF;
+#[cfg(feature = "minigbm")]
+use libc::EINVAL;
 use remain::sorted;
 use resources::address_allocator::AddressAllocator;
 use resources::AddressRange;
@@ -135,10 +137,12 @@ use super::SharedMemoryMapper;
 use super::SharedMemoryRegion;
 use super::VirtioDevice;
 use super::Writer;
-use crate::virtio::device_constants::wl::QUEUE_SIZES;
 use crate::virtio::device_constants::wl::VIRTIO_WL_F_SEND_FENCES;
 use crate::virtio::device_constants::wl::VIRTIO_WL_F_TRANS_FLAGS;
 use crate::virtio::device_constants::wl::VIRTIO_WL_F_USE_SHMEM;
+
+const QUEUE_SIZE: u16 = 256;
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE];
 
 const VIRTWL_SEND_MAX_ALLOCS: usize = 28;
 const VIRTIO_WL_CMD_VFD_NEW: u32 = 256;
@@ -2051,5 +2055,22 @@ impl VirtioDevice for Wl {
                 Ok(())
             }
         }
+    }
+
+    // ANDROID: Add empty implementations for successful snapshot taking. Change to full
+    // implementation as part of b/266514618
+    // virtio-wl is not used, but is created. As such, virtio_snapshot/restore will be called when
+    // cuttlefish attempts to take a snapshot.
+    fn virtio_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn virtio_restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            data == serde_json::Value::Null,
+            "unexpected snapshot data: should be null, got {}",
+            data,
+        );
+        Ok(())
     }
 }

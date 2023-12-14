@@ -73,6 +73,7 @@ pub fn runnable_vcpu<V>(
     no_smt: bool,
     has_bios: bool,
     use_hypervisor_signals: bool,
+    core_scheduling: bool,
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
     vcpu_cgroup_tasks_file: Option<File>,
@@ -119,7 +120,7 @@ where
     )
     .context("failed to configure vcpu")?;
 
-    if !enable_per_vm_core_scheduling {
+    if core_scheduling && !enable_per_vm_core_scheduling {
         // Do per-vCPU core scheduling by setting a unique cookie to each vCPU.
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
@@ -609,6 +610,7 @@ pub fn run_vcpu<V>(
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))] to_gdb_tube: Option<
         mpsc::Sender<VcpuDebugStatusMessage>,
     >,
+    core_scheduling: bool,
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
     privileged_vm: bool,
@@ -658,6 +660,7 @@ where
                 no_smt,
                 has_bios,
                 use_hypervisor_signals,
+                core_scheduling,
                 enable_per_vm_core_scheduling,
                 host_cpu_topology,
                 vcpu_cgroup_tasks_file,

@@ -222,6 +222,8 @@ pub trait HotPlugBus {
     /// - 'None': hotplug bus isn't match with host pci device
     /// - 'Some(bus_num)': hotplug bus is match and put the device at bus_num
     fn is_match(&self, host_addr: PciAddress) -> Option<u8>;
+    /// Gets the upstream PCI Address of the hotplug bus
+    fn get_address(&self) -> Option<PciAddress>;
     /// Gets the secondary bus number of this bus
     fn get_secondary_bus_number(&self) -> Option<u8>;
     /// Add hotplug device into this bus
@@ -327,7 +329,7 @@ impl Ord for BusRange {
 
 impl PartialOrd for BusRange {
     fn partial_cmp(&self, other: &BusRange) -> Option<Ordering> {
-        self.base.partial_cmp(&other.base)
+        Some(self.cmp(other))
     }
 }
 
@@ -466,7 +468,7 @@ impl Bus {
         for device_entry in self.unique_devices() {
             match device_entry {
                 BusDeviceEntry::OuterSync(dev) => {
-                    let dev = dev.lock();
+                    let mut dev = dev.lock();
                     debug!("Snapshot on device: {}", dev.debug_label());
                     add_snapshot(
                         u32::from(dev.device_id()),
@@ -763,7 +765,7 @@ mod tests {
     }
 
     impl Suspendable for DummyDevice {
-        fn snapshot(&self) -> AnyhowResult<serde_json::Value> {
+        fn snapshot(&mut self) -> AnyhowResult<serde_json::Value> {
             serde_json::to_value(self).context("error serializing")
         }
 
@@ -819,7 +821,7 @@ mod tests {
     }
 
     impl Suspendable for ConstantDevice {
-        fn snapshot(&self) -> AnyhowResult<serde_json::Value> {
+        fn snapshot(&mut self) -> AnyhowResult<serde_json::Value> {
             serde_json::to_value(self).context("error serializing")
         }
 

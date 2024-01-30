@@ -243,10 +243,11 @@ fn create_timer_node(fdt: &mut Fdt, num_cpus: u32) -> Result<()> {
 }
 
 fn create_virt_cpufreq_node(fdt: &mut Fdt, num_cpus: u64) -> Result<()> {
-    // TODO: b/320770346: add compatible string
+    let compatible = "virtual,android-v-only-cpufreq";
     let vcf_node = fdt.root_mut().subnode_mut("cpufreq")?;
     let reg = [AARCH64_VIRTFREQ_BASE, AARCH64_VIRTFREQ_SIZE * num_cpus];
 
+    vcf_node.set_prop("compatible", compatible)?;
     vcf_node.set_prop("reg", &reg)?;
     Ok(())
 }

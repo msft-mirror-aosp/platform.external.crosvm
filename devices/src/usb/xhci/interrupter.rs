@@ -19,7 +19,10 @@ use super::xhci_abi::Trb;
 use super::xhci_abi::TrbCast;
 use super::xhci_abi::TrbCompletionCode;
 use super::xhci_abi::TrbType;
-use super::xhci_regs::*;
+use super::xhci_regs::XhciRegs;
+use super::xhci_regs::ERDP_EVENT_HANDLER_BUSY;
+use super::xhci_regs::IMAN_INTERRUPT_PENDING;
+use super::xhci_regs::USB_STS_EVENT_INTERRUPT;
 use crate::register_space::Register;
 
 #[sorted]
@@ -136,7 +139,7 @@ impl Interrupter {
 
     /// Enable/Disable this interrupter.
     pub fn set_enabled(&mut self, enabled: bool) -> Result<()> {
-        usb_debug!("interrupter set enabled {}", enabled);
+        xhci_trace!("interrupter set_enabled({})", enabled);
         self.enabled = enabled;
         self.interrupt_if_needed()
     }
@@ -151,7 +154,7 @@ impl Interrupter {
 
     /// Set event ring seg table size.
     pub fn set_event_ring_seg_table_size(&mut self, size: u16) -> Result<()> {
-        usb_debug!("interrupter set seg table size {}", size);
+        xhci_trace!("interrupter set_event_ring_seg_table_size({})", size);
         self.event_ring
             .set_seg_table_size(size)
             .map_err(Error::SetSegTableSize)
@@ -159,7 +162,7 @@ impl Interrupter {
 
     /// Set event ring segment table base address.
     pub fn set_event_ring_seg_table_base_addr(&mut self, addr: GuestAddress) -> Result<()> {
-        usb_debug!("interrupter set table base addr {:#x}", addr.0);
+        xhci_trace!("interrupter set_table_base_addr({:#x})", addr.0);
         self.event_ring
             .set_seg_table_base_addr(addr)
             .map_err(Error::SetSegTableBaseAddr)
@@ -167,21 +170,20 @@ impl Interrupter {
 
     /// Set event ring dequeue pointer.
     pub fn set_event_ring_dequeue_pointer(&mut self, addr: GuestAddress) -> Result<()> {
-        usb_debug!("interrupter set dequeue ptr addr {:#x}", addr.0);
+        xhci_trace!("interrupter set_dequeue_pointer(addr = {:#x})", addr.0);
         self.event_ring.set_dequeue_pointer(addr);
         self.interrupt_if_needed()
     }
 
     /// Set event hander busy.
     pub fn set_event_handler_busy(&mut self, busy: bool) -> Result<()> {
-        usb_debug!("set event handler busy {}", busy);
+        xhci_trace!("set_event_handler_busy({})", busy);
         self.event_handler_busy = busy;
         self.interrupt_if_needed()
     }
 
     /// Send and interrupt.
     pub fn interrupt(&mut self) -> Result<()> {
-        usb_debug!("sending interrupt");
         self.event_handler_busy = true;
         self.usbsts.set_bits(USB_STS_EVENT_INTERRUPT);
         self.iman.set_bits(IMAN_INTERRUPT_PENDING);

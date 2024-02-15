@@ -2,6 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "kiwi")]
+use base::warn;
+#[cfg(feature = "kiwi")]
+use battlestar::process_invariants;
 use devices::virtio::GpuDisplayMode;
 use devices::virtio::GpuDisplayParameters;
 #[cfg(feature = "gfxstream")]
@@ -55,16 +59,6 @@ pub(crate) fn fixup_gpu_options(
             "backend type {:?} is deprecated, please use gfxstream",
             gpu_params.mode
         ));
-
-        #[cfg(unix)]
-        {
-            if gpu_params.gfxstream_use_guest_angle.is_some() {
-                return Err("'angle' is only supported for gfxstream backend".to_string());
-            }
-            if gpu_params.gfxstream_support_gles31.is_some() {
-                return Err("'gles31' is only supported for gfxstream backend".to_string());
-            }
-        }
     }
 
     Ok(FixedGpuParameters(gpu_params))
@@ -114,7 +108,35 @@ pub(crate) fn validate_gpu_config(cfg: &mut Config) -> Result<(), String> {
             gpu_parameters.display_params.push(Default::default());
         }
 
-        let (width, height) = gpu_parameters.display_params[0].get_virtual_display_size();
+        // Process invariants are not written to the static `PROCESS_INVARIANTS` yet, so instead of
+        // calling `phenotype!(kiwi_emulator_feature, get_enable_4k_uhd_resolution)`, we have to
+        // load it by ourselves.
+        // TODO(b/276909432): The BSS should read the experiment flags and specify the virtual
+        // display size, and then we can remove this workaround.
+        #[cfg(feature = "kiwi")]
+        let is_4k_uhd_enabled = match process_invariants::load_invariants(
+            &cfg.process_invariants_data_handle,
+            &cfg.process_invariants_data_size,
+        ) {
+            Ok(invariants) => invariants
+                .get_flag_snapshot()
+                .get_features()
+                .kiwi_emulator_feature
+                .clone()
+                .unwrap_or_default()
+                .get_enable_4k_uhd_resolution(),
+            Err(e) => {
+                warn!(
+                    "Failed to load process invariants, will not enable 4k UHD: {}",
+                    e
+                );
+                false
+            }
+        };
+        #[cfg(not(feature = "kiwi"))]
+        let is_4k_uhd_enabled = false;
+        let (width, height) =
+            gpu_parameters.display_params[0].get_virtual_display_size_4k_uhd(is_4k_uhd_enabled);
         if let Some(virtio_multi_touch) = cfg.virtio_multi_touch.first_mut() {
             virtio_multi_touch.set_default_size(width, height);
         }
@@ -129,7 +151,7 @@ pub(crate) fn validate_gpu_config(cfg: &mut Config) -> Result<(), String> {
 mod tests {
     use argh::FromArgs;
     #[cfg(feature = "gfxstream")]
-    use rutabaga_gfx::RutabagaWsi;
+    use devices::virtio::GpuWsi;
 
     use super::*;
     use crate::crosvm::config::from_key_values;
@@ -230,11 +252,11 @@ mod tests {
     fn parse_gpu_options_gfxstream_with_wsi_specified() {
         {
             let gpu_params = parse_gpu_options("backend=gfxstream,wsi=vk").unwrap();
-            assert!(matches!(gpu_params.wsi, Some(RutabagaWsi::Vulkan)));
+            assert!(matches!(gpu_params.wsi, Some(GpuWsi::Vulkan)));
         }
         {
             let gpu_params = parse_gpu_options("wsi=vk,backend=gfxstream").unwrap();
-            assert!(matches!(gpu_params.wsi, Some(RutabagaWsi::Vulkan)));
+            assert!(matches!(gpu_params.wsi, Some(GpuWsi::Vulkan)));
         }
         {
             assert!(parse_gpu_options("backend=gfxstream,wsi=invalid_value").is_err());
@@ -304,104 +326,6 @@ mod tests {
                 format!("vulkan=invalid_value,backend={}", BACKEND).as_str()
             )
             .is_err());
-        }
-    }
-
-    #[cfg(feature = "gfxstream")]
-    #[test]
-    fn parse_gpu_options_gfxstream_with_guest_angle_specified() {
-        assert_eq!(
-            parse_gpu_options("backend=gfxstream")
-                .unwrap()
-                .gfxstream_use_guest_angle,
-            None,
-        );
-        assert_eq!(
-            parse_gpu_options("backend=gfxstream,angle=true")
-                .unwrap()
-                .gfxstream_use_guest_angle,
-            Some(true),
-        );
-        assert_eq!(
-            parse_gpu_options("angle=true,backend=gfxstream")
-                .unwrap()
-                .gfxstream_use_guest_angle,
-            Some(true),
-        );
-        assert_eq!(
-            parse_gpu_options("backend=gfxstream,angle=false")
-                .unwrap()
-                .gfxstream_use_guest_angle,
-            Some(false),
-        );
-        assert_eq!(
-            parse_gpu_options("angle=false,backend=gfxstream")
-                .unwrap()
-                .gfxstream_use_guest_angle,
-            Some(false),
-        );
-        assert!(parse_gpu_options("backend=gfxstream,angle=invalid_value").is_err());
-        assert!(parse_gpu_options("angle=invalid_value,backend=gfxstream").is_err());
-    }
-
-    #[test]
-    fn parse_gpu_options_not_gfxstream_with_angle_specified() {
-        assert!(parse_gpu_options("backend=2d,angle=true").is_err());
-        assert!(parse_gpu_options("angle=true,backend=2d").is_err());
-
-        #[cfg(feature = "virgl_renderer")]
-        {
-            assert!(parse_gpu_options("backend=virglrenderer,angle=true").is_err());
-            assert!(parse_gpu_options("angle=true,backend=virglrenderer").is_err());
-        }
-    }
-
-    #[cfg(feature = "gfxstream")]
-    #[test]
-    fn parse_gpu_options_gfxstream_with_gles31_specified() {
-        assert_eq!(
-            parse_gpu_options("backend=gfxstream")
-                .unwrap()
-                .gfxstream_support_gles31,
-            None,
-        );
-        assert_eq!(
-            parse_gpu_options("backend=gfxstream,gles31=true")
-                .unwrap()
-                .gfxstream_support_gles31,
-            Some(true),
-        );
-        assert_eq!(
-            parse_gpu_options("gles31=true,backend=gfxstream")
-                .unwrap()
-                .gfxstream_support_gles31,
-            Some(true),
-        );
-        assert_eq!(
-            parse_gpu_options("backend=gfxstream,gles31=false")
-                .unwrap()
-                .gfxstream_support_gles31,
-            Some(false),
-        );
-        assert_eq!(
-            parse_gpu_options("gles31=false,backend=gfxstream")
-                .unwrap()
-                .gfxstream_support_gles31,
-            Some(false),
-        );
-        assert!(parse_gpu_options("backend=gfxstream,gles31=invalid_value").is_err());
-        assert!(parse_gpu_options("gles31=invalid_value,backend=gfxstream").is_err());
-    }
-
-    #[test]
-    fn parse_gpu_options_not_gfxstream_with_gles31_specified() {
-        assert!(parse_gpu_options("backend=2d,gles31=true").is_err());
-        assert!(parse_gpu_options("gles31=true,backend=2d").is_err());
-
-        #[cfg(feature = "virgl_renderer")]
-        {
-            assert!(parse_gpu_options("backend=virglrenderer,gles31=true").is_err());
-            assert!(parse_gpu_options("gles31=true,backend=virglrenderer").is_err());
         }
     }
 
@@ -787,7 +711,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
     fn parse_gpu_options_and_gpu_display_options_multi_display_supported_on_unix() {
         {

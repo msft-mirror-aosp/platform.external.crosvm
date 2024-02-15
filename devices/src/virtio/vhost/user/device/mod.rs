@@ -7,6 +7,8 @@ mod block;
 pub mod gpu;
 mod handler;
 mod listener;
+#[cfg(feature = "net")]
+mod net;
 #[cfg(feature = "audio")]
 pub mod snd;
 
@@ -20,9 +22,14 @@ pub use gpu::run_gpu_device;
 pub use gpu::Options as GpuOptions;
 pub use handler::VhostBackendReqConnectionState;
 pub use handler::VhostUserBackend;
-use handler::VhostUserPlatformOps;
 pub use listener::sys::VhostUserListener;
 pub use listener::VhostUserListenerTrait;
+#[cfg(feature = "net")]
+pub use net::run_net_device;
+#[cfg(feature = "net")]
+pub use net::NetBackend;
+#[cfg(feature = "net")]
+pub use net::Options as NetOptions;
 #[cfg(feature = "audio")]
 pub use snd::run_snd_device;
 #[cfg(feature = "audio")]
@@ -30,27 +37,19 @@ pub use snd::Options as SndOptions;
 use vmm_vhost::VhostUserSlaveReqHandler;
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
         mod console;
         mod fs;
-        mod net;
         mod vsock;
-        mod vvu;
         mod wl;
 
         pub use vsock::{run_vsock_device, Options as VsockOptions, VhostUserVsockDevice};
         pub use wl::{run_wl_device, parse_wayland_sock, Options as WlOptions};
         pub use console::{create_vu_console_device, run_console_device, Options as ConsoleOptions};
         pub use fs::{run_fs_device, Options as FsOptions};
-        pub use net::{run_net_device, Options as NetOptions};
     } else if #[cfg(windows)] {
-        #[cfg(feature = "slirp")]
-        mod net;
-        #[cfg(feature = "slirp")]
-        pub use net::{run_net_device, Options as NetOptions};
-        #[cfg(feature = "slirp")]
+        #[cfg(all(feature = "net", feature = "slirp"))]
         pub use net::sys::windows::NetBackendConfig;
-
     }
 }
 
@@ -69,11 +68,9 @@ pub trait VhostUserDevice {
 
     /// Turn this device into a vhost-user request handler that will run the device.
     ///
-    /// `ops` is the vhost-user platform ops (i.e. transport) that will be used. `ex` is an
-    /// executor the device can use to schedule its tasks.
+    /// `ex` is an executor the device can use to schedule its tasks.
     fn into_req_handler(
         self: Box<Self>,
-        ops: Box<dyn VhostUserPlatformOps>,
         ex: &Executor,
     ) -> anyhow::Result<Box<dyn VhostUserSlaveReqHandler>>;
 

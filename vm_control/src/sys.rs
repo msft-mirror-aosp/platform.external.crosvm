@@ -3,12 +3,13 @@
 // found in the LICENSE file.
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        pub mod unix;
-        use unix as platform;
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
+        pub mod linux;
+        use linux as platform;
         pub use platform::{VmMsyncRequest, VmMsyncResponse, FsMappingRequest};
         #[cfg(feature = "gpu")]
         pub use platform::gpu::UnixDisplayMode as DisplayMode;
+        pub use platform::handle_request_with_timeout;
     } else if #[cfg(windows)] {
         pub mod windows;
         pub use windows as platform;
@@ -20,3 +21,5 @@ cfg_if::cfg_if! {
 }
 
 pub use platform::handle_request;
+pub use platform::prepare_shared_memory_region;
+pub use platform::should_prepare_memory_region;

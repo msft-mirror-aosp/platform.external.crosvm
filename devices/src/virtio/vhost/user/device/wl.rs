@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -17,7 +18,6 @@ use argh::FromArgs;
 use base::clone_descriptor;
 use base::error;
 use base::warn;
-use base::Event;
 use base::FromRawDescriptor;
 use base::SafeDescriptor;
 use base::Tube;
@@ -26,36 +26,33 @@ use cros_async::AsyncWrapper;
 use cros_async::EventAsync;
 use cros_async::Executor;
 use cros_async::IoSource;
-use futures::future::AbortHandle;
-use futures::future::Abortable;
 use hypervisor::ProtectionType;
 #[cfg(feature = "minigbm")]
 use rutabaga_gfx::RutabagaGralloc;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::VhostUserProtocolFeatures;
-use vmm_vhost::message::VhostUserVirtioFeatures;
+use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 
 use crate::virtio::base_features;
-use crate::virtio::device_constants::wl::QUEUE_SIZES;
+use crate::virtio::device_constants::wl::NUM_QUEUES;
 use crate::virtio::device_constants::wl::VIRTIO_WL_F_SEND_FENCES;
 use crate::virtio::device_constants::wl::VIRTIO_WL_F_TRANS_FLAGS;
 use crate::virtio::device_constants::wl::VIRTIO_WL_F_USE_SHMEM;
-use crate::virtio::vhost::user::device::handler::sys::Doorbell;
+use crate::virtio::vhost::user::device::handler::Error as DeviceError;
 use crate::virtio::vhost::user::device::handler::VhostBackendReqConnection;
 use crate::virtio::vhost::user::device::handler::VhostBackendReqConnectionState;
 use crate::virtio::vhost::user::device::handler::VhostUserBackend;
+use crate::virtio::vhost::user::device::handler::WorkerState;
 use crate::virtio::vhost::user::device::listener::sys::VhostUserListener;
 use crate::virtio::vhost::user::device::listener::VhostUserListenerTrait;
 use crate::virtio::wl;
+use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 use crate::virtio::SharedMemoryRegion;
 
-const MAX_QUEUE_NUM: usize = QUEUE_SIZES.len();
-
 async fn run_out_queue(
-    mut queue: Queue,
-    mem: GuestMemory,
-    doorbell: Doorbell,
+    queue: Rc<RefCell<Queue>>,
+    doorbell: Interrupt,
     kick_evt: EventAsync,
     wlstate: Rc<RefCell<wl::WlState>>,
 ) {
@@ -65,14 +62,17 @@ async fn run_out_queue(
             break;
         }
 
-        wl::process_out_queue(&doorbell, &mut queue, &mem, &mut wlstate.borrow_mut());
+        wl::process_out_queue(
+            &doorbell,
+            &mut queue.borrow_mut(),
+            &mut wlstate.borrow_mut(),
+        );
     }
 }
 
 async fn run_in_queue(
-    mut queue: Queue,
-    mem: GuestMemory,
-    doorbell: Doorbell,
+    queue: Rc<RefCell<Queue>>,
+    doorbell: Interrupt,
     kick_evt: EventAsync,
     wlstate: Rc<RefCell<wl::WlState>>,
     wlstate_ctx: IoSource<AsyncWrapper<SafeDescriptor>>,
@@ -86,8 +86,11 @@ async fn run_in_queue(
             break;
         }
 
-        if wl::process_in_queue(&doorbell, &mut queue, &mem, &mut wlstate.borrow_mut())
-            == Err(wl::DescriptorsExhausted)
+        if wl::process_in_queue(
+            &doorbell,
+            &mut queue.borrow_mut(),
+            &mut wlstate.borrow_mut(),
+        ) == Err(wl::DescriptorsExhausted)
         {
             if let Err(e) = kick_evt.next_val().await {
                 error!("Failed to read kick event for in queue: {}", e);
@@ -107,7 +110,7 @@ struct WlBackend {
     features: u64,
     acked_features: u64,
     wlstate: Option<Rc<RefCell<wl::WlState>>>,
-    workers: [Option<AbortHandle>; MAX_QUEUE_NUM],
+    workers: [Option<WorkerState<Rc<RefCell<Queue>>, ()>>; NUM_QUEUES],
     backend_req_conn: VhostBackendReqConnectionState,
 }
 
@@ -121,7 +124,7 @@ impl WlBackend {
             | 1 << VIRTIO_WL_F_TRANS_FLAGS
             | 1 << VIRTIO_WL_F_SEND_FENCES
             | 1 << VIRTIO_WL_F_USE_SHMEM
-            | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+            | 1 << VHOST_USER_F_PROTOCOL_FEATURES;
         WlBackend {
             ex: ex.clone(),
             wayland_paths: Some(wayland_paths),
@@ -140,7 +143,7 @@ impl WlBackend {
 
 impl VhostUserBackend for WlBackend {
     fn max_queue_num(&self) -> usize {
-        MAX_QUEUE_NUM
+        NUM_QUEUES
     }
 
     fn features(&self) -> u64 {
@@ -202,15 +205,18 @@ impl VhostUserBackend for WlBackend {
         &mut self,
         idx: usize,
         queue: Queue,
-        mem: GuestMemory,
-        doorbell: Doorbell,
-        kick_evt: Event,
+        _mem: GuestMemory,
+        doorbell: Interrupt,
     ) -> anyhow::Result<()> {
-        if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
+        if self.workers[idx].is_some() {
             warn!("Starting new queue handler without stopping old handler");
-            handle.abort();
+            self.stop_queue(idx)?;
         }
 
+        let kick_evt = queue
+            .event()
+            .try_clone()
+            .context("failed to clone queue event")?;
         let kick_evt = EventAsync::new(kick_evt, &self.ex)
             .context("failed to create EventAsync for kick_evt")?;
 
@@ -258,11 +264,12 @@ impl VhostUserBackend for WlBackend {
             }
             Some(state) => state.clone(),
         };
-        let (handle, registration) = AbortHandle::new_pair();
-        match idx {
+        let queue = Rc::new(RefCell::new(queue));
+        let queue_task = match idx {
             0 => {
                 let wlstate_ctx = clone_descriptor(wlstate.borrow().wait_ctx())
                     .map(|fd| {
+                        // SAFETY:
                         // Safe because we just created this fd.
                         AsyncWrapper::new(unsafe { SafeDescriptor::from_raw_descriptor(fd) })
                     })
@@ -273,35 +280,42 @@ impl VhostUserBackend for WlBackend {
                             .context("failed to create async WaitContext")
                     })?;
 
-                self.ex
-                    .spawn_local(Abortable::new(
-                        run_in_queue(queue, mem, doorbell, kick_evt, wlstate, wlstate_ctx),
-                        registration,
-                    ))
-                    .detach();
+                self.ex.spawn_local(run_in_queue(
+                    queue.clone(),
+                    doorbell,
+                    kick_evt,
+                    wlstate,
+                    wlstate_ctx,
+                ))
             }
-            1 => {
-                self.ex
-                    .spawn_local(Abortable::new(
-                        run_out_queue(queue, mem, doorbell, kick_evt, wlstate),
-                        registration,
-                    ))
-                    .detach();
-            }
+            1 => self
+                .ex
+                .spawn_local(run_out_queue(queue.clone(), doorbell, kick_evt, wlstate)),
             _ => bail!("attempted to start unknown queue: {}", idx),
-        }
-        self.workers[idx] = Some(handle);
+        };
+        self.workers[idx] = Some(WorkerState { queue_task, queue });
         Ok(())
     }
 
-    fn stop_queue(&mut self, idx: usize) {
-        if let Some(handle) = self.workers.get_mut(idx).and_then(Option::take) {
-            handle.abort();
+    fn stop_queue(&mut self, idx: usize) -> anyhow::Result<Queue> {
+        if let Some(worker) = self.workers.get_mut(idx).and_then(Option::take) {
+            // Wait for queue_task to be aborted.
+            let _ = self.ex.run_until(worker.queue_task.cancel());
+
+            let queue = match Rc::try_unwrap(worker.queue) {
+                Ok(queue_cell) => queue_cell.into_inner(),
+                Err(_) => panic!("failed to recover queue from worker"),
+            };
+
+            Ok(queue)
+        } else {
+            Err(anyhow::Error::new(DeviceError::WorkerNotFound))
         }
     }
+
     fn reset(&mut self) {
-        for handle in self.workers.iter_mut().filter_map(Option::take) {
-            handle.abort();
+        for worker in self.workers.iter_mut().filter_map(Option::take) {
+            let _ = self.ex.run_until(worker.queue_task.cancel());
         }
     }
 
@@ -312,7 +326,7 @@ impl VhostUserBackend for WlBackend {
         })
     }
 
-    fn set_backend_req_connection(&mut self, conn: VhostBackendReqConnection) {
+    fn set_backend_req_connection(&mut self, conn: Arc<VhostBackendReqConnection>) {
         if let VhostBackendReqConnectionState::Connected(_) = &self.backend_req_conn {
             warn!("connection already established. Overwriting");
         }
@@ -349,10 +363,7 @@ pub fn parse_wayland_sock(value: &str) -> Result<(String, PathBuf), String> {
 pub struct Options {
     #[argh(option, arg_name = "PATH")]
     /// path to bind a listening vhost-user socket
-    socket: Option<String>,
-    #[argh(option, arg_name = "STRING")]
-    /// VFIO-PCI device name (e.g. '0000:00:07.0')
-    vfio: Option<String>,
+    socket: String,
     #[argh(option, from_str_fn(parse_wayland_sock), arg_name = "PATH[,name=NAME]")]
     /// path to one or more Wayland sockets. The unnamed socket is used for
     /// displaying virtual screens while the named ones are used for IPC
@@ -368,7 +379,6 @@ pub fn run_wl_device(opts: Options) -> anyhow::Result<()> {
     let Options {
         wayland_sock,
         socket,
-        vfio,
         resource_bridge,
     } = opts;
 
@@ -379,7 +389,7 @@ pub fn run_wl_device(opts: Options) -> anyhow::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match UnixSeqpacket::connect(&p) {
-                    Ok(s) => return Ok(Tube::new_from_unix_seqpacket(s)),
+                    Ok(s) => return Ok(Tube::new_from_unix_seqpacket(s).unwrap()),
                     Err(e) => {
                         if Instant::now() < deadline {
                             thread::sleep(Duration::from_millis(50));
@@ -395,8 +405,7 @@ pub fn run_wl_device(opts: Options) -> anyhow::Result<()> {
 
     let ex = Executor::new().context("failed to create executor")?;
 
-    let listener =
-        VhostUserListener::new_from_socket_or_vfio(&socket, &vfio, QUEUE_SIZES.len(), None)?;
+    let listener = VhostUserListener::new_socket(&socket, None)?;
 
     let backend = Box::new(WlBackend::new(&ex, wayland_paths, resource_bridge));
     // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.

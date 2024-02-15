@@ -3,10 +3,7 @@
 // found in the LICENSE file.
 
 // These tests are only implemented for kvm & gvm. Other hypervisors may be added in the future.
-#![cfg(all(
-    any(feature = "gvm", unix),
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
+#![cfg(all(any(feature = "gvm", unix), target_arch = "x86_64"))]
 
 mod sys;
 
@@ -16,8 +13,11 @@ use std::sync::Arc;
 use std::thread;
 
 use arch::LinuxArch;
+use arch::SmbiosOptions;
 use base::Event;
 use base::Tube;
+use devices::Bus;
+use devices::BusType;
 use devices::IrqChipX86_64;
 use devices::PciConfigIo;
 use hypervisor::CpuConfigX86_64;
@@ -109,8 +109,8 @@ where
 
     let mut irq_chip = create_irq_chip(vm.try_clone().expect("failed to clone vm"), 1, device_tube);
 
-    let mmio_bus = Arc::new(devices::Bus::new());
-    let io_bus = Arc::new(devices::Bus::new());
+    let mmio_bus = Arc::new(Bus::new(BusType::Mmio));
+    let io_bus = Arc::new(Bus::new(BusType::Io));
     let (exit_evt_wrtube, _) = Tube::directional_pair().unwrap();
 
     let mut control_tubes = vec![TaggedControlTube::VmIrq(irqchip_tube)];
@@ -129,23 +129,26 @@ where
 
     let devices = vec![];
 
-    let (pci, pci_irqs, _pid_debug_label_map, _amls) = arch::generate_pci_root(
+    let (pci, pci_irqs, _pid_debug_label_map, _amls, _gpe_scope_amls) = arch::generate_pci_root(
         devices,
         &mut irq_chip,
         mmio_bus.clone(),
+        GuestAddress(0),
+        12,
         io_bus.clone(),
         &mut resources,
         &mut vm,
         4,
         None,
         #[cfg(feature = "swap")]
-        None,
+        &mut None,
     )
     .unwrap();
     let pci = Arc::new(Mutex::new(pci));
     let (pcibus_exit_evt_wrtube, _) = Tube::directional_pair().unwrap();
     let pci_bus = Arc::new(Mutex::new(PciConfigIo::new(
         pci.clone(),
+        false,
         pcibus_exit_evt_wrtube,
     )));
     io_bus.insert(pci_bus, 0xcf8, 0x8).unwrap();
@@ -172,7 +175,7 @@ where
         &serial_params,
         None,
         #[cfg(feature = "swap")]
-        None,
+        &mut None,
     )
     .unwrap();
 
@@ -208,10 +211,6 @@ where
             .try_clone()
             .expect("unable to clone exit_evt_wrtube"),
         Default::default(),
-        #[cfg(feature = "direct")]
-        &[], // direct_gpe
-        #[cfg(feature = "direct")]
-        &[], // direct_fixed_evts
         &mut irq_chip,
         X86_64_SCI_IRQ,
         (None, None),
@@ -219,9 +218,11 @@ where
         max_bus,
         &mut resume_notify_devices,
         #[cfg(feature = "swap")]
-        None,
-        #[cfg(unix)]
+        &mut None,
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         false,
+        Default::default(),
+        &pci_irqs,
     )
     .unwrap();
 
@@ -233,12 +234,13 @@ where
         kernel_end,
         params,
         None,
+        Vec::new(),
     )
     .expect("failed to setup system_memory");
 
     // Note that this puts the mptable at 0x9FC00 in guest physical memory.
     mptable::setup_mptable(&guest_mem, 1, &pci_irqs).expect("failed to setup mptable");
-    smbios::setup_smbios(&guest_mem, None, &Vec::new()).expect("failed to setup smbios");
+    smbios::setup_smbios(&guest_mem, &SmbiosOptions::default(), 0).expect("failed to setup smbios");
 
     let mut apic_ids = Vec::new();
     acpi::create_acpi_tables(
@@ -272,7 +274,7 @@ where
                 .add_vcpu(0, &vcpu)
                 .expect("failed to add vcpu to irqchip");
 
-            let cpu_config = CpuConfigX86_64::new(false, false, false, false, false, false, None);
+            let cpu_config = CpuConfigX86_64::new(false, false, false, false, false, None);
             if !vm.check_capability(VmCap::EarlyInitCpuid) {
                 setup_cpuid(&hyp, &irq_chip, &vcpu, 0, 1, cpu_config).unwrap();
             }
@@ -292,7 +294,7 @@ where
             // mov [eax],ebx
             // so we're writing 0x12 (the contents of ebx) to the address
             // in eax (write_addr).
-            vcpu_regs.rax = write_addr.offset() as u64;
+            vcpu_regs.rax = write_addr.offset();
             vcpu_regs.rbx = 0x12;
             // ecx will contain 0, but after the second instruction it will
             // also contain 0x12
@@ -309,9 +311,8 @@ where
 
             set_lint(0, &mut irq_chip).unwrap();
 
-            let run_handle = vcpu.take_run_handle(None).unwrap();
             loop {
-                match vcpu.run(&run_handle).expect("run failed") {
+                match vcpu.run().expect("run failed") {
                     VcpuExit::Io => {
                         vcpu.handle_io(&mut |IoParams {
                                                  address,

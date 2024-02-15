@@ -4,24 +4,21 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error as ThisError;
 
-use super::HandleExecutor;
-use super::HandleSource;
+use super::HandleReactor;
+use crate::common_executor;
+use crate::common_executor::RawExecutor;
 use crate::AsyncResult;
 use crate::IntoAsync;
 use crate::IoSource;
 
-/// Creates a concrete `IoSource` using the handle_executor.
-pub(crate) fn async_handle_from<'a, F: IntoAsync + 'a>(f: F) -> AsyncResult<IoSource<F>> {
-    Ok(IoSource::Handle(HandleSource::new(
-        vec![f].into_boxed_slice(),
-    )?))
-}
+pub const DEFAULT_IO_CONCURRENCY: u32 = 1;
 
 /// An executor for scheduling tasks that poll futures to completion.
 ///
@@ -35,7 +32,7 @@ pub(crate) fn async_handle_from<'a, F: IntoAsync + 'a>(f: F) -> AsyncResult<IoSo
 /// represented on the POSIX side as an enum, rather than a trait. This leads to some code &
 /// interface duplication, but as far as we understand that is unavoidable.
 ///
-/// See https://chromium-review.googlesource.com/c/chromiumos/platform/crosvm/+/2571401/2..6/cros_async/src/executor.rs#b75
+/// See <https://chromium-review.googlesource.com/c/chromiumos/platform/crosvm/+/2571401/2..6/cros_async/src/executor.rs#b75>
 /// for further details.
 ///
 /// # Examples
@@ -87,11 +84,11 @@ pub(crate) fn async_handle_from<'a, F: IntoAsync + 'a>(f: F) -> AsyncResult<IoSo
 ///     Ok(len)
 /// }
 ///
-/// #[cfg(unix)]
+/// #[cfg(any(target_os = "android", target_os = "linux"))]
 /// # fn do_it() -> Result<(), Box<dyn Error>> {
 ///     let ex = Executor::new()?;
 ///
-///     let (rx, tx) = base::pipe(true)?;
+///     let (rx, tx) = base::pipe()?;
 ///     let zero = File::open("/dev/zero")?;
 ///     let zero_bytes = CHUNK_SIZE * 7;
 ///     let zero_to_pipe = transfer_data(
@@ -116,13 +113,14 @@ pub(crate) fn async_handle_from<'a, F: IntoAsync + 'a>(f: F) -> AsyncResult<IoSo
 ///
 /// #     Ok(())
 /// # }
-/// #[cfg(unix)]
+/// #[cfg(any(target_os = "android", target_os = "linux"))]
 /// # do_it().unwrap();
 /// ```
 
 #[derive(Clone)]
 pub enum Executor {
-    Handle(HandleExecutor),
+    Handle(Arc<RawExecutor<HandleReactor>>),
+    Overlapped(Arc<RawExecutor<HandleReactor>>),
 }
 
 /// An enum to express the kind of the backend of `Executor`
@@ -132,6 +130,7 @@ pub enum Executor {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub enum ExecutorKind {
     Handle,
+    Overlapped,
 }
 
 /// If set, [`Executor::new()`] is created with `ExecutorKind` of `DEFAULT_EXECUTOR_KIND`.
@@ -154,14 +153,28 @@ pub enum SetDefaultExecutorKindError {
     SetMoreThanOnce(ExecutorKind),
 }
 
+/// Reference to a task managed by the executor.
+///
+/// Dropping a `TaskHandle` attempts to cancel the associated task. Call `detach` to allow it to
+/// continue running the background.
+///
+/// `await`ing the `TaskHandle` waits for the task to finish and yields its result.
 pub enum TaskHandle<R> {
-    Handle(super::HandleExecutorTaskHandle<R>),
+    Handle(common_executor::TaskHandle<HandleReactor, R>),
 }
 
 impl<R: Send + 'static> TaskHandle<R> {
     pub fn detach(self) {
         match self {
             TaskHandle::Handle(x) => x.detach(),
+        }
+    }
+
+    // Cancel the task and wait for it to stop. Returns the result of the task if it was already
+    // finished.
+    pub async fn cancel(self) -> Option<R> {
+        match self {
+            TaskHandle::Handle(x) => x.cancel().await,
         }
     }
 }
@@ -185,8 +198,19 @@ impl Executor {
     /// Create a new `Executor` of the given `ExecutorKind`.
     pub fn with_executor_kind(kind: ExecutorKind) -> AsyncResult<Self> {
         match kind {
-            ExecutorKind::Handle => Ok(Executor::Handle(
-                HandleExecutor::new().map_err(crate::io_ext::Error::HandleExecutor)?,
+            ExecutorKind::Handle => Ok(Executor::Handle(RawExecutor::<HandleReactor>::new()?)),
+            ExecutorKind::Overlapped => {
+                Ok(Executor::Overlapped(RawExecutor::<HandleReactor>::new()?))
+            }
+        }
+    }
+
+    /// Create a new `Executor` of the given `ExecutorKind`.
+    pub fn with_kind_and_concurrency(kind: ExecutorKind, concurrency: u32) -> AsyncResult<Self> {
+        match kind {
+            ExecutorKind::Handle => Ok(Executor::Handle(RawExecutor::<HandleReactor>::new()?)),
+            ExecutorKind::Overlapped => Ok(Executor::Overlapped(
+                RawExecutor::<HandleReactor>::new_with(HandleReactor::new_with(concurrency)?)?,
             )),
         }
     }
@@ -196,7 +220,21 @@ impl Executor {
     /// executor.
     pub fn async_from<'a, F: IntoAsync + 'a>(&self, f: F) -> AsyncResult<IoSource<F>> {
         match self {
-            Executor::Handle(_) => async_handle_from(f),
+            Executor::Handle(ex) => ex.new_source(f),
+            Executor::Overlapped(ex) => ex.new_source(f),
+        }
+    }
+
+    /// Create a new overlapped `IoSource<F>` associated with `self`. Callers may then use the
+    /// If the executor is not overlapped, then Handle source is returned.
+    /// returned `IoSource` to directly start async operations without needing a separate reference
+    /// to the executor.
+    pub fn async_overlapped_from<'a, F: IntoAsync + 'a>(&self, f: F) -> AsyncResult<IoSource<F>> {
+        match self {
+            Executor::Handle(ex) => ex.new_source(f),
+            Executor::Overlapped(ex) => Ok(IoSource::Overlapped(super::OverlappedSource::new(
+                f, ex, false,
+            )?)),
         }
     }
 
@@ -253,6 +291,7 @@ impl Executor {
     {
         match self {
             Executor::Handle(ex) => TaskHandle::Handle(ex.spawn(f)),
+            Executor::Overlapped(ex) => TaskHandle::Handle(ex.spawn(f)),
         }
     }
 
@@ -290,6 +329,7 @@ impl Executor {
     {
         match self {
             Executor::Handle(ex) => TaskHandle::Handle(ex.spawn_local(f)),
+            Executor::Overlapped(ex) => TaskHandle::Handle(ex.spawn_local(f)),
         }
     }
 
@@ -360,6 +400,7 @@ impl Executor {
     pub fn run_until<F: Future>(&self, f: F) -> AsyncResult<F::Output> {
         match self {
             Executor::Handle(ex) => Ok(ex.run_until(f)?),
+            Executor::Overlapped(ex) => Ok(ex.run_until(f)?),
         }
     }
 }

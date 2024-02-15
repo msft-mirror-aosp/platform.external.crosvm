@@ -37,6 +37,8 @@ static EMBEDDED_BPFS: Lazy<std::collections::HashMap<&str, Vec<u8>>> =
 pub const MAX_OPEN_FILES_DEFAULT: u64 = 1024;
 /// The max open files for gpu processes.
 const MAX_OPEN_FILES_FOR_GPU: u64 = 32768;
+/// The max open files for jail warden, matching FD_RAW_FAILURE.
+pub const MAX_OPEN_FILES_FOR_JAIL_WARDEN: u64 = 65536;
 
 /// The user in the jail to run as.
 pub enum RunAsUser {
@@ -46,6 +48,9 @@ pub enum RunAsUser {
     CurrentUser,
     /// Runs as the root user in the jail.
     Root,
+    /// Runs as the specified uid and gid.
+    /// This requires `SandboxConfig::ugid_map` to be set.
+    Specified(u32, u32),
 }
 
 /// Config for the sandbox to be created by [Minijail].
@@ -59,6 +64,8 @@ pub struct SandboxConfig<'a> {
     pub ugid_map: Option<(&'a str, &'a str)>,
     /// The remount mode instead of default MS_PRIVATE.
     pub remount_mode: Option<c_ulong>,
+    /// Whether to use empty net namespace. Enabled by default.
+    pub namespace_net: bool,
     /// Whether or not to configure the jail to support bind-mounts.
     ///
     /// Note that most device processes deny `open(2)` and `openat(2)` by seccomp policy and just
@@ -79,6 +86,7 @@ impl<'a> SandboxConfig<'a> {
             seccomp_policy_name: policy,
             ugid_map: None,
             remount_mode: None,
+            namespace_net: true,
             bind_mounts: false,
             run_as: RunAsUser::Unspecified,
         }
@@ -171,6 +179,14 @@ pub fn create_sandbox_minijail(
             jail.gidmap(&format!("0 {} 1", crosvm_gid))
                 .context("error setting GID map")?;
         }
+        RunAsUser::Specified(uid, gid) => {
+            if uid != 0 {
+                jail.change_uid(uid)
+            }
+            if gid != 0 {
+                jail.change_gid(gid)
+            }
+        }
     }
     if config.bind_mounts {
         // Create a tmpfs in the device's root directory so that we can bind mount files.
@@ -191,8 +207,10 @@ pub fn create_sandbox_minijail(
     // Run in a new mount namespace.
     jail.namespace_vfs();
 
-    // Run in an empty network namespace.
-    jail.namespace_net();
+    if config.namespace_net {
+        // Run in an empty network namespace.
+        jail.namespace_net();
+    }
 
     // Don't allow the device to gain new privileges.
     jail.no_new_privs();
@@ -314,7 +332,11 @@ pub fn simple_jail(jail_config: &Option<JailConfig>, policy: &str) -> Result<Opt
 }
 
 /// Creates [Minijail] for gpu processes.
-pub fn create_gpu_minijail(root: &Path, config: &SandboxConfig) -> Result<Minijail> {
+pub fn create_gpu_minijail(
+    root: &Path,
+    config: &SandboxConfig,
+    render_node_only: bool,
+) -> Result<Minijail> {
     let mut jail = create_sandbox_minijail(root, MAX_OPEN_FILES_FOR_GPU, config)?;
 
     // Device nodes required for DRM.
@@ -332,10 +354,7 @@ pub fn create_gpu_minijail(root: &Path, config: &SandboxConfig) -> Result<Minija
     let sys_devices_path = Path::new("/sys/devices");
     jail.mount_bind(sys_devices_path, sys_devices_path, false)?;
 
-    let drm_dri_path = Path::new("/dev/dri");
-    if drm_dri_path.exists() {
-        jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
-    }
+    jail_mount_bind_drm(&mut jail, render_node_only)?;
 
     // If the ARM specific devices exist on the host, bind mount them in.
     let mali0_path = Path::new("/dev/mali0");
@@ -379,6 +398,31 @@ pub fn create_gpu_minijail(root: &Path, config: &SandboxConfig) -> Result<Minija
     }
 
     Ok(jail)
+}
+
+/// Selectively bind mount drm nodes into `jail` based on `render_node_only`
+///
+/// This function will not return an error if drm nodes don't exist
+pub fn jail_mount_bind_drm(jail: &mut Minijail, render_node_only: bool) -> Result<()> {
+    if render_node_only {
+        const DRM_NUM_NODES: u32 = 63;
+        const DRM_RENDER_NODE_START: u32 = 128;
+        for offset in 0..DRM_NUM_NODES {
+            let path_str = format!("/dev/dri/renderD{}", DRM_RENDER_NODE_START + offset);
+            let drm_dri_path = Path::new(&path_str);
+            if !drm_dri_path.exists() {
+                break;
+            }
+            jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
+        }
+    } else {
+        let drm_dri_path = Path::new("/dev/dri");
+        if drm_dri_path.exists() {
+            jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Mirror-mount all the directories in `dirs` into `jail` on a best-effort basis.

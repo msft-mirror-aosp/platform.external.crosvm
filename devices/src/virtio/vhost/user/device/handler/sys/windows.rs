@@ -25,24 +25,23 @@ use vmm_vhost::message::VhostUserMsgHeader;
 use vmm_vhost::SlaveReqHandler;
 use vmm_vhost::VhostUserSlaveReqHandler;
 
-use crate::virtio::vhost::user::device::handler::CallEvent;
 use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
-use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
-
-pub type Doorbell = CallEvent;
 
 pub fn read_from_tube_transporter(
     raw_transport_tube: RawDescriptor,
 ) -> anyhow::Result<TubeTransferDataList> {
-    // Safe because we know that raw_transport_tube is valid (passed by inheritance), and that
-    // the blocking & framing modes are accurate because we create them ourselves in the broker.
-    let tube_transporter = TubeTransporterReader::create_tube_transporter_reader(unsafe {
-        PipeConnection::from_raw_descriptor(
-            raw_transport_tube,
-            FramingMode::Message,
-            BlockingMode::Wait,
-        )
-    });
+    let tube_transporter = TubeTransporterReader::create_tube_transporter_reader(
+        // SAFETY:
+        // Safe because we know that raw_transport_tube is valid (passed by inheritance), and that
+        // the blocking & framing modes are accurate because we create them ourselves in the broker.
+        unsafe {
+            PipeConnection::from_raw_descriptor(
+                raw_transport_tube,
+                FramingMode::Message,
+                BlockingMode::Wait,
+            )
+        },
+    );
 
     tube_transporter.read_tubes().map_err(anyhow::Error::msg)
 }
@@ -71,8 +70,7 @@ pub async fn run_handler(
     pin_mut!(close_event_fut);
     pin_mut!(exit_event_fut);
 
-    let mut pending_header: Option<(VhostUserMsgHeader<MasterReq>, Option<Vec<std::fs::File>>)> =
-        None;
+    let mut pending_header: Option<(VhostUserMsgHeader<MasterReq>, Vec<std::fs::File>)> = None;
     loop {
         select! {
             _read_res = read_event_fut => {
@@ -113,53 +111,24 @@ pub async fn run_handler(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Barrier;
+pub mod test_helpers {
+    use base::Tube;
+    use vmm_vhost::message::MasterReq;
+    use vmm_vhost::SlaveReqHandler;
+    use vmm_vhost::VhostUserSlaveReqHandler;
 
-    use super::*;
-    use crate::virtio::vhost::user::device::handler::tests::*;
-    use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
-    use crate::virtio::vhost::user::device::handler::*;
-    use crate::virtio::vhost::user::vmm::VhostUserHandler;
-    #[test]
-    fn test_vhost_user_activate() {
-        const QUEUES_NUM: usize = 2;
+    pub(crate) fn setup() -> (Tube, Tube) {
+        Tube::pair().unwrap()
+    }
 
-        let (dev_tube, main_tube) = Tube::pair().unwrap();
+    pub(crate) fn connect(tube: Tube) -> Tube {
+        tube
+    }
 
-        let vmm_bar = Arc::new(Barrier::new(2));
-        let dev_bar = vmm_bar.clone();
-
-        std::thread::spawn(move || {
-            // VMM side
-            let allow_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
-            let init_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
-            let allow_protocol_features = VhostUserProtocolFeatures::CONFIG;
-
-            let mut vmm_handler = VhostUserHandler::new_from_connection(
-                main_tube,
-                QUEUES_NUM as u64,
-                allow_features,
-                init_features,
-                allow_protocol_features,
-            )
-            .unwrap();
-
-            vmm_handler_send_requests(&mut vmm_handler, QUEUES_NUM);
-
-            vmm_bar.wait();
-        });
-
-        // Device side
-        let backend = std::sync::Mutex::new(DeviceRequestHandler::new(
-            Box::new(FakeBackend::new()),
-            Box::new(VhostUserRegularOps),
-        ));
-
-        let mut req_handler = SlaveReqHandler::from_stream(dev_tube, backend);
-
-        test_handle_requests(&mut req_handler, QUEUES_NUM);
-
-        dev_bar.wait();
+    pub(crate) fn listen<S: VhostUserSlaveReqHandler>(
+        dev_tube: Tube,
+        handler: S,
+    ) -> SlaveReqHandler<S> {
+        SlaveReqHandler::from_stream(dev_tube, handler)
     }
 }

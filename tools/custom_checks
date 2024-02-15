@@ -45,6 +45,7 @@ CRLF_LINE_ENDING_FILES: List[str] = [
     "**.bat",
     "**.ps1",
     "e2e_tests/tests/goldens/backcompat_test_simple_lspci_win.txt",
+    "tools/windows/build_test",
 ]
 
 
@@ -59,7 +60,7 @@ def check_line_endings(*files: str):
     "Checks line endings. Windows only files are using clrf. All others just lf."
     for line in cmd("git ls-files --eol", *files).lines():
         parts = line.split()
-        file = parts[3]
+        file = parts[-1]
         index_endings = parts[0][2:]
         wdir_endings = parts[1][2:]
 
@@ -91,7 +92,6 @@ def check_rust_lockfiles(*_files: str):
 # These crosvm features are currently not built upstream. Do not add to this list.
 KNOWN_DISABLED_FEATURES = [
     "default-no-sandbox",
-    "direct",
     "libvda",
     "seccomp_trace",
     "whpx",
@@ -107,9 +107,17 @@ def check_rust_features(*_files: str):
     def collect_features(feature_name: str) -> Generator[str, None, None]:
         yield feature_name
         for feature in features[feature_name]:
-            name = feature.split("/")[0]
-            if name in features:
-                yield from collect_features(name)
+            if feature in features:
+                yield from collect_features(feature)
+            else:
+                # optional crate is enabled through sub-feature of the crate.
+                # e.g. protos optional crate/feature is enabled by protos/plugin
+                optional_crate_name = feature.split("/")[0]
+                if (
+                    optional_crate_name in features
+                    and features[optional_crate_name][0] == f"dep:{optional_crate_name}"
+                ):
+                    yield optional_crate_name
 
     all_platform_features = set(
         (
@@ -118,6 +126,7 @@ def check_rust_features(*_files: str):
             *collect_features("all-armhf"),
             *collect_features("all-mingw64"),
             *collect_features("all-msvc64"),
+            *collect_features("all-riscv64"),
         )
     )
     disabled_features = [

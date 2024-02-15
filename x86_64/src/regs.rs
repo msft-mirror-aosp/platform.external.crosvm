@@ -228,9 +228,9 @@ const EFER_LME: u64 = 0x100;
 const EFER_LMA: u64 = 0x400;
 
 const BOOT_GDT_OFFSET: u64 = 0x1500;
-const BOOT_IDT_OFFSET: u64 = 0x1520;
+const BOOT_IDT_OFFSET: u64 = 0x1528;
 
-const BOOT_GDT_MAX: usize = 4;
+const BOOT_GDT_MAX: usize = 5;
 
 fn write_gdt_table(table: &[u64], guest_mem: &GuestMemory) -> Result<()> {
     let boot_gdt_addr = GuestAddress(BOOT_GDT_OFFSET);
@@ -258,24 +258,26 @@ fn write_idt_value(val: u64, guest_mem: &GuestMemory) -> Result<()> {
 
 /// Configures the GDT, IDT, and segment registers for long mode.
 pub fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut Sregs) -> Result<()> {
-    let gdt_table: [u64; BOOT_GDT_MAX as usize] = [
+    // reference: https://docs.kernel.org/arch/x86/boot.html?highlight=__BOOT_CS#id1
+    let gdt_table: [u64; BOOT_GDT_MAX] = [
+        gdt::gdt_entry(0, 0, 0),            // NULL
         gdt::gdt_entry(0, 0, 0),            // NULL
         gdt::gdt_entry(0xa09b, 0, 0xfffff), // CODE
         gdt::gdt_entry(0xc093, 0, 0xfffff), // DATA
         gdt::gdt_entry(0x808b, 0, 0xfffff), // TSS
     ];
 
-    let code_seg = gdt::segment_from_gdt(gdt_table[1], 1);
-    let data_seg = gdt::segment_from_gdt(gdt_table[2], 2);
-    let tss_seg = gdt::segment_from_gdt(gdt_table[3], 3);
+    let code_seg = gdt::segment_from_gdt(gdt_table[2], 2);
+    let data_seg = gdt::segment_from_gdt(gdt_table[3], 3);
+    let tss_seg = gdt::segment_from_gdt(gdt_table[4], 4);
 
     // Write segments
     write_gdt_table(&gdt_table[..], mem)?;
-    sregs.gdt.base = BOOT_GDT_OFFSET as u64;
+    sregs.gdt.base = BOOT_GDT_OFFSET;
     sregs.gdt.limit = mem::size_of_val(&gdt_table) as u16 - 1;
 
     write_idt_value(0, mem)?;
-    sregs.idt.base = BOOT_IDT_OFFSET as u64;
+    sregs.idt.base = BOOT_IDT_OFFSET;
     sregs.idt.limit = mem::size_of::<u64>() as u16 - 1;
 
     sregs.cs = code_seg;
@@ -301,11 +303,11 @@ pub fn setup_page_tables(mem: &GuestMemory, sregs: &mut Sregs) -> Result<()> {
     let boot_pde_addr = GuestAddress(0xb000);
 
     // Entry covering VA [0..512GB)
-    mem.write_obj_at_addr(boot_pdpte_addr.offset() as u64 | 0x03, boot_pml4_addr)
+    mem.write_obj_at_addr(boot_pdpte_addr.offset() | 0x03, boot_pml4_addr)
         .map_err(|_| Error::WritePML4Address)?;
 
     // Entry covering VA [0..1GB)
-    mem.write_obj_at_addr(boot_pde_addr.offset() as u64 | 0x03, boot_pdpte_addr)
+    mem.write_obj_at_addr(boot_pde_addr.offset() | 0x03, boot_pdpte_addr)
         .map_err(|_| Error::WritePDPTEAddress)?;
 
     // 512 2MB entries together covering VA [0..1GB). Note we are assuming
@@ -314,7 +316,7 @@ pub fn setup_page_tables(mem: &GuestMemory, sregs: &mut Sregs) -> Result<()> {
         mem.write_obj_at_addr((i << 21) + 0x83u64, boot_pde_addr.unchecked_add(i * 8))
             .map_err(|_| Error::WritePDEAddress)?;
     }
-    sregs.cr3 = boot_pml4_addr.offset() as u64;
+    sregs.cr3 = boot_pml4_addr.offset();
     sregs.cr4 |= X86_CR4_PAE;
     sregs.cr0 |= X86_CR0_PG;
     sregs.efer |= EFER_LMA; // Long mode is active. Must be auto-enabled with CR0_PG.
@@ -344,14 +346,17 @@ mod tests {
         configure_segments_and_sregs(&gm, &mut sregs).unwrap();
 
         assert_eq!(0x0, read_u64(&gm, BOOT_GDT_OFFSET));
-        assert_eq!(0xaf9b000000ffff, read_u64(&gm, BOOT_GDT_OFFSET + 8));
-        assert_eq!(0xcf93000000ffff, read_u64(&gm, BOOT_GDT_OFFSET + 16));
-        assert_eq!(0x8f8b000000ffff, read_u64(&gm, BOOT_GDT_OFFSET + 24));
+        assert_eq!(0xaf9b000000ffff, read_u64(&gm, BOOT_GDT_OFFSET + 0x10));
+        assert_eq!(0xcf93000000ffff, read_u64(&gm, BOOT_GDT_OFFSET + 0x18));
+        assert_eq!(0x8f8b000000ffff, read_u64(&gm, BOOT_GDT_OFFSET + 0x20));
         assert_eq!(0x0, read_u64(&gm, BOOT_IDT_OFFSET));
 
         assert_eq!(0, sregs.cs.base);
         assert_eq!(0xfffff, sregs.ds.limit);
-        assert_eq!(0x10, sregs.es.selector);
+        assert_eq!(0x10, sregs.cs.selector);
+        assert_eq!(0x18, sregs.ds.selector);
+        assert_eq!(0x18, sregs.es.selector);
+        assert_eq!(0x18, sregs.ss.selector);
         assert_eq!(1, sregs.fs.present);
         assert_eq!(1, sregs.gs.g);
         assert_eq!(0, sregs.ss.avl);

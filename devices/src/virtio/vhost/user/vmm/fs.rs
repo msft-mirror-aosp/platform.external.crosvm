@@ -4,14 +4,11 @@
 
 use data_model::Le32;
 use virtio_sys::virtio_fs::virtio_fs_config;
-use vmm_vhost::message::VhostUserProtocolFeatures;
 use zerocopy::AsBytes;
 
 use crate::virtio::device_constants::fs::FS_MAX_TAG_LEN;
-use crate::virtio::device_constants::fs::QUEUE_SIZE;
 use crate::virtio::vhost::user::vmm::Connection;
 use crate::virtio::vhost::user::vmm::Error;
-use crate::virtio::vhost::user::vmm::QueueSizes;
 use crate::virtio::vhost::user::vmm::Result;
 use crate::virtio::vhost::user::vmm::VhostUserVirtioDevice;
 use crate::virtio::DeviceType;
@@ -20,48 +17,40 @@ impl VhostUserVirtioDevice {
     pub fn new_fs(
         base_features: u64,
         connection: Connection,
-        tag: &str,
+        max_queue_size: Option<u16>,
+        tag: Option<&str>,
     ) -> Result<VhostUserVirtioDevice> {
-        if tag.len() > FS_MAX_TAG_LEN {
-            return Err(Error::TagTooLong {
-                len: tag.len(),
-                max: FS_MAX_TAG_LEN,
-            });
-        }
+        let cfg = if let Some(tag) = tag {
+            if tag.len() > FS_MAX_TAG_LEN {
+                return Err(Error::TagTooLong {
+                    len: tag.len(),
+                    max: FS_MAX_TAG_LEN,
+                });
+            }
 
-        // The spec requires a minimum of 2 queues: one worker queue and one high priority queue
-        let default_queues = 2;
+            let mut cfg_tag = [0u8; FS_MAX_TAG_LEN];
+            cfg_tag[..tag.len()].copy_from_slice(tag.as_bytes());
 
-        let mut cfg_tag = [0u8; FS_MAX_TAG_LEN];
-        cfg_tag[..tag.len()].copy_from_slice(tag.as_bytes());
-
-        let cfg = virtio_fs_config {
-            tag: cfg_tag,
-            // Only count the worker queues, exclude the high prio queue
-            num_request_queues: Le32::from(default_queues - 1),
+            Some(
+                virtio_fs_config {
+                    tag: cfg_tag,
+                    // Only count the request queue, exclude the high prio queue
+                    num_request_queues: Le32::from(1),
+                }
+                .as_bytes()
+                .to_vec(),
+            )
+        } else {
+            None
         };
 
-        let queue_sizes = QueueSizes::AskDevice {
-            queue_size: QUEUE_SIZE,
-            default_queues: default_queues as usize,
-        };
-        let max_queues = 2;
-
-        let allow_features = 0;
-
-        let allow_protocol_features =
-            VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG;
-
-        VhostUserVirtioDevice::new(
+        VhostUserVirtioDevice::new_internal(
             connection,
             DeviceType::Fs,
-            queue_sizes,
-            max_queues,
-            allow_features,
-            allow_protocol_features,
+            max_queue_size,
             base_features,
-            Some(cfg.as_bytes()),
-            false,
+            cfg.as_deref(),
+            None, // pci_address
         )
     }
 }

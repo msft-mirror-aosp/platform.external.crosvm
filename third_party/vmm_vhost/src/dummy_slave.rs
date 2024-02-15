@@ -5,9 +5,8 @@ use std::fs::File;
 
 use crate::message::*;
 use crate::Error;
-use crate::Protocol;
 use crate::Result;
-use crate::VhostUserSlaveReqHandlerMut;
+use crate::VhostUserSlaveReqHandler;
 
 pub const MAX_QUEUE_NUM: usize = 2;
 pub const MAX_VRING_NUM: usize = 256;
@@ -40,11 +39,7 @@ impl DummySlaveReqHandler {
     }
 }
 
-impl VhostUserSlaveReqHandlerMut for DummySlaveReqHandler {
-    fn protocol(&self) -> Protocol {
-        Protocol::Regular
-    }
-
+impl VhostUserSlaveReqHandler for DummySlaveReqHandler {
     fn set_owner(&mut self) -> Result<()> {
         if self.owned {
             return Err(Error::InvalidOperation);
@@ -82,8 +77,7 @@ impl VhostUserSlaveReqHandlerMut for DummySlaveReqHandler {
         // pass data to/from the backend until ring is enabled by
         // VHOST_USER_SET_VRING_ENABLE with parameter 1, or after it has
         // been disabled by VHOST_USER_SET_VRING_ENABLE with parameter 0.
-        let vring_enabled =
-            self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0;
+        let vring_enabled = self.acked_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0;
         for enabled in &mut self.vring_enabled {
             *enabled = vring_enabled;
         }
@@ -197,7 +191,7 @@ impl VhostUserSlaveReqHandlerMut for DummySlaveReqHandler {
     fn set_vring_enable(&mut self, index: u32, enable: bool) -> Result<()> {
         // This request should be handled only when VHOST_USER_F_PROTOCOL_FEATURES
         // has been negotiated.
-        if self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
+        if self.acked_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0 {
             return Err(Error::InvalidOperation);
         } else if index as usize >= self.queue_num || index as usize > self.queue_num {
             return Err(Error::InvalidParam);
@@ -253,6 +247,7 @@ impl VhostUserSlaveReqHandlerMut for DummySlaveReqHandler {
                 mmap_offset: 0,
                 num_queues: inflight.num_queues,
                 queue_size: inflight.queue_size,
+                ..Default::default()
             },
             file,
         ))
@@ -276,5 +271,21 @@ impl VhostUserSlaveReqHandlerMut for DummySlaveReqHandler {
 
     fn get_shared_memory_regions(&mut self) -> Result<Vec<VhostSharedMemoryRegion>> {
         Ok(Vec::new())
+    }
+
+    fn sleep(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn wake(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn restore(&mut self, _data_bytes: &[u8], _queue_evts: Vec<File>) -> Result<()> {
+        Ok(())
     }
 }

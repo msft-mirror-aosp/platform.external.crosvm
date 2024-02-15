@@ -30,7 +30,7 @@ fi
 #
 # TODO: Consider using android's prebuilt rust binaries. Currently doesn't work
 # because they try to incorrectly use system clang and llvm.
-RUST_TOOLCHAIN="1.65.0"
+RUST_TOOLCHAIN="1.68.2"
 rustup which --toolchain $RUST_TOOLCHAIN cargo || \
   rustup toolchain install $RUST_TOOLCHAIN
 CARGO_BIN="$(dirname $(rustup which --toolchain $RUST_TOOLCHAIN cargo))"
@@ -43,7 +43,7 @@ if [ ! "$REUSE" ]; then
 fi
 
 set -x
-cargo_embargo --cfg cargo_embargo.json $REUSE --cargo-bin "$CARGO_BIN"
+cargo_embargo $REUSE --cargo-bin "$CARGO_BIN" generate cargo_embargo.json
 set +x
 
 if [ ! "$REUSE" ]; then

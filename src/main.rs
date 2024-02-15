@@ -15,9 +15,11 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use argh::FromArgs;
+use base::debug;
 use base::error;
 use base::info;
 use base::syslog;
+use base::syslog::LogArgs;
 use base::syslog::LogConfig;
 use cmdline::RunCommand;
 use cmdline::UsbAttachCommand;
@@ -29,6 +31,7 @@ use crosvm::config::Config;
 use devices::virtio::vhost::user::device::run_block_device;
 #[cfg(feature = "gpu")]
 use devices::virtio::vhost::user::device::run_gpu_device;
+#[cfg(feature = "net")]
 use devices::virtio::vhost::user::device::run_net_device;
 #[cfg(feature = "audio")]
 use devices::virtio::vhost::user::device::run_snd_device;
@@ -57,6 +60,10 @@ use vm_control::client::do_gpu_display_list;
 #[cfg(feature = "gpu")]
 use vm_control::client::do_gpu_display_remove;
 use vm_control::client::do_modify_battery;
+#[cfg(feature = "pci-hotplug")]
+use vm_control::client::do_net_add;
+#[cfg(feature = "pci-hotplug")]
+use vm_control::client::do_net_remove;
 use vm_control::client::do_swap_status;
 use vm_control::client::do_usb_attach;
 use vm_control::client::do_usb_detach;
@@ -130,10 +137,7 @@ impl From<sys::ExitState> for CommandStatus {
     }
 }
 
-fn run_vm<F: 'static>(cmd: RunCommand, log_config: LogConfig<F>) -> Result<CommandStatus>
-where
-    F: Fn(&mut syslog::fmt::Formatter, &log::Record<'_>) -> std::io::Result<()> + Sync + Send,
-{
+fn run_vm(cmd: RunCommand, log_config: LogConfig) -> Result<CommandStatus> {
     let cfg = match TryInto::<Config>::try_into(cmd) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -174,7 +178,11 @@ fn stop_vms(cmd: cmdline::StopCommand) -> std::result::Result<(), ()> {
 }
 
 fn suspend_vms(cmd: cmdline::SuspendCommand) -> std::result::Result<(), ()> {
-    vms_request(&VmRequest::Suspend, cmd.socket_path)
+    if cmd.full {
+        vms_request(&VmRequest::SuspendVm, cmd.socket_path)
+    } else {
+        vms_request(&VmRequest::SuspendVcpus, cmd.socket_path)
+    }
 }
 
 fn swap_vms(cmd: cmdline::SwapCommand) -> std::result::Result<(), ()> {
@@ -183,7 +191,12 @@ fn swap_vms(cmd: cmdline::SwapCommand) -> std::result::Result<(), ()> {
         Enable(params) => (VmRequest::Swap(SwapCommand::Enable), &params.socket_path),
         Trim(params) => (VmRequest::Swap(SwapCommand::Trim), &params.socket_path),
         SwapOut(params) => (VmRequest::Swap(SwapCommand::SwapOut), &params.socket_path),
-        Disable(params) => (VmRequest::Swap(SwapCommand::Disable), &params.socket_path),
+        Disable(params) => (
+            VmRequest::Swap(SwapCommand::Disable {
+                slow_file_cleanup: params.slow_file_cleanup,
+            }),
+            &params.socket_path,
+        ),
         Status(params) => (VmRequest::Swap(SwapCommand::Status), &params.socket_path),
     };
     if let VmRequest::Swap(SwapCommand::Status) = req {
@@ -194,7 +207,11 @@ fn swap_vms(cmd: cmdline::SwapCommand) -> std::result::Result<(), ()> {
 }
 
 fn resume_vms(cmd: cmdline::ResumeCommand) -> std::result::Result<(), ()> {
-    vms_request(&VmRequest::Resume, cmd.socket_path)
+    if cmd.full {
+        vms_request(&VmRequest::ResumeVm, cmd.socket_path)
+    } else {
+        vms_request(&VmRequest::ResumeVcpus, cmd.socket_path)
+    }
 }
 
 fn powerbtn_vms(cmd: cmdline::PowerbtnCommand) -> std::result::Result<(), ()> {
@@ -213,6 +230,7 @@ fn inject_gpe(cmd: cmdline::GpeCommand) -> std::result::Result<(), ()> {
 fn balloon_vms(cmd: cmdline::BalloonCommand) -> std::result::Result<(), ()> {
     let command = BalloonControlCommand::Adjust {
         num_bytes: cmd.num_bytes,
+        wait_for_success: cmd.wait,
     };
     vms_request(&VmRequest::BalloonCommand(command), cmd.socket_path)
 }
@@ -235,6 +253,24 @@ fn balloon_stats(cmd: cmdline::BalloonStatsCommand) -> std::result::Result<(), (
     }
 }
 
+#[cfg(feature = "balloon")]
+fn balloon_ws(cmd: cmdline::BalloonWsCommand) -> std::result::Result<(), ()> {
+    let command = BalloonControlCommand::WorkingSet {};
+    let request = &VmRequest::BalloonCommand(command);
+    let response = handle_request(request, cmd.socket_path)?;
+    match serde_json::to_string_pretty(&response) {
+        Ok(response_json) => println!("{response_json}"),
+        Err(e) => {
+            error!("Failed to serialize into JSON: {e}");
+            return Err(());
+        }
+    }
+    match response {
+        VmResponse::BalloonWS { .. } => Ok(()),
+        _ => Err(()),
+    }
+}
+
 fn modify_battery(cmd: cmdline::BatteryCommand) -> std::result::Result<(), ()> {
     do_modify_battery(
         cmd.socket_path,
@@ -247,7 +283,7 @@ fn modify_battery(cmd: cmdline::BatteryCommand) -> std::result::Result<(), ()> {
 fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
     let (request, socket_path, vfio_path) = match cmd.command {
         cmdline::VfioSubCommand::Add(c) => {
-            let request = VmRequest::HotPlugCommand {
+            let request = VmRequest::HotPlugVfioCommand {
                 device: HotPlugDeviceInfo {
                     device_type: HotPlugDeviceType::EndPoint,
                     path: c.vfio_path.clone(),
@@ -258,7 +294,7 @@ fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
             (request, c.socket_path, c.vfio_path)
         }
         cmdline::VfioSubCommand::Remove(c) => {
-            let request = VmRequest::HotPlugCommand {
+            let request = VmRequest::HotPlugVfioCommand {
                 device: HotPlugDeviceInfo {
                     device_type: HotPlugDeviceType::EndPoint,
                     path: c.vfio_path.clone(),
@@ -276,6 +312,52 @@ fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
 
     vms_request(&request, socket_path)?;
     Ok(())
+}
+
+#[cfg(feature = "pci-hotplug")]
+fn modify_virtio_net(cmd: cmdline::VirtioNetCommand) -> std::result::Result<(), ()> {
+    match cmd.command {
+        cmdline::VirtioNetSubCommand::AddTap(c) => {
+            let bus_num = do_net_add(&c.tap_name, c.socket_path).map_err(|e| {
+                error!("{}", &e);
+            })?;
+            info!("Tap device {} plugged to PCI bus {}", &c.tap_name, bus_num);
+        }
+        cmdline::VirtioNetSubCommand::RemoveTap(c) => {
+            do_net_remove(c.bus, &c.socket_path).map_err(|e| {
+                error!("Tap device remove failed: {:?}", &e);
+            })?;
+            info!("Tap device removed from PCI bus {}", &c.bus);
+        }
+    };
+
+    Ok(())
+}
+
+#[cfg(feature = "composite-disk")]
+fn parse_composite_partition_arg(
+    partition_arg: &str,
+) -> std::result::Result<(String, String, bool), ()> {
+    let mut partition_fields = partition_arg.split(":");
+
+    let label = partition_fields.next();
+    let path = partition_fields.next();
+    let opt = partition_fields.next();
+
+    if let (Some(label), Some(path)) = (label, path) {
+        // By default, composite disk is read-only
+        let writable = match opt {
+            None => false,
+            Some(opt) => opt.contains("writable"),
+        };
+        Ok((label.to_owned(), path.to_owned(), writable))
+    } else {
+        error!(
+            "Must specify label and path for partition '{}', like LABEL:PARTITION",
+            partition_arg
+        );
+        Err(())
+    }
 }
 
 #[cfg(feature = "composite-disk")]
@@ -335,37 +417,32 @@ fn create_composite(cmd: cmdline::CreateCompositeCommand) -> std::result::Result
         .partitions
         .into_iter()
         .map(|partition_arg| {
-            if let [label, path] = partition_arg.split(":").collect::<Vec<_>>()[..] {
-                let partition_file = File::open(path)
-                    .map_err(|e| error!("Failed to open partition image: {}", e))?;
+            let (label, path, writable) = parse_composite_partition_arg(&partition_arg)?;
 
-                // Sparseness for composite disks is not user provided on Linux
-                // (e.g. via an option), and it has no runtime effect.
-                let size = create_disk_file(
-                    partition_file,
-                    /* is_sparse_file= */ true,
-                    disk::MAX_NESTING_DEPTH,
-                    Path::new(path),
-                )
-                .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
-                .get_len()
-                .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
-                Ok(PartitionInfo {
-                    label: label.to_owned(),
-                    path: Path::new(path).to_owned(),
-                    partition_type: ImagePartitionType::LinuxFilesystem,
-                    writable: false,
-                    size,
-                })
-            } else {
-                error!(
-                    "Must specify label and path for partition '{}', like LABEL:PATH",
-                    partition_arg
-                );
-                Err(())
-            }
+            let partition_file =
+                File::open(&path).map_err(|e| error!("Failed to open partition image: {}", e))?;
+
+            // Sparseness for composite disks is not user provided on Linux
+            // (e.g. via an option), and it has no runtime effect.
+            let size = create_disk_file(
+                partition_file,
+                /* is_sparse_file= */ true,
+                disk::MAX_NESTING_DEPTH,
+                Path::new(&path),
+            )
+            .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
+            .get_len()
+            .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
+
+            Ok(PartitionInfo {
+                label,
+                path: Path::new(&path).to_owned(),
+                partition_type: ImagePartitionType::LinuxFilesystem,
+                writable,
+                size,
+            })
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<PartitionInfo>, ()>>()?;
 
     create_composite_disk(
         &partitions,
@@ -433,6 +510,7 @@ fn start_device(opts: cmdline::DeviceCommand) -> std::result::Result<(), ()> {
             CrossPlatformDevicesCommands::Block(cfg) => run_block_device(cfg),
             #[cfg(feature = "gpu")]
             CrossPlatformDevicesCommands::Gpu(cfg) => run_gpu_device(cfg),
+            #[cfg(feature = "net")]
             CrossPlatformDevicesCommands::Net(cfg) => run_net_device(cfg),
             #[cfg(feature = "audio")]
             CrossPlatformDevicesCommands::Snd(cfg) => run_snd_device(cfg),
@@ -632,12 +710,16 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
     };
     let extended_status = args.extended_status;
 
-    info!("CLI arguments parsed.");
+    debug!("CLI arguments parsed.");
 
     let mut log_config = LogConfig {
-        filter: &args.log_level,
-        proc_name: args.syslog_tag.unwrap_or("crosvm".to_string()),
-        syslog: !args.no_syslog,
+        log_args: LogArgs {
+            filter: args.log_level,
+            proc_name: args.syslog_tag.unwrap_or("crosvm".to_string()),
+            syslog: !args.no_syslog,
+            ..Default::default()
+        },
+
         ..Default::default()
     };
 
@@ -646,7 +728,12 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
             // Past this point, usage of exit is in danger of leaking zombie processes.
             if let CrossPlatformCommands::Run(cmd) = command {
                 if let Some(syslog_tag) = &cmd.syslog_tag {
-                    log_config.proc_name = syslog_tag.clone();
+                    base::warn!(
+                        "`crosvm run --syslog-tag` is deprecated; please use \
+                         `crosvm --syslog-tag=\"{}\" run` instead",
+                        syslog_tag
+                    );
+                    log_config.log_args.proc_name = syslog_tag.clone();
                 }
                 // We handle run_vm separately because it does not simply signal success/error
                 // but also indicates whether the guest requested reset or stop.
@@ -671,6 +758,15 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
                     #[cfg(feature = "balloon")]
                     CrossPlatformCommands::BalloonStats(cmd) => {
                         balloon_stats(cmd).map_err(|_| anyhow!("balloon_stats subcommand failed"))
+                    }
+                    #[cfg(feature = "balloon")]
+                    CrossPlatformCommands::BalloonWs(cmd) => {
+                        balloon_ws(cmd).map_err(|_| anyhow!("balloon_ws subcommand failed"))
+                    }
+                    // TODO(b/288432539): remove once concierge is migrated
+                    #[cfg(feature = "balloon")]
+                    CrossPlatformCommands::BalloonWss(cmd) => {
+                        balloon_ws(cmd).map_err(|_| anyhow!("balloon_ws subcommand failed"))
                     }
                     CrossPlatformCommands::Battery(cmd) => {
                         modify_battery(cmd).map_err(|_| anyhow!("battery subcommand failed"))
@@ -724,6 +820,10 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
                     CrossPlatformCommands::Vfio(cmd) => {
                         modify_vfio(cmd).map_err(|_| anyhow!("vfio subcommand failed"))
                     }
+                    #[cfg(feature = "pci-hotplug")]
+                    CrossPlatformCommands::VirtioNet(cmd) => {
+                        modify_virtio_net(cmd).map_err(|_| anyhow!("virtio subcommand failed"))
+                    }
                     CrossPlatformCommands::Snapshot(cmd) => {
                         snapshot_vm(cmd).map_err(|_| anyhow!("snapshot subcommand failed"))
                     }
@@ -732,12 +832,13 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
             }
         }
         cmdline::Command::Sys(command) => {
+            let log_args = log_config.log_args.clone();
             // On windows, the sys commands handle their own logging setup, so we can't handle it
             // below otherwise logging will double init.
             if cfg!(unix) {
                 syslog::init_with(log_config).context("failed to initialize syslog")?;
             }
-            sys::run_command(command).map(|_| CommandStatus::SuccessOrVmStop)
+            sys::run_command(command, log_args).map(|_| CommandStatus::SuccessOrVmStop)
         }
     };
 
@@ -756,7 +857,7 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
 
 fn main() {
     syslog::early_init();
-    info!("crosvm started.");
+    debug!("crosvm started.");
     let res = crosvm_main(std::env::args());
 
     let exit_code = match &res {
@@ -875,5 +976,31 @@ mod tests {
         let res = crosvm_main(args.iter().map(|s| s.to_string()));
         let status = res.expect("arg parsing should succeed");
         assert_eq!(status, CommandStatus::InvalidArgs);
+    }
+
+    #[test]
+    #[cfg(feature = "composite-disk")]
+    fn parse_composite_disk_arg() {
+        let arg1 = String::from("LABEL1:/partition1.img:writable");
+        let res1 = parse_composite_partition_arg(&arg1);
+        assert_eq!(
+            res1,
+            Ok((
+                String::from("LABEL1"),
+                String::from("/partition1.img"),
+                true
+            ))
+        );
+
+        let arg2 = String::from("LABEL2:/partition2.img");
+        let res2 = parse_composite_partition_arg(&arg2);
+        assert_eq!(
+            res2,
+            Ok((
+                String::from("LABEL2"),
+                String::from("/partition2.img"),
+                false
+            ))
+        );
     }
 }

@@ -9,26 +9,16 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::upper_case_acronyms)]
 
-use std::convert::TryInto;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
 use base::Protection;
 use bitflags::bitflags;
-use data_model::DataInit;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use crate::VringConfigData;
-
-/// The vhost-user specification uses a field of u32 to store message length.
-/// On the other hand, preallocated buffers are needed to receive messages from the Unix domain
-/// socket. To preallocating a 4GB buffer for each vhost-user message is really just an overhead.
-/// Among all defined vhost-user messages, only the VhostUserConfig and VhostUserMemory has variable
-/// message size. For the VhostUserConfig, a maximum size of 4K is enough because the user
-/// configuration space for virtio devices is (4K - 0x100) bytes at most. For the VhostUserMemory,
-/// 4K should be enough too because it can support 255 memory regions at most.
-pub const MAX_MSG_SIZE: usize = 0x1000;
 
 /// The VhostUserMemory message has variable message size and variable number of attached file
 /// descriptors. Each user memory region entry in the message payload occupies 32 bytes,
@@ -49,18 +39,22 @@ pub const VHOST_USER_MAX_VRINGS: u64 = 0x8000u64;
 
 /// Used for the payload in Vhost Master messages.
 pub trait Req:
-    Clone + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Into<u32> + Send + Sync
+    Clone + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Into<u32> + TryFrom<u32> + Send + Sync
 {
-    /// Is the entity valid.
-    fn is_valid(&self) -> bool;
+}
+
+/// Error when converting an integer to an enum value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReqError {
+    /// The value does not correspond to a valid message code.
+    #[error("The value {0} does not correspond to a valid message code.")]
+    InvalidValue(u32),
 }
 
 /// Type of requests sending from masters to slaves.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, enumn::N)]
 pub enum MasterReq {
-    /// Null operation.
-    NOOP = 0,
     /// Get from the underlying vhost implementation the features bit mask.
     GET_FEATURES = 1,
     /// Enable features in the underlying vhost implementation using a bit mask.
@@ -148,8 +142,14 @@ pub enum MasterReq {
     GET_STATUS = 40,
     /// Get a list of the device's shared memory regions.
     GET_SHARED_MEMORY_REGIONS = 41,
-    /// Upper bound of valid commands.
-    MAX_CMD = 42,
+    /// Stop all queue handlers and save each queue state.
+    SLEEP = 42,
+    /// Start up all queue handlers with their saved queue state.
+    WAKE = 43,
+    /// Request serialized state of vhost process.
+    SNAPSHOT = 44,
+    /// Request to restore state of vhost process.
+    RESTORE = 45,
 }
 
 impl From<MasterReq> for u32 {
@@ -158,18 +158,20 @@ impl From<MasterReq> for u32 {
     }
 }
 
-impl Req for MasterReq {
-    fn is_valid(&self) -> bool {
-        (*self > MasterReq::NOOP) && (*self < MasterReq::MAX_CMD)
+impl Req for MasterReq {}
+
+impl TryFrom<u32> for MasterReq {
+    type Error = ReqError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        MasterReq::n(value).ok_or(ReqError::InvalidValue(value))
     }
 }
 
 /// Type of requests sending from slaves to masters.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, enumn::N)]
 pub enum SlaveReq {
-    /// Null operation.
-    NOOP = 0,
     /// Send IOTLB messages with struct vhost_iotlb_msg as payload.
     IOTLB_MSG = 1,
     /// Notify that the virtio device's configuration space has changed.
@@ -194,8 +196,6 @@ pub enum SlaveReq {
     FS_IO = 11,
     /// Indicates a request to map GPU memory into a shared memory region.
     GPU_MAP = 12,
-    /// Upper bound of valid commands.
-    MAX_CMD = 13,
 }
 
 impl From<SlaveReq> for u32 {
@@ -204,9 +204,13 @@ impl From<SlaveReq> for u32 {
     }
 }
 
-impl Req for SlaveReq {
-    fn is_valid(&self) -> bool {
-        (*self > SlaveReq::NOOP) && (*self < SlaveReq::MAX_CMD)
+impl Req for SlaveReq {}
+
+impl TryFrom<u32> for SlaveReq {
+    type Error = ReqError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        SlaveReq::n(value).ok_or(ReqError::InvalidValue(value))
     }
 }
 
@@ -223,6 +227,8 @@ pub trait VhostUserMsgValidator {
 // Bit mask for common message flags.
 bitflags! {
     /// Common message flags for vhost-user requests and replies.
+    #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    #[repr(transparent)]
     pub struct VhostUserHeaderFlag: u32 {
         /// Bits[0..2] is message version number.
         const VERSION = 0x3;
@@ -240,20 +246,18 @@ bitflags! {
 /// Common message header for vhost-user requests and replies.
 /// A vhost-user message consists of 3 header fields and an optional payload. All numbers are in the
 /// machine native byte order.
-#[repr(packed)]
-#[derive(Copy, FromBytes)]
+#[repr(C, packed)]
+#[derive(Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct VhostUserMsgHeader<R: Req> {
     request: u32,
     flags: u32,
     size: u32,
     _r: PhantomData<R>,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl<R: Req> DataInit for VhostUserMsgHeader<R> {}
 
 impl<R: Req> Debug for VhostUserMsgHeader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Point")
+        f.debug_struct("VhostUserMsgHeader")
             .field("request", &{ self.request })
             .field("flags", &{ self.flags })
             .field("size", &{ self.size })
@@ -287,9 +291,8 @@ impl<R: Req> VhostUserMsgHeader<R> {
     }
 
     /// Get message type.
-    pub fn get_code(&self) -> R {
-        // It's safe because R is marked as repr(u32).
-        unsafe { std::mem::transmute_copy::<u32, R>(&{ self.request }) }
+    pub fn get_code(&self) -> std::result::Result<R, R::Error> {
+        R::try_from(self.request)
     }
 
     /// Set message type.
@@ -338,7 +341,7 @@ impl<R: Req> VhostUserMsgHeader<R> {
 
     /// Check whether it's the reply message for the request `req`.
     pub fn is_reply_for(&self, req: &VhostUserMsgHeader<R>) -> bool {
-        self.is_reply() && !req.is_reply() && self.get_code() == req.get_code()
+        self.is_reply() && !req.is_reply() && self.request == req.request
     }
 
     /// Get message size.
@@ -363,25 +366,10 @@ impl<R: Req> Default for VhostUserMsgHeader<R> {
     }
 }
 
-impl From<[u8; 12]> for VhostUserMsgHeader<MasterReq> {
-    fn from(buf: [u8; 12]) -> Self {
-        // Convert 4-length slice into [u8; 4]. This must succeed.
-        let req = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        // Safe because `MasterReq` is defined with `#[repr(u32)]`.
-        let req = unsafe { std::mem::transmute_copy::<u32, MasterReq>(&req) };
-
-        let flags = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        let size = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        Self::new(req, flags, size)
-    }
-}
-
 impl<T: Req> VhostUserMsgValidator for VhostUserMsgHeader<T> {
     #[allow(clippy::if_same_then_else)]
     fn is_valid(&self) -> bool {
-        if !self.get_code().is_valid() {
-            return false;
-        } else if self.size as usize > MAX_MSG_SIZE {
+        if self.get_code().is_err() {
             return false;
         } else if self.get_version() != 0x1 {
             return false;
@@ -392,18 +380,14 @@ impl<T: Req> VhostUserMsgValidator for VhostUserMsgHeader<T> {
     }
 }
 
-// Bit mask for transport specific flags in VirtIO feature set defined by vhost-user.
-bitflags! {
-    /// Transport specific flags in VirtIO feature set defined by vhost-user.
-    pub struct VhostUserVirtioFeatures: u64 {
-        /// Feature flag for the protocol feature.
-        const PROTOCOL_FEATURES = 0x4000_0000;
-    }
-}
+/// Virtio feature flag for the vhost-user protocol features.
+pub const VHOST_USER_F_PROTOCOL_FEATURES: u32 = 30;
 
 // Bit mask for vhost-user protocol feature flags.
 bitflags! {
     /// Vhost-user protocol feature flags.
+    #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    #[repr(transparent)]
     pub struct VhostUserProtocolFeatures: u64 {
         /// Support multiple queues.
         const MQ = 0x0000_0001;
@@ -439,20 +423,20 @@ bitflags! {
         const CONFIGURE_MEM_SLOTS = 0x0000_8000;
         /// Support reporting status.
         const STATUS = 0x0001_0000;
-        /// Support shared memory regions.
-        const SHARED_MEMORY_REGIONS = 0x0002_0000;
+        /// Support Xen mmap.
+        const XEN_MMAP = 0x0002_0000;
+        /// Support shared memory regions. (Non-standard.)
+        const SHARED_MEMORY_REGIONS = 0x8000_0000;
     }
 }
 
 /// A generic message to encapsulate a 64-bit value.
 #[repr(packed)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserU64 {
     /// The encapsulated 64-bit common value.
     pub value: u64,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserU64 {}
 
 impl VhostUserU64 {
     /// Create a new instance.
@@ -463,26 +447,57 @@ impl VhostUserU64 {
 
 impl VhostUserMsgValidator for VhostUserU64 {}
 
-/// A generic message for empty message.
-#[derive(Default, Clone, Copy)]
-pub struct VhostUserEmptyMessage;
+/// An empty message.
+#[repr(C)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
+pub struct VhostUserEmptyMsg;
 
-// Safe because it has no data
-unsafe impl DataInit for VhostUserEmptyMessage {}
+impl VhostUserMsgValidator for VhostUserEmptyMsg {}
+
+/// A generic message to encapsulate a success or failure.
+/// use i8 instead of bool to allow FromBytes to be derived.
+/// type layout is same for all supported architectures.
+#[repr(C, packed)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
+pub struct VhostUserSuccess {
+    /// True if request was successful.
+    bool_store: i8,
+}
+
+impl VhostUserSuccess {
+    /// Create a new instance.
+    pub fn new(success: bool) -> Self {
+        VhostUserSuccess {
+            bool_store: success.into(),
+        }
+    }
+
+    /// Convert i8 storage back to bool
+    #[inline(always)]
+    pub fn success(&self) -> bool {
+        self.bool_store != 0
+    }
+}
+
+impl VhostUserMsgValidator for VhostUserSuccess {}
+
+/// A generic message for empty message.
+/// ZST in repr(C) has same type layout as repr(rust)
+#[repr(C)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
+pub struct VhostUserEmptyMessage;
 
 impl VhostUserMsgValidator for VhostUserEmptyMessage {}
 
 /// Memory region descriptor for the SET_MEM_TABLE request.
-#[repr(packed)]
-#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserMemory {
     /// Number of memory regions in the payload.
     pub num_regions: u32,
     /// Padding for alignment.
     pub padding1: u32,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserMemory {}
 
 impl VhostUserMemory {
     /// Create a new instance.
@@ -507,8 +522,8 @@ impl VhostUserMsgValidator for VhostUserMemory {
 }
 
 /// Memory region descriptors as payload for the SET_MEM_TABLE request.
-#[repr(packed)]
-#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserMemoryRegion {
     /// Guest physical address of the memory region.
     pub guest_phys_addr: u64,
@@ -519,8 +534,6 @@ pub struct VhostUserMemoryRegion {
     /// Offset where region starts in the mapped memory.
     pub mmap_offset: u64,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserMemoryRegion {}
 
 impl VhostUserMemoryRegion {
     /// Create a new instance.
@@ -553,7 +566,7 @@ pub type VhostUserMemoryPayload = Vec<VhostUserMemoryRegion>;
 /// Single memory region descriptor as payload for ADD_MEM_REG and REM_MEM_REG
 /// requests.
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserSingleMemoryRegion {
     /// Padding for correct alignment
     padding: u64,
@@ -566,8 +579,6 @@ pub struct VhostUserSingleMemoryRegion {
     /// Offset where region starts in the mapped memory.
     pub mmap_offset: u64,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserSingleMemoryRegion {}
 
 impl VhostUserSingleMemoryRegion {
     /// Create a new instance.
@@ -597,16 +608,13 @@ impl VhostUserMsgValidator for VhostUserSingleMemoryRegion {
 
 /// Vring state descriptor.
 #[repr(packed)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserVringState {
     /// Vring index.
     pub index: u32,
     /// A common 32bit value to encapsulate vring state etc.
     pub num: u32,
 }
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserVringState {}
 
 impl VhostUserVringState {
     /// Create a new instance.
@@ -620,6 +628,8 @@ impl VhostUserMsgValidator for VhostUserVringState {}
 // Bit mask for vring address flags.
 bitflags! {
     /// Flags for vring address.
+    #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    #[repr(transparent)]
     pub struct VhostUserVringAddrFlags: u32 {
         /// Support log of vring operations.
         /// Modifications to "used" vring should be logged.
@@ -628,8 +638,8 @@ bitflags! {
 }
 
 /// Vring address descriptor.
-#[repr(packed)]
-#[derive(Default, Clone, Copy)]
+#[repr(C, packed)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserVringAddr {
     /// Vring index.
     pub index: u32,
@@ -644,9 +654,6 @@ pub struct VhostUserVringAddr {
     /// Guest address for logging.
     pub log: u64,
 }
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserVringAddr {}
 
 impl VhostUserVringAddr {
     /// Create a new instance.
@@ -701,6 +708,8 @@ impl VhostUserMsgValidator for VhostUserVringAddr {
 // Bit mask for the vhost-user device configuration message.
 bitflags! {
     /// Flags for the device configuration message.
+    #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    #[repr(transparent)]
     pub struct VhostUserConfigFlags: u32 {
         /// Vhost master messages used for writeable fields.
         const WRITABLE = 0x1;
@@ -711,7 +720,7 @@ bitflags! {
 
 /// Message to read/write device configuration space.
 #[repr(packed)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserConfig {
     /// Offset of virtio device's configuration space.
     pub offset: u32,
@@ -720,8 +729,6 @@ pub struct VhostUserConfig {
     /// Flags for the device configuration operation.
     pub flags: u32,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserConfig {}
 
 impl VhostUserConfig {
     /// Create a new instance.
@@ -755,8 +762,11 @@ pub type VhostUserConfigPayload = Vec<u8>;
 
 /// Single memory region descriptor as payload for ADD_MEM_REG and REM_MEM_REG
 /// requests.
+/// This struct is defined by qemu and compiles with arch-dependent padding.
+/// Interestingly, all our supported archs (arm, aarch64, x86_64) has same
+/// data layout for this type.
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserInflight {
     /// Size of the area to track inflight I/O.
     pub mmap_size: u64,
@@ -766,10 +776,9 @@ pub struct VhostUserInflight {
     pub num_queues: u16,
     /// Size of virtqueues.
     pub queue_size: u16,
+    /// implicit padding on 64-bit platforms
+    pub _padding: [u8; 4],
 }
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserInflight {}
 
 impl VhostUserInflight {
     /// Create a new instance.
@@ -779,6 +788,7 @@ impl VhostUserInflight {
             mmap_offset,
             num_queues,
             queue_size,
+            ..Default::default()
         }
     }
 }
@@ -818,11 +828,27 @@ pub struct VhostUserIotlb {
 }
 */
 
+/// Flags for virtio-fs slave messages.
+#[repr(transparent)]
+#[derive(
+    AsBytes,
+    FromZeroes,
+    FromBytes,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+)]
+pub struct VhostUserFSSlaveMsgFlags(u64);
+
 // Bit mask for flags in virtio-fs slave messages
 bitflags! {
-    #[derive(Default)]
-    /// Flags for virtio-fs slave messages.
-    pub struct VhostUserFSSlaveMsgFlags: u64 {
+    impl VhostUserFSSlaveMsgFlags: u64 {
         /// Empty permission.
         const EMPTY = 0x0;
         /// Read permission.
@@ -837,7 +863,7 @@ pub const VHOST_USER_FS_SLAVE_ENTRIES: usize = 8;
 
 /// Slave request message to update the MMIO window.
 #[repr(packed)]
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserFSSlaveMsg {
     /// File offset.
     pub fd_offset: [u64; VHOST_USER_FS_SLAVE_ENTRIES],
@@ -848,8 +874,6 @@ pub struct VhostUserFSSlaveMsg {
     /// Flags for the mmap operation
     pub flags: [VhostUserFSSlaveMsgFlags; VHOST_USER_FS_SLAVE_ENTRIES],
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserFSSlaveMsg {}
 
 impl VhostUserMsgValidator for VhostUserFSSlaveMsg {
     fn is_valid(&self) -> bool {
@@ -865,10 +889,26 @@ impl VhostUserMsgValidator for VhostUserFSSlaveMsg {
     }
 }
 
+/// Flags for SHMEM_MAP messages.
+#[repr(transparent)]
+#[derive(
+    AsBytes,
+    FromZeroes,
+    FromBytes,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+)]
+pub struct VhostUserShmemMapMsgFlags(u8);
+
 bitflags! {
-    #[derive(Default)]
-    /// Flags for SHMEM_MAP messages.
-    pub struct VhostUserShmemMapMsgFlags: u8 {
+    impl VhostUserShmemMapMsgFlags: u8 {
         /// Empty permission.
         const EMPTY = 0x0;
         /// Read permission.
@@ -889,7 +929,7 @@ impl From<Protection> for VhostUserShmemMapMsgFlags {
 
 impl From<VhostUserShmemMapMsgFlags> for Protection {
     fn from(flags: VhostUserShmemMapMsgFlags) -> Self {
-        let mut prot = Protection::from(0);
+        let mut prot = Protection::default();
         if flags.contains(VhostUserShmemMapMsgFlags::MAP_R) {
             prot = prot.set_read();
         }
@@ -902,7 +942,7 @@ impl From<VhostUserShmemMapMsgFlags> for Protection {
 
 /// Slave request message to map a file into a shared memory region.
 #[repr(C, packed)]
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserShmemMapMsg {
     /// Flags for the mmap operation
     pub flags: VhostUserShmemMapMsgFlags,
@@ -916,8 +956,6 @@ pub struct VhostUserShmemMapMsg {
     /// Size of region to map.
     pub len: u64,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserShmemMapMsg {}
 
 impl VhostUserMsgValidator for VhostUserShmemMapMsg {
     fn is_valid(&self) -> bool {
@@ -949,7 +987,7 @@ impl VhostUserShmemMapMsg {
 
 /// Slave request message to map GPU memory into a shared memory region.
 #[repr(C, packed)]
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct VhostUserGpuMapMsg {
     /// Shared memory region id.
     pub shmid: u8,
@@ -967,8 +1005,6 @@ pub struct VhostUserGpuMapMsg {
     /// Driver UUID
     pub driver_uuid: [u8; 16],
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserGpuMapMsg {}
 
 impl VhostUserMsgValidator for VhostUserGpuMapMsg {
     fn is_valid(&self) -> bool {
@@ -1002,7 +1038,7 @@ impl VhostUserGpuMapMsg {
 
 /// Slave request message to unmap part of a shared memory region.
 #[repr(C, packed)]
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, FromZeroes, FromBytes, AsBytes)]
 pub struct VhostUserShmemUnmapMsg {
     /// Shared memory region id.
     pub shmid: u8,
@@ -1012,8 +1048,6 @@ pub struct VhostUserShmemUnmapMsg {
     /// Size of region to unmap.
     pub len: u64,
 }
-// Safe because it only has data and has no implicit padding.
-unsafe impl DataInit for VhostUserShmemUnmapMsg {}
 
 impl VhostUserMsgValidator for VhostUserShmemUnmapMsg {
     fn is_valid(&self) -> bool {
@@ -1166,7 +1200,7 @@ impl QueueRegionPacked {
 
 /// Virtio shared memory descriptor.
 #[repr(packed)]
-#[derive(Default, Copy, Clone, FromBytes, AsBytes)]
+#[derive(Default, Copy, Clone, FromZeroes, FromBytes, AsBytes)]
 pub struct VhostSharedMemoryRegion {
     /// The shared memory region's shmid.
     pub id: u8,
@@ -1189,44 +1223,34 @@ impl VhostSharedMemoryRegion {
 
 #[cfg(test)]
 mod tests {
-    use std::mem;
-
     use super::*;
 
     #[test]
     fn check_master_request_code() {
-        let code = MasterReq::NOOP;
-        assert!(!code.is_valid());
-        let code = MasterReq::MAX_CMD;
-        assert!(!code.is_valid());
-        assert!(code > MasterReq::NOOP);
-        let code = MasterReq::GET_FEATURES;
-        assert!(code.is_valid());
+        MasterReq::try_from(0).expect_err("invalid value");
+        MasterReq::try_from(46).expect_err("invalid value");
+        MasterReq::try_from(10000).expect_err("invalid value");
+
+        let code = MasterReq::try_from(MasterReq::GET_FEATURES as u32).unwrap();
         assert_eq!(code, code.clone());
-        let code: MasterReq = unsafe { std::mem::transmute::<u32, MasterReq>(10000u32) };
-        assert!(!code.is_valid());
     }
 
     #[test]
     fn check_slave_request_code() {
-        let code = SlaveReq::NOOP;
-        assert!(!code.is_valid());
-        let code = SlaveReq::MAX_CMD;
-        assert!(!code.is_valid());
-        assert!(code > SlaveReq::NOOP);
-        let code = SlaveReq::CONFIG_CHANGE_MSG;
-        assert!(code.is_valid());
+        SlaveReq::try_from(0).expect_err("invalid value");
+        SlaveReq::try_from(13).expect_err("invalid value");
+        SlaveReq::try_from(10000).expect_err("invalid value");
+
+        let code = SlaveReq::try_from(SlaveReq::CONFIG_CHANGE_MSG as u32).unwrap();
         assert_eq!(code, code.clone());
-        let code: SlaveReq = unsafe { std::mem::transmute::<u32, SlaveReq>(10000u32) };
-        assert!(!code.is_valid());
     }
 
     #[test]
     fn msg_header_ops() {
         let mut hdr = VhostUserMsgHeader::new(MasterReq::GET_FEATURES, 0, 0x100);
-        assert_eq!(hdr.get_code(), MasterReq::GET_FEATURES);
+        assert_eq!(hdr.get_code(), Ok(MasterReq::GET_FEATURES));
         hdr.set_code(MasterReq::SET_FEATURES);
-        assert_eq!(hdr.get_code(), MasterReq::SET_FEATURES);
+        assert_eq!(hdr.get_code(), Ok(MasterReq::SET_FEATURES));
 
         assert_eq!(hdr.get_version(), 0x1);
 
@@ -1247,18 +1271,6 @@ mod tests {
         assert!(!hdr.is_need_reply());
         assert!(!hdr.is_reply());
         assert_eq!(hdr.get_version(), 0x1);
-
-        // Check message length
-        assert!(hdr.is_valid());
-        hdr.set_size(0x2000);
-        assert!(!hdr.is_valid());
-        hdr.set_size(0x100);
-        assert_eq!(hdr.get_size(), 0x100);
-        assert!(hdr.is_valid());
-        hdr.set_size((MAX_MSG_SIZE - mem::size_of::<VhostUserMsgHeader<MasterReq>>()) as u32);
-        assert!(hdr.is_valid());
-        hdr.set_size(0x0);
-        assert!(hdr.is_valid());
 
         // Check version
         hdr.set_version(0x0);
@@ -1393,9 +1405,8 @@ mod tests {
     #[test]
     fn test_vhost_user_state_from_config() {
         let config = VringConfigData {
-            queue_max_size: 256,
             queue_size: 128,
-            flags: VhostUserVringAddrFlags::VHOST_VRING_F_LOG.bits,
+            flags: VhostUserVringAddrFlags::VHOST_VRING_F_LOG.bits(),
             desc_table_addr: 0x1000,
             used_ring_addr: 0x2000,
             avail_ring_addr: 0x3000,

@@ -7,20 +7,27 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result;
 
-use data_model::VolatileSlice;
+use crate::VolatileSlice;
 
 /// A trait for flushing the contents of a file to disk.
-/// This is equivalent to File's `sync_all` method, but
-/// wrapped in a trait so that it can be implemented for
-/// other types.
+/// This is equivalent to File's `sync_all` and `sync_data` methods, but wrapped in a trait so that
+/// it can be implemented for other types.
 pub trait FileSync {
     // Flush buffers related to this file to disk.
     fn fsync(&mut self) -> Result<()>;
+
+    // Flush buffers related to this file's data to disk, avoiding updating extra metadata. Note
+    // that an implementation may simply implement fsync for fdatasync.
+    fn fdatasync(&mut self) -> Result<()>;
 }
 
 impl FileSync for File {
     fn fsync(&mut self) -> Result<()> {
         self.sync_all()
+    }
+
+    fn fdatasync(&mut self) -> Result<()> {
+        self.sync_data()
     }
 }
 

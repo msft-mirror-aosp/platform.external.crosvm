@@ -22,14 +22,14 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
 use std::iter::once;
-use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::RawHandle;
 use std::ptr;
 use std::slice;
-use std::sync::Once;
 
+mod keyboard;
+pub use keyboard::*;
 use libc::c_ulong;
 use serde::Deserialize;
 use serde::Serialize;
@@ -46,8 +46,6 @@ use winapi::um::processthreadsapi::GetCurrentProcess;
 use winapi::um::processthreadsapi::GetExitCodeProcess;
 use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::processthreadsapi::ResumeThread;
-use winapi::um::sysinfoapi::GetNativeSystemInfo;
-use winapi::um::sysinfoapi::SYSTEM_INFO;
 use winapi::um::winbase::CreateFileMappingA;
 use winapi::um::winbase::HANDLE_FLAG_INHERIT;
 use winapi::um::winnt::DUPLICATE_SAME_ACCESS;
@@ -60,11 +58,10 @@ pub use crate::dll_notification::*;
 #[macro_export]
 macro_rules! syscall_bail {
     ($details:expr) => {
-        ::anyhow::bail!(
-            "{} (Error code {})",
-            $details,
+        // SAFETY: Safe because GetLastError is thread safe and won't access the memory.
+        ::anyhow::bail!("{} (Error code {})", $details, unsafe {
             ::winapi::um::errhandlingapi::GetLastError()
-        )
+        })
     };
 }
 
@@ -85,30 +82,6 @@ pub fn get_low_order(number: u64) -> c_ulong {
 /// Returns the upper 32 bits of a u64 as a u32 (c_ulong/DWORD)
 pub fn get_high_order(number: u64) -> c_ulong {
     (number >> 32) as c_ulong
-}
-
-static INIT_NATIVE_SYSTEM_INFO: Once = Once::new();
-static mut NATIVE_SYSTEM_INFO: MaybeUninit<SYSTEM_INFO> = MaybeUninit::uninit();
-
-pub fn pagesize() -> usize {
-    get_native_system_info().dwPageSize as usize
-}
-
-pub fn allocation_granularity() -> u64 {
-    get_native_system_info().dwAllocationGranularity as u64
-}
-
-pub fn number_of_processors() -> usize {
-    get_native_system_info().dwNumberOfProcessors as usize
-}
-
-fn get_native_system_info() -> SYSTEM_INFO {
-    INIT_NATIVE_SYSTEM_INFO.call_once(|| unsafe {
-        // Safe because this is a universally available call on modern Windows systems.
-        GetNativeSystemInfo(NATIVE_SYSTEM_INFO.as_mut_ptr());
-    });
-    // Safe because it is guaranteed to be initialized by GetNativeSystemInfo above.
-    unsafe { NATIVE_SYSTEM_INFO.assume_init() }
 }
 
 pub fn win32_string(value: &str) -> CString {
@@ -221,7 +194,7 @@ pub fn duplicate_handle(hndl: RawHandle) -> io::Result<RawHandle> {
 
 /// Sets whether a handle is inheritable. Note that this only works on some types of handles,
 /// such as files, pipes, etc. See
-/// https://docs.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-sethandleinformation#parameters
+/// <https://docs.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-sethandleinformation#parameters>
 /// for further details.
 pub fn set_handle_inheritance(hndl: RawHandle, inheritable: bool) -> io::Result<()> {
     // Safe because even if hndl is invalid, no unsafe memory access will result.
@@ -320,14 +293,6 @@ pub fn get_exit_code_process(handle: RawHandle) -> io::Result<Option<DWORD>> {
 
 pub type HResult<T> = Result<T, HRESULT>;
 
-// windows-rs bindings
-#[cfg(target_env = "msvc")]
-mod bindings {
-    ::windows::include_bindings!();
-}
-#[cfg(target_env = "msvc")]
-pub use bindings::Windows::Win32::Globalization::ImmDisableIME;
-
 /// Each type of process should have its own type here. This affects both exit
 /// handling and sandboxing policy.
 ///
@@ -337,6 +302,7 @@ pub use bindings::Windows::Win32::Globalization::ImmDisableIME;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize, enumn::N)]
 #[repr(u8)]
 pub enum ProcessType {
+    UnknownType = 0,
     Block = 1,
     Main = 2,
     Metrics = 3,
@@ -348,6 +314,37 @@ pub enum ProcessType {
     Spu = 9,
 }
 
+/// State of a crosvm child process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
+pub enum ProcessState {
+    UnknownState,
+    /// Process is running normally.
+    Healthy,
+    /// Process died unexpectedly - it is either killed, crashed or something else.
+    Died,
+    /// Process exited on request or gracefully.
+    Exited,
+}
+
+/// Priority of a crosvm child process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
+pub enum ProcessPriority {
+    UnknwonPriority,
+    /// Crosvm critical process. In absence of this process crosvm cannot function normally.
+    Critical,
+    /// Non-critical process - the process is safe to restart. Crosvm/guest may continue to function
+    /// normally when such process dies.
+    NonCritical,
+}
+
+/// Information about crosvm child process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub id: u64,
+    pub ptype: ProcessType,
+    pub priority: ProcessPriority,
+    pub state: ProcessState,
+}
 #[cfg(test)]
 mod tests {
     use super::*;

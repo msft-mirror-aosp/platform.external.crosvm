@@ -20,24 +20,26 @@ use std::path::Path;
 use std::str;
 
 use base::error;
-use base::open_file;
+use base::open_file_or_duplicate;
 use base::AsRawDescriptor;
 use base::AsRawDescriptors;
 use base::FileAllocate;
 use base::FileReadWriteAtVolatile;
 use base::FileSetLen;
 use base::FileSync;
+use base::PunchHoleMut;
 use base::RawDescriptor;
+use base::VolatileMemory;
+use base::VolatileSlice;
 use base::WriteZeroesAt;
 use cros_async::Executor;
-use data_model::VolatileMemory;
-use data_model::VolatileSlice;
 use libc::EINVAL;
 use libc::ENOSPC;
 use libc::ENOTSUP;
 use remain::sorted;
 use thiserror::Error;
 
+use crate::asynchronous::DiskFlush;
 use crate::create_disk_file;
 use crate::qcow::qcow_raw_file::QcowRawFile;
 use crate::qcow::refcount::RefCount;
@@ -48,7 +50,6 @@ use crate::AsyncDisk;
 use crate::AsyncDiskFileWrapper;
 use crate::DiskFile;
 use crate::DiskGetLen;
-use crate::PunchHoleMut;
 use crate::ToAsyncDisk;
 
 #[sorted]
@@ -400,8 +401,8 @@ fn max_refcount_clusters(refcount_order: u32, cluster_size: u32, num_clusters: u
 ///
 /// ```
 /// # use base::FileReadWriteAtVolatile;
-/// # use data_model::VolatileSlice;
 /// # use disk::QcowFile;
+/// # use base::VolatileSlice;
 /// # fn test(file: std::fs::File) -> std::io::Result<()> {
 ///     let mut q = QcowFile::from(file, disk::MAX_NESTING_DEPTH).expect("Can't open qcow file");
 ///     let mut buf = [0u8; 12];
@@ -427,6 +428,14 @@ pub struct QcowFile {
 }
 
 impl DiskFile for QcowFile {}
+
+impl DiskFlush for QcowFile {
+    fn flush(&mut self) -> io::Result<()> {
+        // Using fsync is overkill here, but, the code for flushing state to file tangled up with
+        // the fsync, so it is best we can do for now.
+        self.fsync()
+    }
+}
 
 impl QcowFile {
     /// Creates a QcowFile from `file`. File must be a valid qcow2 image.
@@ -456,7 +465,7 @@ impl QcowFile {
 
         let backing_file = if let Some(backing_file_path) = header.backing_file_path.as_ref() {
             let path = backing_file_path.clone();
-            let backing_raw_file = open_file(
+            let backing_raw_file = open_file_or_duplicate(
                 Path::new(&path),
                 OpenOptions::new().read(true), // TODO(b/190435784): Add support for O_DIRECT.
             )
@@ -606,7 +615,7 @@ impl QcowFile {
         backing_file_max_nesting_depth: u32,
     ) -> Result<QcowFile> {
         let backing_path = Path::new(backing_file_name);
-        let backing_raw_file = open_file(
+        let backing_raw_file = open_file_or_duplicate(
             backing_path,
             OpenOptions::new().read(true), // TODO(b/190435784): add support for O_DIRECT.
         )
@@ -639,7 +648,7 @@ impl QcowFile {
 
         // Set the refcount for each refcount table cluster.
         let cluster_size = 0x01u64 << qcow.header.cluster_bits;
-        let refcount_table_base = qcow.header.refcount_table_offset as u64;
+        let refcount_table_base = qcow.header.refcount_table_offset;
         let end_cluster_addr =
             refcount_table_base + u64::from(qcow.header.refcount_table_clusters) * cluster_size;
 
@@ -985,7 +994,7 @@ impl QcowFile {
     // Gets the offset of the given guest address in the host file. If L1, L2, or data clusters have
     // yet to be allocated, return None.
     fn file_offset_read(&mut self, address: u64) -> std::io::Result<Option<u64>> {
-        if address >= self.virtual_size() as u64 {
+        if address >= self.virtual_size() {
             return Err(std::io::Error::from_raw_os_error(EINVAL));
         }
 
@@ -1028,7 +1037,7 @@ impl QcowFile {
     // Gets the offset of the given guest address in the host file. If L1, L2, or data clusters need
     // to be allocated, they will be.
     fn file_offset_write(&mut self, address: u64) -> std::io::Result<u64> {
-        if address >= self.virtual_size() as u64 {
+        if address >= self.virtual_size() {
             return Err(std::io::Error::from_raw_os_error(EINVAL));
         }
 
@@ -1163,7 +1172,7 @@ impl QcowFile {
     // Deallocate the storage for the cluster starting at `address`.
     // Any future reads of this cluster will return all zeroes (or the backing file, if in use).
     fn deallocate_cluster(&mut self, address: u64) -> std::io::Result<()> {
-        if address >= self.virtual_size() as u64 {
+        if address >= self.virtual_size() {
             return Err(std::io::Error::from_raw_os_error(EINVAL));
         }
 
@@ -1550,6 +1559,11 @@ impl FileSync for QcowFile {
         self.sync_caches()?;
         self.avail_clusters.append(&mut self.unref_clusters);
         Ok(())
+    }
+
+    fn fdatasync(&mut self) -> io::Result<()> {
+        // QcowFile does not implement fdatasync. Just fall back to fsync.
+        self.fsync()
     }
 }
 
@@ -2475,7 +2489,7 @@ mod tests {
     fn io_seek() {
         with_default_file(1024 * 1024 * 10, |mut qcow_file| {
             // Cursor should start at 0.
-            assert_eq!(qcow_file.seek(SeekFrom::Current(0)).unwrap(), 0);
+            assert_eq!(qcow_file.stream_position().unwrap(), 0);
 
             // Seek 1 MB from start.
             assert_eq!(
@@ -2488,7 +2502,7 @@ mod tests {
             qcow_file
                 .seek(SeekFrom::Current(-(1024 * 1024 + 1)))
                 .expect_err("negative offset seek should fail");
-            assert_eq!(qcow_file.seek(SeekFrom::Current(0)).unwrap(), 1024 * 1024);
+            assert_eq!(qcow_file.stream_position().unwrap(), 1024 * 1024);
 
             // Seek to last byte.
             assert_eq!(
@@ -2515,16 +2529,10 @@ mod tests {
             let mut readback = [0u8; BLOCK_SIZE];
 
             qcow_file.write_all(&data_55).unwrap();
-            assert_eq!(
-                qcow_file.seek(SeekFrom::Current(0)).unwrap(),
-                BLOCK_SIZE as u64
-            );
+            assert_eq!(qcow_file.stream_position().unwrap(), BLOCK_SIZE as u64);
 
             qcow_file.write_all(&data_aa).unwrap();
-            assert_eq!(
-                qcow_file.seek(SeekFrom::Current(0)).unwrap(),
-                BLOCK_SIZE as u64 * 2
-            );
+            assert_eq!(qcow_file.stream_position().unwrap(), BLOCK_SIZE as u64 * 2);
 
             // Read BLOCK_SIZE of just 0xaa.
             assert_eq!(
@@ -2534,10 +2542,7 @@ mod tests {
                 BLOCK_SIZE as u64
             );
             qcow_file.read_exact(&mut readback).unwrap();
-            assert_eq!(
-                qcow_file.seek(SeekFrom::Current(0)).unwrap(),
-                BLOCK_SIZE as u64 * 2
-            );
+            assert_eq!(qcow_file.stream_position().unwrap(), BLOCK_SIZE as u64 * 2);
             for (orig, read) in data_aa.iter().zip(readback.iter()) {
                 assert_eq!(orig, read);
             }

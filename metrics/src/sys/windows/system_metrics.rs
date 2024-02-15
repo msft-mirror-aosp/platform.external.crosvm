@@ -39,9 +39,9 @@ use winapi::um::winnt::PROCESS_VM_READ;
 use winapi::um::winnt::SYNCHRONIZE;
 
 use crate::log_metric;
-use crate::windows::Error;
-use crate::windows::Result;
-use crate::windows::METRIC_UPLOAD_INTERVAL_SECONDS;
+use crate::sys::windows::Error;
+use crate::sys::windows::Result;
+use crate::sys::windows::METRIC_UPLOAD_INTERVAL_SECONDS;
 use crate::MetricEventType;
 
 const BYTES_PER_MB: usize = 1024 * 1024;
@@ -142,7 +142,7 @@ impl Worker {
                 if total_systime > 0 {
                     let cpu_usage = 100 * total_processtime / total_systime;
                     // The i64 cast will not cause overflow because the usage is at most 100.
-                    log_metric(MetricEventType::CpuUsage, cpu_usage as i64);
+                    log_metric(MetricEventType::CpuUsage, cpu_usage);
                 }
             }
             *cpu_measurements = None;
@@ -249,6 +249,7 @@ impl Worker {
 
         let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
 
+        // SAFETY:
         // Safe because we own the process handle and all memory was allocated.
         let result = unsafe {
             GetProcessMemoryInfo(
@@ -280,6 +281,7 @@ impl Worker {
         let mut process_time: ProcessCpuTime = Default::default();
         let sys_time_success: i32;
 
+        // SAFETY:
         // Safe because memory is allocated for sys_time before the windows call.
         // And the value were initilized to 0s.
         unsafe {
@@ -294,6 +296,7 @@ impl Worker {
             // Query current process cpu time.
             let process_handle = CoreWinMetrics::get_process_handle()?;
             let process_time_success: i32;
+            // SAFETY:
             // Safe because memory is allocated for process_time before the windows call.
             // And the value were initilized to 0s.
             unsafe {
@@ -328,6 +331,7 @@ impl Worker {
     fn get_io_metrics(&self) -> SysResult<ProcessIo> {
         let process_handle = CoreWinMetrics::get_process_handle()?;
         let mut io_counters = IO_COUNTERS::default();
+        // SAFETY:
         // Safe because we own the process handle and all memory was allocated.
         let result = unsafe {
             GetProcessIoCounters(
@@ -454,6 +458,7 @@ impl Worker {
 }
 
 fn compute_filetime_subtraction(fta: FILETIME, ftb: FILETIME) -> LONGLONG {
+    // SAFETY:
     // safe because we are initializing the struct to 0s.
     unsafe {
         let mut a: LARGE_INTEGER = mem::zeroed::<LARGE_INTEGER>();
@@ -584,6 +589,7 @@ impl CoreWinMetrics {
     }
 
     fn get_process_handle() -> SysResult<SafeDescriptor> {
+        // SAFETY:
         // Safe because we own the current process.
         let process_handle = unsafe {
             OpenProcess(
@@ -595,6 +601,7 @@ impl CoreWinMetrics {
         if process_handle.is_null() {
             return Err(SysError::last());
         }
+        // SAFETY:
         // Safe as the SafeDescriptor is the only thing with access to the handle after this.
         Ok(unsafe { SafeDescriptor::from_raw_descriptor(process_handle) })
     }

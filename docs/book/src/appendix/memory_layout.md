@@ -2,11 +2,12 @@
 
 ## x86-64 guest physical memory map
 
-This is a survey of the existing memory layout for crosvm on x86-64 when booting a Linux kernel. Some of these values are different when booting a BIOS image or when compiled with features=direct (ManaTEE); see the source. All addresses are in hexadecimal.
+This is a survey of the existing memory layout for crosvm on x86-64 when booting a Linux kernel. Some of these values are different when booting a BIOS image;
+see the source. All addresses are in hexadecimal.
 
 | Name/source link             | Address       | End (exclusive) | Size      | Notes                                                                                    |
 | ---------------------------- | ------------- | --------------- | --------- | ---------------------------------------------------------------------------------------- |
-|                              | `0000`        | `7000`          |           | RAM (may start at 0x1000 for crosvm-direct)                                              |
+| [`START_OF_RAM_32BITS`]      | `0000`        |                 |           | RAM                                                                                      |
 | [`ZERO_PAGE_OFFSET`]         | `7000`        |                 |           | Linux boot_params structure                                                              |
 | [`BOOT_STACK_POINTER`]       | `8000`        |                 |           | Boot SP value                                                                            |
 | [`boot_pml4_addr`]           | `9000`        |                 |           | Boot page table                                                                          |
@@ -25,6 +26,7 @@ This is a survey of the existing memory layout for crosvm on x86-64 when booting
 |                              | `1_0000_0000` |                 |           | RAM (>4G)                                                                                |
 |                              | (end of RAM)  |                 |           | High (>4G) MMIO allocation area                                                          |
 
+[`start_of_ram_32bits`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=335?q=START_OF_RAM_32BITS
 [`zero_page_offset`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=338?q=ZERO_PAGE_OFFSET
 [`boot_stack_pointer`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=332?q=BOOT_STACK_POINTER
 [`boot_pml4_addr`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/regs.rs;l=299?q=boot_pml4_addr
@@ -57,6 +59,7 @@ These apply for all boot modes.
 | [`AARCH64_RTC_ADDR`]              | `2000`          | `3000`          | 4 KiB          | Real-time clock                                               |
 | [`AARCH64_VMWDT_ADDR`]            | `3000`          | `4000`          | 4 KiB          | Watchdog device                                               |
 | [`AARCH64_PCI_CFG_BASE`]          | `1_0000`        | `2_0000`        | 64 KiB         | PCI configuration (CAM)                                       |
+| [`AARCH64_VIRTFREQ_BASE`]         | `104_0000`      | `105_0000`      | 64 KiB         | Virtual cpufreq device                                        |
 | [`AARCH64_PVTIME_IPA_START`]      | `1f0_0000`      | `200_0000`      | 64 KiB         | Paravirtualized time                                          |
 | [`AARCH64_MMIO_BASE`]             | `200_0000`      | `400_0000`      | 32 MiB         | Low MMIO allocation area                                      |
 | [`AARCH64_GIC_CPUI_BASE`]         | `3ffd_0000`     | `3fff_0000`     | 128 KiB        | vGIC                                                          |
@@ -91,6 +94,7 @@ These apply when a bootloader is passed with `--bios`.
 [`aarch64_rtc_addr`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=177?q=AARCH64_RTC_ADDR
 [`aarch64_vmwdt_addr`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=187?q=AARCH64_VMWDT_ADDR
 [`aarch64_pci_cfg_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=192?q=AARCH64_PCI_CFG_BASE
+[`aarch64_virtfreq_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=207?q=AARCH64_VIRTFREQ_BASE
 [`aarch64_mmio_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=196?q=AARCH64_MMIO_BASE
 [`aarch64_gic_cpui_base`]: https://crsrc.org/o/src/platform/crosvm/devices/src/irqchip/kvm/aarch64.rs;l=106?q=AARCH64_GIC_CPUI_BASE
 [`aarch64_gic_dist_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=105?q=AARCH64_GIC_DIST_BASE

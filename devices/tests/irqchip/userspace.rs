@@ -2,9 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#![cfg(target_arch = "x86_64")]
 
-use std::os::raw::c_int;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -17,6 +16,7 @@ use base::Tube;
 use devices::Bus;
 use devices::BusAccessInfo;
 use devices::BusDeviceSync;
+use devices::BusType;
 use devices::CrosvmDeviceId;
 use devices::DestinationShorthand;
 use devices::DeviceId;
@@ -51,9 +51,8 @@ use hypervisor::Regs;
 use hypervisor::Sregs;
 use hypervisor::TriggerMode;
 use hypervisor::Vcpu;
-use hypervisor::VcpuEvents;
 use hypervisor::VcpuExit;
-use hypervisor::VcpuRunHandle;
+use hypervisor::VcpuSnapshot;
 use hypervisor::VcpuX86_64;
 use hypervisor::Xsave;
 use resources::AddressRange;
@@ -205,8 +204,8 @@ fn irq_event_tokens() {
 fn finalize_devices() {
     let mut chip = get_chip(1);
 
-    let mmio_bus = Bus::new();
-    let io_bus = Bus::new();
+    let mmio_bus = Bus::new(BusType::Mmio);
+    let io_bus = Bus::new(BusType::Io);
     let mut resources = SystemAllocator::new(
         SystemAllocatorConfig {
             io: Some(AddressRange {
@@ -461,8 +460,8 @@ fn lowest_priority_destination() {
 fn broadcast_eoi() {
     let mut chip = get_chip(1);
 
-    let mmio_bus = Bus::new();
-    let io_bus = Bus::new();
+    let mmio_bus = Bus::new(BusType::Mmio);
+    let io_bus = Bus::new(BusType::Io);
     let mut resources = SystemAllocator::new(
         SystemAllocatorConfig {
             io: Some(AddressRange {
@@ -665,20 +664,17 @@ impl Vcpu for FakeVcpu {
         self
     }
 
-    fn take_run_handle(&self, _signal_num: Option<c_int>) -> Result<VcpuRunHandle> {
+    fn run(&mut self) -> Result<VcpuExit> {
         unimplemented!()
     }
-    fn run(&mut self, _run_handle: &VcpuRunHandle) -> Result<VcpuExit> {
-        unimplemented!()
-    }
+
     fn set_immediate_exit(&self, _exit: bool) {}
-    fn set_local_immediate_exit(_exit: bool) {}
-    fn set_local_immediate_exit_fn(&self) -> extern "C" fn() {
-        extern "C" fn f() {
-            FakeVcpu::set_local_immediate_exit(true);
-        }
-        f
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn signal_handle(&self) -> hypervisor::VcpuSignalHandle {
+        unimplemented!()
     }
+
     fn handle_mmio(&self, _handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()> {
         unimplemented!()
     }
@@ -694,10 +690,7 @@ impl Vcpu for FakeVcpu {
     fn handle_wrmsr(&self) {
         unimplemented!()
     }
-    fn pvclock_ctrl(&self) -> Result<()> {
-        unimplemented!()
-    }
-    fn set_signal_mask(&self, _signals: &[c_int]) -> Result<()> {
+    fn on_suspend(&self) -> Result<()> {
         unimplemented!()
     }
     unsafe fn enable_raw_capability(&self, _cap: u32, _args: &[u64; 4]) -> Result<()> {
@@ -747,10 +740,10 @@ impl VcpuX86_64 for FakeVcpu {
     fn set_xsave(&self, _xsave: &Xsave) -> Result<()> {
         unimplemented!()
     }
-    fn get_vcpu_events(&self) -> Result<VcpuEvents> {
+    fn get_interrupt_state(&self) -> Result<serde_json::Value> {
         unimplemented!()
     }
-    fn set_vcpu_events(&self, _vcpu_events: &VcpuEvents) -> Result<()> {
+    fn set_interrupt_state(&self, _data: serde_json::Value) -> Result<()> {
         unimplemented!()
     }
     fn get_debugregs(&self) -> Result<DebugRegs> {
@@ -790,6 +783,22 @@ impl VcpuX86_64 for FakeVcpu {
         unimplemented!()
     }
     fn set_tsc_offset(&self, _offset: u64) -> Result<()> {
+        unimplemented!()
+    }
+    fn set_tsc_value(&self, _value: u64) -> Result<()> {
+        unimplemented!()
+    }
+    fn snapshot(&self) -> anyhow::Result<VcpuSnapshot> {
+        unimplemented!()
+    }
+    fn restore(
+        &mut self,
+        _snapshot: &VcpuSnapshot,
+        _host_tsc_reference_moment: u64,
+    ) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn restore_timekeeping(&self, _host_tsc_reference_moment: u64, _tsc_offset: u64) -> Result<()> {
         unimplemented!()
     }
 }

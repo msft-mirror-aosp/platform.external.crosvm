@@ -11,10 +11,10 @@ use base::error;
 use base::info;
 use base::warn;
 use base::Error;
+use metrics::protos::event_details::wave_format::WaveFormatSubFormat;
 use metrics::protos::event_details::RecordDetails;
 use metrics::protos::event_details::WaveFormat;
 use metrics::protos::event_details::WaveFormatDetails;
-use metrics::protos::event_details::WaveFormat_WaveFormatSubFormat;
 use metrics::MetricEventType;
 use winapi::shared::guiddef::IsEqualGUID;
 use winapi::shared::guiddef::GUID;
@@ -42,13 +42,13 @@ use winapi::um::combaseapi::CoTaskMemFree;
 use wio::com::ComPtr;
 
 use crate::AudioSharedFormat;
-use crate::RenderError;
+use crate::WinAudioError;
 use crate::MONO_CHANNEL_COUNT;
 use crate::STEREO_CHANNEL_COUNT;
 
 pub type WaveFormatDetailsProto = WaveFormatDetails;
 pub type WaveFormatProto = WaveFormat;
-pub type SubFormatProto = WaveFormat_WaveFormatSubFormat;
+pub type SubFormatProto = WaveFormatSubFormat;
 
 /// Wrapper around `WAVEFORMATEX` and `WAVEFORMATEXTENSIBLE` to hide some of the unsafe calls
 /// that could be made.
@@ -125,7 +125,7 @@ impl WaveAudioFormat {
                 {
                     wave_format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
                     wave_format.nChannels =
-                        std::cmp::min(STEREO_CHANNEL_COUNT as u16, default_num_channels);
+                        std::cmp::min(STEREO_CHANNEL_COUNT, default_num_channels);
                     wave_format.wBitsPerSample = target_bit_depth as u16;
                     wave_format.nAvgBytesPerSec = calc_avg_bytes_per_sec(
                         wave_format.nChannels,
@@ -209,8 +209,8 @@ impl WaveAudioFormat {
             }
         };
 
-        ((samples_per_sec as f64 * shared_default_size_in_100nanoseconds as f64) / 10000000.0)
-            .ceil() as usize
+        ((samples_per_sec as f64 * shared_default_size_in_100nanoseconds) / 10000000.0).ceil()
+            as usize
     }
 
     pub fn create_audio_shared_format(
@@ -447,7 +447,7 @@ impl From<&WaveAudioFormat> for WaveFormatProto {
 /// is to always get a 32bit float format.
 pub(crate) fn get_valid_mix_format(
     audio_client: &ComPtr<IAudioClient>,
-) -> Result<WaveAudioFormat, RenderError> {
+) -> Result<WaveAudioFormat, WinAudioError> {
     // Safe because `format_ptr` is owned by this unsafe block. `format_ptr` is guarenteed to
     // be not null by the time it reached `WaveAudioFormat::new` (check_hresult! should make
     // sure of that), which is also release the pointer passed in.
@@ -456,7 +456,7 @@ pub(crate) fn get_valid_mix_format(
         let hr = audio_client.GetMixFormat(&mut format_ptr);
         check_hresult!(
             hr,
-            RenderError::from(hr),
+            WinAudioError::from(hr),
             "Failed to retrieve audio engine's shared format"
         )?;
 
@@ -465,15 +465,15 @@ pub(crate) fn get_valid_mix_format(
 
     let mut wave_format_details = WaveFormatDetailsProto::new();
     let mut event_code = MetricEventType::AudioFormatRequestOk;
-    wave_format_details.set_requested(WaveFormatProto::from(&format));
+    wave_format_details.requested = Some(WaveFormatProto::from(&format)).into();
 
     info!("Printing mix format from `GetMixFormat`:\n{:?}", format);
     const BIT_DEPTH: usize = 32;
     format.modify_mix_format(BIT_DEPTH, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
 
-    let modified_wave_format = WaveFormatProto::from(&format);
-    if &modified_wave_format != wave_format_details.get_requested() {
-        wave_format_details.set_modified(modified_wave_format);
+    let modified_wave_format = Some(WaveFormatProto::from(&format)).into();
+    if modified_wave_format != wave_format_details.requested {
+        wave_format_details.modified = modified_wave_format;
         event_code = MetricEventType::AudioFormatModifiedOk;
     }
 
@@ -491,7 +491,7 @@ pub(crate) fn check_format(
     format: &WaveAudioFormat,
     mut wave_format_details: WaveFormatDetailsProto,
     event_code: MetricEventType,
-) -> Result<(), RenderError> {
+) -> Result<(), WinAudioError> {
     let mut closest_match_format: *mut WAVEFORMATEX = std::ptr::null_mut();
     // Safe because all values passed into `IsFormatSupport` is owned by us and we will
     // guarentee they won't be dropped and are valid.
@@ -509,7 +509,8 @@ pub(crate) fn check_format(
             // Safe because if the `hr` value is `S_FALSE`, then `IsFormatSupported` must've
             // given us a closest match.
             let closest_match_enum = unsafe { WaveAudioFormat::new(closest_match_format) };
-            wave_format_details.set_closest_matched(WaveFormatProto::from(&closest_match_enum));
+            wave_format_details.closest_matched =
+                Some(WaveFormatProto::from(&closest_match_enum)).into();
 
             error!(
                 "Current audio format not supported, the closest format is:\n{:?}",
@@ -525,7 +526,7 @@ pub(crate) fn check_format(
         // differentiate between rendering and capture.
         upload_metrics(wave_format_details, MetricEventType::AudioFormatFailed);
 
-        Err(RenderError::WindowsError(hr, last_error))
+        Err(WinAudioError::WindowsError(hr, last_error))
     } else {
         upload_metrics(wave_format_details, event_code);
 
@@ -538,7 +539,7 @@ fn upload_metrics(
     metrics_event_code: MetricEventType,
 ) {
     let mut details = RecordDetails::new();
-    details.set_wave_format_details(wave_format_details);
+    details.wave_format_details = Some(wave_format_details).into();
     metrics::log_event_with_details(metrics_event_code, &details);
 }
 

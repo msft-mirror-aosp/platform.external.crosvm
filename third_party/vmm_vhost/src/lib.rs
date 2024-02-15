@@ -30,10 +30,9 @@
 //! that shares its virtqueues. Slave is the consumer of the virtqueues. Master and slave can be
 //! either a client (i.e. connecting) or server (listening) in the socket communication.
 
-#![deny(missing_docs)]
-
 use std::fs::File;
 use std::io::Error as IOError;
+use std::num::TryFromIntError;
 
 use remain::sorted;
 use thiserror::Error as ThisError;
@@ -42,44 +41,28 @@ mod backend;
 pub use backend::*;
 
 pub mod message;
+pub use message::VHOST_USER_F_PROTOCOL_FEATURES;
 
 pub mod connection;
 
 mod sys;
+pub use connection::Connection;
+pub use message::MasterReq;
+pub use message::SlaveReq;
 pub use sys::SystemStream;
 pub use sys::*;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "vmm")] {
-        pub(crate) mod master;
-        pub use self::master::{Master, VhostUserMaster};
-        mod master_req_handler;
-        pub use self::master_req_handler::{VhostUserMasterReqHandler,
-                                    VhostUserMasterReqHandlerMut};
-    }
-}
-cfg_if::cfg_if! {
-    if #[cfg(feature = "device")] {
-        mod slave_req_handler;
-        mod slave_proxy;
-        pub use self::slave_req_handler::{
-            Protocol, SlaveReqHandler, SlaveReqHelper, VhostUserSlaveReqHandler,
-            VhostUserSlaveReqHandlerMut,
-        };
-        pub use self::slave_proxy::Slave;
-    }
-}
-cfg_if::cfg_if! {
-    if #[cfg(all(feature = "device", unix))] {
-        mod slave;
-        pub use self::slave::SlaveListener;
-    }
-}
-cfg_if::cfg_if! {
-    if #[cfg(feature = "vmm")] {
-        pub use self::master_req_handler::MasterReqHandler;
-    }
-}
+pub(crate) mod master;
+pub use self::master::Master;
+mod master_req_handler;
+pub use self::master_req_handler::VhostUserMasterReqHandler;
+mod slave_proxy;
+mod slave_req_handler;
+pub use self::master_req_handler::MasterReqHandler;
+pub use self::slave_proxy::Slave;
+pub use self::slave_req_handler::SlaveReqHandler;
+pub use self::slave_req_handler::SlaveReqHelper;
+pub use self::slave_req_handler::VhostUserSlaveReqHandler;
 
 /// Errors for vhost-user operations
 #[sorted]
@@ -88,6 +71,9 @@ pub enum Error {
     /// client exited properly.
     #[error("client exited properly")]
     ClientExit,
+    /// Failure to deserialize data.
+    #[error("failed to deserialize data")]
+    DeserializationFailed,
     /// client disconnected.
     /// If connection is closed properly, use `ClientExit` instead.
     #[error("client closed the connection")]
@@ -98,6 +84,9 @@ pub enum Error {
     /// Fd array in question is too big or too small
     #[error("wrong number of attached fds")]
     IncorrectFds,
+    /// Invalid cast to int.
+    #[error("invalid cast to int: {0}")]
+    InvalidCastToInt(TryFromIntError),
     /// Invalid message format, flag or content.
     #[error("invalid message")]
     InvalidMessage,
@@ -127,9 +116,21 @@ pub enum Error {
     /// Error from request handler
     #[error("handler failed to handle request: {0}")]
     ReqHandlerError(IOError),
+    /// Failure to restore.
+    #[error("Failed to restore")]
+    RestoreError(anyhow::Error),
+    /// Failure to serialize data.
+    #[error("failed to serialize data")]
+    SerializationFailed,
     /// Failure from the slave side.
     #[error("slave internal error")]
     SlaveInternalError,
+    /// Failure to run device specific sleep.
+    #[error("Failed to run device specific sleep: {0}")]
+    SleepError(anyhow::Error),
+    /// Failure to snapshot.
+    #[error("Failed to snapshot")]
+    SnapshotError(anyhow::Error),
     /// The socket is broken or has been closed.
     #[error("socket is broken: {0}")]
     SocketBroken(std::io::Error),
@@ -142,17 +143,29 @@ pub enum Error {
     /// Should retry the socket operation again.
     #[error("temporary socket error: {0}")]
     SocketRetry(std::io::Error),
+    /// Failure to stop a queue.
+    #[error("failed to stop queue")]
+    StopQueueError(anyhow::Error),
     /// Error from tx/rx on a Tube.
     #[error("failed to read/write on Tube: {0}")]
     TubeError(base::TubeError),
     /// Error from VFIO device.
     #[error("error occurred in VFIO device: {0}")]
     VfioDeviceError(anyhow::Error),
+    /// Error from invalid vring index.
+    #[error("Vring index not found: {0}")]
+    VringIndexNotFound(usize),
+    /// Failure to run device specific wake.
+    #[error("Failed to run device specific wake: {0}")]
+    WakeError(anyhow::Error),
 }
 
 impl From<base::TubeError> for Error {
     fn from(err: base::TubeError) -> Self {
-        Error::TubeError(err)
+        match err {
+            base::TubeError::Disconnected => Error::Disconnect,
+            err => Error::TubeError(err),
+        }
     }
 }
 
@@ -207,31 +220,28 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Result of request handler.
 pub type HandlerResult<T> = std::result::Result<T, IOError>;
 
-/// Utility function to take the first element from option of a vector of files.
-/// Returns `None` if the vector contains no file or more than one file.
-pub(crate) fn take_single_file(files: Option<Vec<File>>) -> Option<File> {
-    let mut files = files?;
+/// Utility function to convert a vector of files into a single file.
+/// Returns `None` if the vector contains no files or more than one file.
+pub(crate) fn into_single_file(mut files: Vec<File>) -> Option<File> {
     if files.len() != 1 {
         return None;
     }
     Some(files.swap_remove(0))
 }
 
-#[cfg(all(test, feature = "device"))]
+#[cfg(test)]
 mod dummy_slave;
 
-#[cfg(all(test, feature = "vmm", feature = "device"))]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
-    use std::sync::Mutex;
     use std::thread;
 
     use base::AsRawDescriptor;
     use tempfile::tempfile;
 
     use super::*;
-    use crate::backend::VhostBackend;
     use crate::connection::tests::*;
     use crate::dummy_slave::DummySlaveReqHandler;
     use crate::dummy_slave::VIRTIO_FEATURES;
@@ -240,9 +250,7 @@ mod tests {
     use crate::VringConfigData;
 
     /// Utility function to process a header and a message together.
-    fn handle_request(
-        h: &mut SlaveReqHandler<Mutex<DummySlaveReqHandler>, MasterReqEndpoint>,
-    ) -> Result<()> {
+    fn handle_request(h: &mut SlaveReqHandler<DummySlaveReqHandler>) -> Result<()> {
         // We assume that a header comes together with message body in tests so we don't wait before
         // calling `process_message()`.
         let (hdr, files) = h.recv_header()?;
@@ -251,7 +259,7 @@ mod tests {
 
     #[test]
     fn create_dummy_slave() {
-        let slave = Mutex::new(DummySlaveReqHandler::new());
+        let mut slave = DummySlaveReqHandler::new();
 
         slave.set_owner().unwrap();
         assert!(slave.set_owner().is_err());
@@ -259,40 +267,37 @@ mod tests {
 
     #[test]
     fn test_set_owner() {
-        let slave_be = Mutex::new(DummySlaveReqHandler::new());
+        let slave_be = DummySlaveReqHandler::new();
         let (master, mut slave) = create_master_slave_pair(slave_be);
 
-        assert!(!slave.as_ref().lock().unwrap().owned);
+        assert!(!slave.as_ref().owned);
         master.set_owner().unwrap();
         handle_request(&mut slave).unwrap();
-        assert!(slave.as_ref().lock().unwrap().owned);
+        assert!(slave.as_ref().owned);
         master.set_owner().unwrap();
         assert!(handle_request(&mut slave).is_err());
-        assert!(slave.as_ref().lock().unwrap().owned);
+        assert!(slave.as_ref().owned);
     }
 
     #[test]
     fn test_set_features() {
         let mbar = Arc::new(Barrier::new(2));
         let sbar = mbar.clone();
-        let slave_be = Mutex::new(DummySlaveReqHandler::new());
+        let slave_be = DummySlaveReqHandler::new();
         let (mut master, mut slave) = create_master_slave_pair(slave_be);
 
         thread::spawn(move || {
             handle_request(&mut slave).unwrap();
-            assert!(slave.as_ref().lock().unwrap().owned);
+            assert!(slave.as_ref().owned);
+
+            handle_request(&mut slave).unwrap();
+            handle_request(&mut slave).unwrap();
+            assert_eq!(slave.as_ref().acked_features, VIRTIO_FEATURES & !0x1);
 
             handle_request(&mut slave).unwrap();
             handle_request(&mut slave).unwrap();
             assert_eq!(
-                slave.as_ref().lock().unwrap().acked_features,
-                VIRTIO_FEATURES & !0x1
-            );
-
-            handle_request(&mut slave).unwrap();
-            handle_request(&mut slave).unwrap();
-            assert_eq!(
-                slave.as_ref().lock().unwrap().acked_protocol_features,
+                slave.as_ref().acked_protocol_features,
                 VhostUserProtocolFeatures::all().bits()
             );
 
@@ -318,26 +323,23 @@ mod tests {
     fn test_master_slave_process() {
         let mbar = Arc::new(Barrier::new(2));
         let sbar = mbar.clone();
-        let slave_be = Mutex::new(DummySlaveReqHandler::new());
+        let slave_be = DummySlaveReqHandler::new();
         let (mut master, mut slave) = create_master_slave_pair(slave_be);
 
         thread::spawn(move || {
             // set_own()
             handle_request(&mut slave).unwrap();
-            assert!(slave.as_ref().lock().unwrap().owned);
+            assert!(slave.as_ref().owned);
 
             // get/set_features()
             handle_request(&mut slave).unwrap();
             handle_request(&mut slave).unwrap();
-            assert_eq!(
-                slave.as_ref().lock().unwrap().acked_features,
-                VIRTIO_FEATURES & !0x1
-            );
+            assert_eq!(slave.as_ref().acked_features, VIRTIO_FEATURES & !0x1);
 
             handle_request(&mut slave).unwrap();
             handle_request(&mut slave).unwrap();
             assert_eq!(
-                slave.as_ref().lock().unwrap().acked_protocol_features,
+                slave.as_ref().acked_protocol_features,
                 VhostUserProtocolFeatures::all().bits()
             );
 
@@ -438,8 +440,9 @@ mod tests {
         #[cfg(windows)]
         let tubes = base::Tube::pair().unwrap();
         #[cfg(windows)]
-        // Safe because we will be importing the Tube in the other thread.
         let descriptor =
+            // SAFETY:
+            // Safe because we will be importing the Tube in the other thread.
             unsafe { tube_transporter::packed_tube::pack(tubes.0, std::process::id()).unwrap() };
 
         #[cfg(unix)]
@@ -457,7 +460,6 @@ mod tests {
         master.set_vring_num(0, 256).unwrap();
         master.set_vring_base(0, 0).unwrap();
         let config = VringConfigData {
-            queue_max_size: 256,
             queue_size: 128,
             flags: VhostUserVringAddrFlags::VHOST_VRING_F_LOG.bits(),
             desc_table_addr: 0x1000,

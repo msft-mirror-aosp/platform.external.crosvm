@@ -4,7 +4,7 @@
 
 //! x86 architecture support.
 
-#![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#![cfg(target_arch = "x86_64")]
 
 mod fdt;
 
@@ -27,9 +27,6 @@ mod msr_index;
 #[allow(clippy::all)]
 mod mpspec;
 
-#[cfg(unix)]
-pub mod msr;
-
 pub mod acpi;
 mod bzimage;
 pub mod cpuid;
@@ -45,7 +42,6 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::io::Seek;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -56,31 +52,34 @@ use acpi_tables::aml::Aml;
 use acpi_tables::sdt::SDT;
 use anyhow::Context;
 use arch::get_serial_cmdline;
+use arch::CpuSet;
+use arch::DtbOverlay;
 use arch::GetSerialCmdlineError;
-use arch::MsrAction;
-use arch::MsrConfig;
-use arch::MsrFilter;
-use arch::MsrRWType;
-use arch::MsrValueFrom;
 use arch::RunnableLinuxVm;
 use arch::VmComponents;
 use arch::VmImage;
 #[cfg(feature = "seccomp_trace")]
 use base::debug;
 use base::warn;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use base::AsRawDescriptors;
 use base::Event;
+use base::FileGetLen;
+use base::FileReadWriteAtVolatile;
 use base::SendTube;
 use base::Tube;
 use base::TubeError;
 use chrono::Utc;
 pub use cpuid::adjust_cpuid;
 pub use cpuid::CpuIdContext;
+use devices::acpi::PM_WAKEUP_GPIO;
+use devices::Bus;
 use devices::BusDevice;
 use devices::BusDeviceObj;
 use devices::BusResumeDevice;
+use devices::BusType;
 use devices::Debugcon;
+use devices::FwCfgParameters;
 use devices::IrqChip;
 use devices::IrqChipX86_64;
 use devices::IrqEventSource;
@@ -88,26 +87,32 @@ use devices::PciAddress;
 use devices::PciConfigIo;
 use devices::PciConfigMmio;
 use devices::PciDevice;
+use devices::PciInterruptPin;
 use devices::PciRoot;
 use devices::PciRootCommand;
 use devices::PciVirtualConfigMmio;
 use devices::Pflash;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::ProxyDevice;
 use devices::Serial;
 use devices::SerialHardware;
 use devices::SerialParameters;
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use devices::VirtualPmc;
+use devices::FW_CFG_BASE_PORT;
+use devices::FW_CFG_MAX_FILE_SLOTS;
+use devices::FW_CFG_WIDTH;
+#[cfg(feature = "gdb")]
 use gdbstub_arch::x86::reg::id::X86_64CoreRegId;
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(feature = "gdb")]
 use gdbstub_arch::x86::reg::X86SegmentRegs;
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(feature = "gdb")]
 use gdbstub_arch::x86::reg::X86_64CoreRegs;
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(feature = "gdb")]
 use gdbstub_arch::x86::reg::X87FpuInternalRegs;
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(feature = "gdb")]
 use hypervisor::x86_64::Regs;
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(feature = "gdb")]
 use hypervisor::x86_64::Sregs;
 use hypervisor::CpuConfigX86_64;
 use hypervisor::Hypervisor;
@@ -122,7 +127,7 @@ use hypervisor::VmX86_64;
 use jail::read_jail_addr;
 #[cfg(windows)]
 use jail::FakeMinijailStub as Minijail;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use minijail::Minijail;
 use once_cell::sync::OnceCell;
 use rand::rngs::OsRng;
@@ -131,6 +136,8 @@ use remain::sorted;
 use resources::AddressRange;
 use resources::SystemAllocator;
 use resources::SystemAllocatorConfig;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use sync::Condvar;
 use sync::Mutex;
 use thiserror::Error;
 use vm_control::BatControl;
@@ -141,10 +148,10 @@ use vm_memory::GuestMemoryError;
 use vm_memory::MemoryRegionOptions;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use crate::bootparam::boot_params;
 use crate::cpuid::EDX_HYBRID_CPU_SHIFT;
-use crate::msr_index::*;
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -159,7 +166,7 @@ pub enum Error {
     CloneEvent(base::Error),
     #[error("failed to clone IRQ chip: {0}")]
     CloneIrqChip(base::Error),
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[error("failed to clone jail: {0}")]
     CloneJail(minijail::Error),
     #[error("unable to clone a Tube: {0}")]
@@ -182,6 +189,8 @@ pub enum Error {
     CreateEvent(base::Error),
     #[error("failed to create fdt: {0}")]
     CreateFdt(cros_fdt::Error),
+    #[error("failed to create fw_cfg device: {0}")]
+    CreateFwCfgDevice(devices::FwCfgError),
     #[error("failed to create IOAPIC device: {0}")]
     CreateIoapicDevice(base::Error),
     #[error("failed to create a PCI root hub: {0}")]
@@ -190,7 +199,7 @@ pub enum Error {
     CreatePit(base::Error),
     #[error("unable to make PIT device: {0}")]
     CreatePitDevice(devices::PitError),
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[error("unable to create proxy device: {0}")]
     CreateProxyDevice(devices::ProxyError),
     #[error("unable to create serial devices: {0}")]
@@ -203,9 +212,6 @@ pub enum Error {
     CreateVirtioMmioBus(arch::DeviceRegistrationError),
     #[error("invalid e820 setup params")]
     E820Configuration,
-    #[cfg(feature = "direct")]
-    #[error("failed to enable ACPI event forwarding: {0}")]
-    EnableAcpiEvent(devices::DirectIrqError),
     #[error("failed to enable singlestep execution: {0}")]
     EnableSinglestep(base::Error),
     #[error("failed to enable split irqchip: {0}")]
@@ -299,7 +305,7 @@ pub struct X8664arch;
 // Like `bootparam::setup_data` without the incomplete array field at the end, which allows us to
 // safely implement Copy, Clone
 #[repr(C)]
-#[derive(Copy, Clone, Default, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Default, FromZeroes, FromBytes, AsBytes)]
 struct setup_data_hdr {
     pub next: u64,
     pub type_: u32,
@@ -328,7 +334,7 @@ const MB: u64 = 1 << 20;
 const GB: u64 = 1 << 30;
 
 pub const BOOT_STACK_POINTER: u64 = 0x8000;
-const START_OF_RAM_32BITS: u64 = if cfg!(feature = "direct") { 0x1000 } else { 0 };
+const START_OF_RAM_32BITS: u64 = 0;
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 // Linux (with 4-level paging) has a physical memory limit of 46 bits (64 TiB).
 const HIGH_MMIO_MAX_END: u64 = (1u64 << 46) - 1;
@@ -378,17 +384,7 @@ static LOW_MEMORY_LAYOUT: OnceCell<LowMemoryLayout> = OnceCell::new();
 pub fn init_low_memory_layout(pcie_ecam: Option<AddressRange>, pci_low_start: Option<u64>) {
     LOW_MEMORY_LAYOUT.get_or_init(|| {
         // Make sure it align to 256MB for MTRR convenient
-        const MEM_32BIT_GAP_SIZE: u64 = if cfg!(feature = "direct") {
-            // Allow space for identity mapping coreboot memory regions on the host
-            // which is found at around 7a00_0000 (little bit before 2GB)
-            //
-            // TODO(b/188011323): stop hardcoding sizes and addresses here and instead
-            // determine the memory map from how the VM has been configured via the
-            // command line.
-            2560 * MB
-        } else {
-            768 * MB
-        };
+        const MEM_32BIT_GAP_SIZE: u64 = 768 * MB;
         // Reserved memory for nand_bios/LAPIC/IOAPIC/HPET/.....
         const RESERVED_MEM_SIZE: u64 = 0x800_0000;
         const PCI_MMIO_END: u64 = FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - 1;
@@ -693,7 +689,12 @@ impl arch::LinuxArch for X8664arch {
         dump_device_tree_blob: Option<PathBuf>,
         debugcon_jail: Option<Minijail>,
         pflash_jail: Option<Minijail>,
-        #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
+        fw_cfg_jail: Option<Minijail>,
+        #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] guest_suspended_cvar: Option<
+            Arc<(Mutex<bool>, Condvar)>,
+        >,
+        device_tree_overlays: Vec<DtbOverlay>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmX86_64,
@@ -711,7 +712,6 @@ impl arch::LinuxArch for X8664arch {
         vm.set_tss_addr(tss_addr).map_err(Error::SetTssAddr)?;
 
         // Use IRQ info in ACPI if provided by the user.
-        let mut noirq = true;
         let mut mptable = true;
         let mut sci_irq = X86_64_SCI_IRQ;
 
@@ -723,9 +723,7 @@ impl arch::LinuxArch for X8664arch {
             .map_err(Error::ReservePcieCfgMmio)?;
 
         for sdt in components.acpi_sdts.iter() {
-            if sdt.is_signature(b"DSDT") || sdt.is_signature(b"APIC") {
-                noirq = false;
-            } else if sdt.is_signature(b"FACP") {
+            if sdt.is_signature(b"FACP") {
                 mptable = false;
                 let sci_irq_fadt: u16 = sdt.read(acpi::FADT_FIELD_SCI_INTERRUPT);
                 sci_irq = sci_irq_fadt.into();
@@ -736,8 +734,8 @@ impl arch::LinuxArch for X8664arch {
         }
 
         let pcie_vcfg_range = Self::get_pcie_vcfg_mmio_range(&mem, &pcie_cfg_mmio_range);
-        let mmio_bus = Arc::new(devices::Bus::new());
-        let io_bus = Arc::new(devices::Bus::new());
+        let mmio_bus = Arc::new(Bus::new(BusType::Mmio));
+        let io_bus = Arc::new(Bus::new(BusType::Io));
 
         let (pci_devices, devs): (Vec<_>, Vec<_>) = devs
             .into_iter()
@@ -748,24 +746,28 @@ impl arch::LinuxArch for X8664arch {
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
 
-        let (pci, pci_irqs, mut pid_debug_label_map, amls) = arch::generate_pci_root(
-            pci_devices,
-            irq_chip.as_irq_chip_mut(),
-            mmio_bus.clone(),
-            io_bus.clone(),
-            system_allocator,
-            &mut vm,
-            4, // Share the four pin interrupts (INTx#)
-            Some(pcie_vcfg_range.start),
-            #[cfg(feature = "swap")]
-            swap_controller,
-        )
-        .map_err(Error::CreatePciRoot)?;
+        let (pci, pci_irqs, mut pid_debug_label_map, amls, gpe_scope_amls) =
+            arch::generate_pci_root(
+                pci_devices,
+                irq_chip.as_irq_chip_mut(),
+                mmio_bus.clone(),
+                GuestAddress(pcie_cfg_mmio_range.start),
+                12,
+                io_bus.clone(),
+                system_allocator,
+                &mut vm,
+                4, // Share the four pin interrupts (INTx#)
+                Some(pcie_vcfg_range.start),
+                #[cfg(feature = "swap")]
+                swap_controller,
+            )
+            .map_err(Error::CreatePciRoot)?;
 
         let pci = Arc::new(Mutex::new(pci));
         pci.lock().enable_pcie_cfg_mmio(pcie_cfg_mmio_range.start);
         let pci_cfg = PciConfigIo::new(
             pci.clone(),
+            components.break_linux_pci_config_io,
             vm_evt_wrtube.try_clone().map_err(Error::CloneTube)?,
         );
         let pci_bus = Arc::new(Mutex::new(pci_cfg));
@@ -810,6 +812,17 @@ impl arch::LinuxArch for X8664arch {
 
         // Event used to notify crosvm that guest OS is trying to suspend.
         let suspend_evt = Event::new().map_err(Error::CreateEvent)?;
+
+        if components.fw_cfg_enable {
+            Self::setup_fw_cfg_device(
+                &io_bus,
+                components.fw_cfg_parameters.clone(),
+                components.bootorder_fw_cfg_blob.clone(),
+                fw_cfg_jail,
+                #[cfg(feature = "swap")]
+                swap_controller,
+            )?;
+        }
 
         if !components.no_i8042 {
             Self::setup_legacy_i8042_device(
@@ -879,10 +892,6 @@ impl arch::LinuxArch for X8664arch {
             suspend_evt.try_clone().map_err(Error::CloneEvent)?,
             vm_evt_wrtube.try_clone().map_err(Error::CloneTube)?,
             components.acpi_sdts,
-            #[cfg(feature = "direct")]
-            &components.direct_gpe,
-            #[cfg(feature = "direct")]
-            &components.direct_fixed_evts,
             irq_chip.as_irq_chip_mut(),
             sci_irq,
             battery,
@@ -891,12 +900,15 @@ impl arch::LinuxArch for X8664arch {
             &mut resume_notify_devices,
             #[cfg(feature = "swap")]
             swap_controller,
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             components.ac_adapter,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            guest_suspended_cvar,
+            &pci_irqs,
         )?;
 
         // Create customized SSDT table
-        let sdt = acpi::create_customize_ssdt(pci.clone(), amls);
+        let sdt = acpi::create_customize_ssdt(pci.clone(), amls, gpe_scope_amls);
         if let Some(sdt) = sdt {
             acpi_dev_resource.sdts.push(sdt);
         }
@@ -918,8 +930,7 @@ impl arch::LinuxArch for X8664arch {
             mptable::setup_mptable(&mem, vcpu_count as u8, &pci_irqs)
                 .map_err(Error::SetupMptable)?;
         }
-        smbios::setup_smbios(&mem, components.dmi_path, &components.oem_strings)
-            .map_err(Error::SetupSmbios)?;
+        smbios::setup_smbios(&mem, &components.smbios, bios_size).map_err(Error::SetupSmbios)?;
 
         let host_cpus = if components.host_cpu_topology {
             components.vcpu_affinity.clone()
@@ -945,10 +956,6 @@ impl arch::LinuxArch for X8664arch {
         .ok_or(Error::CreateAcpi)?;
 
         let mut cmdline = Self::get_base_linux_cmdline();
-
-        if noirq {
-            cmdline.insert_str("acpi=noirq").unwrap();
-        }
 
         get_serial_cmdline(&mut cmdline, serial_parameters, "io")
             .map_err(Error::GetSerialCmdline)?;
@@ -991,6 +998,7 @@ impl arch::LinuxArch for X8664arch {
                     kernel_end,
                     params,
                     dump_device_tree_blob,
+                    device_tree_overlays,
                 )?;
 
                 // Configure the bootstrap VCPU for the Linux/x86 64-bit boot protocol.
@@ -1023,7 +1031,6 @@ impl arch::LinuxArch for X8664arch {
             vcpu_init,
             no_smt: components.no_smt,
             irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
-            has_bios: matches!(components.vm_image, VmImage::Bios(_)),
             io_bus,
             mmio_bus,
             pid_debug_label_map,
@@ -1032,11 +1039,11 @@ impl arch::LinuxArch for X8664arch {
             rt_cpus: components.rt_cpus,
             delay_rt: components.delay_rt,
             bat_control,
-            #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+            #[cfg(feature = "gdb")]
             gdb: components.gdb,
             pm: Some(acpi_dev_resource.pm),
             root_config: pci,
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             platform_devices: Vec::new(),
             hotplug_bus: BTreeMap::new(),
             devices_thread: None,
@@ -1052,7 +1059,6 @@ impl arch::LinuxArch for X8664arch {
         vcpu_init: VcpuInitX86_64,
         vcpu_id: usize,
         num_cpus: usize,
-        _has_bios: bool,
         cpu_config: Option<CpuConfigX86_64>,
     ) -> Result<()> {
         let cpu_config = match cpu_config {
@@ -1099,15 +1105,15 @@ impl arch::LinuxArch for X8664arch {
     fn register_pci_device<V: VmX86_64, Vcpu: VcpuX86_64>(
         linux: &mut RunnableLinuxVm<V, Vcpu>,
         device: Box<dyn PciDevice>,
-        #[cfg(unix)] minijail: Option<Minijail>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] minijail: Option<Minijail>,
         resources: &mut SystemAllocator,
         hp_control_tube: &mpsc::Sender<PciRootCommand>,
-        #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
+        #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
     ) -> Result<PciAddress> {
         arch::configure_pci_device(
             linux,
             device,
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             minijail,
             resources,
             hp_control_tube,
@@ -1116,9 +1122,21 @@ impl arch::LinuxArch for X8664arch {
         )
         .map_err(Error::ConfigurePciDevice)
     }
+
+    fn get_host_cpu_frequencies_khz() -> Result<BTreeMap<usize, Vec<u32>>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn get_host_cpu_capacity() -> Result<BTreeMap<usize, u32>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn get_host_cpu_clusters() -> Result<Vec<CpuSet>> {
+        Ok(Vec::new())
+    }
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(feature = "gdb")]
 impl<T: VcpuX86_64> arch::GdbOps<T> for X8664arch {
     type Error = Error;
 
@@ -1318,7 +1336,7 @@ impl<T: VcpuX86_64> arch::GdbOps<T> for X8664arch {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "gdb"))]
+#[cfg(feature = "gdb")]
 // return the translated address and the size of the page it resides in.
 fn phys_addr(mem: &GuestMemory, vaddr: u64, sregs: &Sregs) -> Result<(u64, u64)> {
     const CR0_PG_MASK: u64 = 1 << 31;
@@ -1379,7 +1397,9 @@ fn phys_addr(mem: &GuestMemory, vaddr: u64, sregs: &Sregs) -> Result<(u64, u64)>
 
     if sregs.efer & MSR_EFER_LMA != 0 {
         // TODO - check LA57
-        if sregs.cr4 & CR4_LA57_MASK != 0 {}
+        if sregs.cr4 & CR4_LA57_MASK != 0 {
+            todo!("handle LA57");
+        }
         let p4_ent = next_pte(mem, sregs.cr3, vaddr, 4)?;
         let p3_ent = next_pte(mem, p4_ent, vaddr, 3)?;
         // TODO check if it's a 1G page with the PSE bit in p2_ent
@@ -1491,9 +1511,7 @@ impl X8664arch {
     /// * `mem` - The memory to be used by the guest.
     /// * `bios_image` - the File object for the specified bios
     fn load_bios(mem: &GuestMemory, bios_image: &mut File) -> Result<()> {
-        let bios_image_length = bios_image
-            .seek(io::SeekFrom::End(0))
-            .map_err(Error::LoadBios)?;
+        let bios_image_length = bios_image.get_len().map_err(Error::LoadBios)?;
         if bios_image_length >= FIRST_ADDR_PAST_32BITS {
             return Err(Error::LoadBios(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1503,15 +1521,13 @@ impl X8664arch {
                 ),
             )));
         }
+
+        let guest_slice = mem
+            .get_slice_at_addr(bios_start(bios_image_length), bios_image_length as usize)
+            .map_err(Error::SetupGuestMemory)?;
         bios_image
-            .seek(io::SeekFrom::Start(0))
+            .read_exact_at_volatile(guest_slice, 0)
             .map_err(Error::LoadBios)?;
-        mem.read_to_memory(
-            bios_start(bios_image_length),
-            bios_image,
-            bios_image_length as usize,
-        )
-        .map_err(Error::SetupGuestMemory)?;
         Ok(())
     }
 
@@ -1519,20 +1535,20 @@ impl X8664arch {
         pflash_image: File,
         block_size: u32,
         bios_size: u64,
-        mmio_bus: &devices::Bus,
+        mmio_bus: &Bus,
         jail: Option<Minijail>,
-        #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
+        #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
     ) -> Result<()> {
         let size = pflash_image.metadata().map_err(Error::LoadPflash)?.len();
         let start = FIRST_ADDR_PAST_32BITS - bios_size - size;
         let pflash_image = Box::new(pflash_image);
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let fds = pflash_image.as_raw_descriptors();
 
         let pflash = Pflash::new(pflash_image, block_size).map_err(Error::SetupPflash)?;
         let pflash: Arc<Mutex<dyn BusDevice>> = match jail {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             Some(jail) => Arc::new(Mutex::new(
                 ProxyDevice::new(
                     pflash,
@@ -1610,6 +1626,7 @@ impl X8664arch {
         kernel_end: u64,
         params: boot_params,
         dump_device_tree_blob: Option<PathBuf>,
+        device_tree_overlays: Vec<DtbOverlay>,
     ) -> Result<()> {
         kernel_loader::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)
             .map_err(Error::LoadCmdline)?;
@@ -1617,7 +1634,8 @@ impl X8664arch {
         let mut setup_data = Vec::<SetupData>::new();
         if let Some(android_fstab) = android_fstab {
             setup_data.push(
-                fdt::create_fdt(android_fstab, dump_device_tree_blob).map_err(Error::CreateFdt)?,
+                fdt::create_fdt(android_fstab, dump_device_tree_blob, device_tree_overlays)
+                    .map_err(Error::CreateFdt)?,
             );
         }
         setup_data.push(setup_data_rng_seed());
@@ -1698,6 +1716,75 @@ impl X8664arch {
         cmdline
     }
 
+    /// Sets up fw_cfg device.
+    ///  # Arguments
+    ///
+    /// * - `io_bus` - the IO bus object
+    /// * - `fw_cfg_parameters` - command-line specified data to add to device. May contain
+    /// all None fields if user did not specify data to add to the device
+    fn setup_fw_cfg_device(
+        io_bus: &Bus,
+        fw_cfg_parameters: Vec<FwCfgParameters>,
+        bootorder_fw_cfg_blob: Vec<u8>,
+        fw_cfg_jail: Option<Minijail>,
+        #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
+    ) -> Result<()> {
+        let fw_cfg = match devices::FwCfgDevice::new(FW_CFG_MAX_FILE_SLOTS, fw_cfg_parameters) {
+            Ok(mut device) => {
+                // this condition will only be true if the user specified at least one bootindex
+                // option on the command line. If none were specified, bootorder_fw_cfg_blob will
+                // only have a null byte (null terminator)
+                if bootorder_fw_cfg_blob.len() > 1 {
+                    // Add boot order file to the device. If the file is not present, firmware may
+                    // not be able to boot.
+                    if let Err(err) = device.add_file(
+                        "bootorder",
+                        bootorder_fw_cfg_blob,
+                        devices::FwCfgItemType::GenericItem,
+                    ) {
+                        return Err(Error::CreateFwCfgDevice(err));
+                    }
+                }
+                device
+            }
+            Err(err) => {
+                return Err(Error::CreateFwCfgDevice(err));
+            }
+        };
+
+        let fw_cfg: Arc<Mutex<dyn BusDevice>> = match fw_cfg_jail.as_ref() {
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            Some(jail) => {
+                let jail_clone = jail.try_clone().map_err(Error::CloneJail)?;
+                #[cfg(feature = "seccomp_trace")]
+                debug!(
+                    "seccomp_trace {{\"event\": \"minijail_clone\", \"src_jail_addr\": \"0x{:x}\", \"dst_jail_addr\": \"0x{:x}\"}}",
+                    read_jail_addr(jail),
+                    read_jail_addr(&jail_clone)
+                );
+                Arc::new(Mutex::new(
+                    ProxyDevice::new(
+                        fw_cfg,
+                        jail_clone,
+                        Vec::new(),
+                        #[cfg(feature = "swap")]
+                        swap_controller,
+                    )
+                    .map_err(Error::CreateProxyDevice)?,
+                ))
+            }
+            #[cfg(windows)]
+            Some(_) => unreachable!(),
+            None => Arc::new(Mutex::new(fw_cfg)),
+        };
+
+        io_bus
+            .insert(fw_cfg, FW_CFG_BASE_PORT, FW_CFG_WIDTH)
+            .map_err(Error::InsertBus)?;
+
+        Ok(())
+    }
+
     /// Sets up the legacy x86 i8042/KBD platform device
     ///
     /// # Arguments
@@ -1706,7 +1793,7 @@ impl X8664arch {
     /// * - `pit_uses_speaker_port` - does the PIT use port 0x61 for the PC speaker
     /// * - `vm_evt_wrtube` - the event object which should receive exit events
     pub fn setup_legacy_i8042_device(
-        io_bus: &devices::Bus,
+        io_bus: &Bus,
         pit_uses_speaker_port: bool,
         vm_evt_wrtube: SendTube,
     ) -> Result<()> {
@@ -1729,7 +1816,7 @@ impl X8664arch {
     /// * - `io_bus` - the IO bus object
     /// * - `mem_size` - the size in bytes of physical ram for the guest
     pub fn setup_legacy_cmos_device(
-        io_bus: &devices::Bus,
+        io_bus: &Bus,
         irq_chip: &mut dyn IrqChipX86_64,
         vm_control: Tube,
         mem_size: u64,
@@ -1785,36 +1872,41 @@ impl X8664arch {
     /// * - `irq_chip` the IrqChip object for registering irq events
     /// * - `battery` indicate whether to create the battery
     /// * - `mmio_bus` the MMIO bus to add the devices to
+    /// * - `pci_irqs` IRQ assignment of PCI devices. Tuples of (PCI address,
+    ///               gsi, PCI interrupt pin). Note that this matches one of
+    ///               the return values of generate_pci_root.
     pub fn setup_acpi_devices(
         pci_root: Arc<Mutex<PciRoot>>,
         mem: &GuestMemory,
-        io_bus: &devices::Bus,
+        io_bus: &Bus,
         resources: &mut SystemAllocator,
         suspend_evt: Event,
         vm_evt_wrtube: SendTube,
         sdts: Vec<SDT>,
-        #[cfg(feature = "direct")] direct_gpe: &[u32],
-        #[cfg(feature = "direct")] direct_fixed_evts: &[devices::ACPIPMFixedEvent],
         irq_chip: &mut dyn IrqChip,
         sci_irq: u32,
         battery: (Option<BatteryType>, Option<Minijail>),
-        #[cfg_attr(windows, allow(unused_variables))] mmio_bus: &devices::Bus,
+        #[cfg_attr(windows, allow(unused_variables))] mmio_bus: &Bus,
         max_bus: u8,
         resume_notify_devices: &mut Vec<Arc<Mutex<dyn BusResumeDevice>>>,
-        #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
-        #[cfg(unix)] ac_adapter: bool,
+        #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] ac_adapter: bool,
+        #[cfg(any(target_os = "android", target_os = "linux"))] guest_suspended_cvar: Option<
+            Arc<(Mutex<bool>, Condvar)>,
+        >,
+        pci_irqs: &[(PciAddress, u32, PciInterruptPin)],
     ) -> Result<(acpi::AcpiDevResource, Option<BatControl>)> {
         // The AML data for the acpi devices
         let mut amls = Vec::new();
 
         let bat_control = if let Some(battery_type) = battery.0 {
             match battery_type {
-                #[cfg(unix)]
+                #[cfg(any(target_os = "android", target_os = "linux"))]
                 BatteryType::Goldfish => {
                     let irq_num = resources.allocate_irq().ok_or(Error::CreateBatDevices(
                         arch::DeviceRegistrationError::AllocateIrq,
                     ))?;
-                    let (control_tube, _mmio_base) = arch::sys::unix::add_goldfish_battery(
+                    let (control_tube, _mmio_base) = arch::sys::linux::add_goldfish_battery(
                         &mut amls,
                         battery.1,
                         mmio_bus,
@@ -1856,36 +1948,9 @@ impl X8664arch {
         );
         pcie_vcfg.to_aml_bytes(&mut amls);
 
-        #[cfg(feature = "direct")]
-        let direct_evt_info = if direct_gpe.is_empty() && direct_fixed_evts.is_empty() {
-            None
-        } else {
-            let direct_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
-            let mut sci_devirq =
-                devices::DirectIrq::new_level(&direct_sci_evt).map_err(Error::EnableAcpiEvent)?;
-
-            sci_devirq
-                .sci_irq_prepare()
-                .map_err(Error::EnableAcpiEvent)?;
-
-            for gpe in direct_gpe {
-                sci_devirq
-                    .gpe_enable_forwarding(*gpe)
-                    .map_err(Error::EnableAcpiEvent)?;
-            }
-
-            for evt in direct_fixed_evts {
-                sci_devirq
-                    .fixed_event_enable_forwarding(*evt)
-                    .map_err(Error::EnableAcpiEvent)?;
-            }
-
-            Some((direct_sci_evt, direct_gpe, direct_fixed_evts))
-        };
-
         let pm_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let acdc = if ac_adapter {
             // Allocate GPE for AC adapter notfication
             let gpe = resources.allocate_gpe().ok_or(Error::AllocateGpe)?;
@@ -1917,10 +1982,33 @@ impl X8664arch {
         #[cfg(windows)]
         let acdc = None;
 
+        //Virtual PMC
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if let Some(guest_suspended_cvar) = guest_suspended_cvar {
+            let alloc = resources.get_anon_alloc();
+            let mmio_base = resources
+                .allocate_mmio(
+                    devices::pmc_virt::VPMC_VIRT_MMIO_SIZE,
+                    alloc,
+                    "VirtualPmc".to_string(),
+                    resources::AllocOptions::new().align(devices::pmc_virt::VPMC_VIRT_MMIO_SIZE),
+                )
+                .unwrap();
+
+            let pmc_virtio_mmio =
+                Arc::new(Mutex::new(VirtualPmc::new(mmio_base, guest_suspended_cvar)));
+            mmio_bus
+                .insert(
+                    pmc_virtio_mmio.clone(),
+                    mmio_base,
+                    devices::pmc_virt::VPMC_VIRT_MMIO_SIZE,
+                )
+                .unwrap();
+            pmc_virtio_mmio.lock().to_aml_bytes(&mut amls);
+        }
+
         let mut pmresource = devices::ACPIPMResource::new(
             pm_sci_evt.try_clone().map_err(Error::CloneEvent)?,
-            #[cfg(feature = "direct")]
-            direct_evt_info,
             suspend_evt,
             vm_evt_wrtube,
             acdc,
@@ -1957,6 +2045,18 @@ impl X8664arch {
             crs_entries.push(entry);
         }
 
+        let prt_entries: Vec<aml::Package> = pci_irqs
+            .iter()
+            .map(|(pci_address, gsi, pci_intr_pin)| {
+                aml::Package::new(vec![
+                    &pci_address.acpi_adr(),
+                    &pci_intr_pin.to_mask(),
+                    &aml::ZERO,
+                    gsi,
+                ])
+            })
+            .collect();
+
         aml::Device::new(
             "_SB_.PC00".into(),
             vec![
@@ -1971,17 +2071,51 @@ impl X8664arch {
                     &aml::ResourceTemplate::new(crs_entries.iter().map(|b| b.as_ref()).collect()),
                 ),
                 &PciRootOSC {},
+                &aml::Name::new(
+                    "_PRT".into(),
+                    &aml::Package::new(prt_entries.iter().map(|p| p as &dyn Aml).collect()),
+                ),
             ],
         )
         .to_aml_bytes(&mut amls);
+
+        if let (Some(start), Some(len)) = (
+            u32::try_from(read_pcie_cfg_mmio().start).ok(),
+            read_pcie_cfg_mmio()
+                .len()
+                .and_then(|l| u32::try_from(l).ok()),
+        ) {
+            aml::Device::new(
+                "_SB_.MB00".into(),
+                vec![
+                    &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0C02")),
+                    &aml::Name::new(
+                        "_CRS".into(),
+                        &aml::ResourceTemplate::new(vec![&aml::Memory32Fixed::new(
+                            true, start, len,
+                        )]),
+                    ),
+                ],
+            )
+            .to_aml_bytes(&mut amls);
+        } else {
+            warn!("Failed to create ACPI MMCFG region reservation");
+        }
 
         let root_bus = pci_root.lock().get_root_bus();
         let addresses = root_bus.lock().get_downstream_devices();
         for address in addresses {
             if let Some(acpi_path) = pci_root.lock().acpi_path(&address) {
+                const DEEPEST_SLEEP_STATE: u32 = 3;
                 aml::Device::new(
                     (*acpi_path).into(),
-                    vec![&aml::Name::new("_ADR".into(), &address.acpi_adr())],
+                    vec![
+                        &aml::Name::new("_ADR".into(), &address.acpi_adr()),
+                        &aml::Name::new(
+                            "_PRW".into(),
+                            &aml::Package::new(vec![&PM_WAKEUP_GPIO, &DEEPEST_SLEEP_STATE]),
+                        ),
+                    ],
                 )
                 .to_aml_bytes(&mut amls);
             }
@@ -1991,7 +2125,7 @@ impl X8664arch {
         io_bus
             .insert(
                 pm.clone(),
-                pm_iobase as u64,
+                pm_iobase,
                 devices::acpi::ACPIPM_RESOURCE_LEN as u64,
             )
             .unwrap();
@@ -2019,10 +2153,10 @@ impl X8664arch {
     pub fn setup_serial_devices(
         protection_type: ProtectionType,
         irq_chip: &mut dyn IrqChip,
-        io_bus: &devices::Bus,
+        io_bus: &Bus,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
-        #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
+        #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
     ) -> Result<()> {
         let com_evt_1_3 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         let com_evt_2_4 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
@@ -2056,10 +2190,10 @@ impl X8664arch {
 
     fn setup_debugcon_devices(
         protection_type: ProtectionType,
-        io_bus: &devices::Bus,
+        io_bus: &Bus,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         debugcon_jail: Option<Minijail>,
-        #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
+        #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
     ) -> Result<()> {
         for param in serial_parameters.values() {
             if param.hardware != SerialHardware::Debugcon {
@@ -2077,7 +2211,7 @@ impl X8664arch {
                 .map_err(Error::CreateDebugconDevice)?;
 
             let con: Arc<Mutex<dyn BusDevice>> = match debugcon_jail.as_ref() {
-                #[cfg(unix)]
+                #[cfg(any(target_os = "android", target_os = "linux"))]
                 Some(jail) => {
                     let jail_clone = jail.try_clone().map_err(Error::CloneJail)?;
                     #[cfg(feature = "seccomp_trace")]
@@ -2119,63 +2253,6 @@ pub enum MsrError {
     MsrDuplicate(u32),
 }
 
-fn insert_msr(
-    msr_map: &mut BTreeMap<u32, MsrConfig>,
-    key: u32,
-    msr_config: MsrConfig,
-) -> std::result::Result<(), MsrError> {
-    if msr_map.insert(key, msr_config).is_some() {
-        Err(MsrError::MsrDuplicate(key))
-    } else {
-        Ok(())
-    }
-}
-
-fn insert_msrs(
-    msr_map: &mut BTreeMap<u32, MsrConfig>,
-    msrs: &[(u32, MsrRWType, MsrAction, MsrValueFrom, MsrFilter)],
-) -> std::result::Result<(), MsrError> {
-    for msr in msrs {
-        insert_msr(
-            msr_map,
-            msr.0,
-            MsrConfig {
-                rw_type: msr.1,
-                action: msr.2,
-                from: msr.3,
-                filter: msr.4,
-            },
-        )?;
-    }
-
-    Ok(())
-}
-
-pub fn set_enable_pnp_data_msr_config(
-    msr_map: &mut BTreeMap<u32, MsrConfig>,
-) -> std::result::Result<(), MsrError> {
-    let msrs = vec![
-        (
-            MSR_IA32_APERF,
-            MsrRWType::ReadOnly,
-            MsrAction::MsrPassthrough,
-            MsrValueFrom::RWFromRunningCPU,
-            MsrFilter::Default,
-        ),
-        (
-            MSR_IA32_MPERF,
-            MsrRWType::ReadOnly,
-            MsrAction::MsrPassthrough,
-            MsrValueFrom::RWFromRunningCPU,
-            MsrFilter::Default,
-        ),
-    ];
-
-    insert_msrs(msr_map, &msrs)?;
-
-    Ok(())
-}
-
 #[derive(Error, Debug)]
 pub enum HybridSupportError {
     #[error("Host CPU doesn't support hybrid architecture.")]
@@ -2211,12 +2288,14 @@ impl CpuIdCall {
 pub fn check_host_hybrid_support(cpuid: &CpuIdCall) -> std::result::Result<(), HybridSupportError> {
     // CPUID.0H.EAX returns maximum input value for basic CPUID information.
     //
+    // SAFETY:
     // Safe because we pass 0 for this call and the host supports the
     // `cpuid` instruction.
     let mut cpuid_entry = unsafe { (cpuid.cpuid)(0x0) };
     if cpuid_entry.eax < 0x1A {
         return Err(HybridSupportError::UnsupportedHostCpu);
     }
+    // SAFETY:
     // Safe because we pass 0x7 and 0 for this call and the host supports the
     // `cpuid` instruction.
     cpuid_entry = unsafe { (cpuid.cpuid_count)(0x7, 0) };
@@ -2228,6 +2307,7 @@ pub fn check_host_hybrid_support(cpuid: &CpuIdCall) -> std::result::Result<(), H
     // 0 is returned in all the registers.
     // For the CPU with hybrid support, its CPUID.1AH.EAX shouldn't be zero.
     //
+    // SAFETY:
     // Safe because we pass 0 for this call and the host supports the
     // `cpuid` instruction.
     cpuid_entry = unsafe { (cpuid.cpuid)(0x1A) };
@@ -2338,22 +2418,6 @@ mod tests {
         assert_eq!(read_pci_mmio_before_32bit().start, 2 * GB);
         assert_eq!(read_pcie_cfg_mmio().start, 3 * GB);
         assert_eq!(read_pcie_cfg_mmio().len().unwrap(), 256 * MB);
-    }
-
-    #[test]
-    #[cfg(feature = "direct")]
-    #[ignore] // TODO(b/236253615): Fix and re-enable this test.
-    fn end_addr_before_32bits() {
-        setup();
-        // On volteer, type16 (coreboot) region is at 0x00000000769f3000-0x0000000076ffffff.
-        // On brya, type16 region is at 0x0000000076876000-0x00000000803fffff
-        let brya_type16_address = 0x7687_6000;
-        assert!(
-            read_pci_mmio_before_32bit().start < brya_type16_address,
-            "{} < {}",
-            read_pci_mmio_before_32bit().start,
-            brya_type16_address
-        );
     }
 
     #[test]

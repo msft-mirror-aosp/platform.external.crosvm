@@ -2,22 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-mod block;
-mod console;
 mod fs;
-mod gpu;
 mod handler;
-mod mac80211_hwsim;
-mod net;
-mod snd;
-mod video;
 mod virtio_device;
-mod vsock;
-mod wl;
 
 use remain::sorted;
 use thiserror::Error as ThisError;
-use virtio_device::QueueSizes;
 pub use virtio_device::VhostUserVirtioDevice;
 use vm_memory::GuestMemoryError;
 use vmm_vhost::message::VhostUserProtocolFeatures;
@@ -26,7 +16,7 @@ use vmm_vhost::Error as VhostError;
 pub use self::handler::VhostUserHandler;
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
         pub type Connection = std::os::unix::net::UnixStream;
     } else if #[cfg(windows)] {
         pub type Connection = base::Tube;
@@ -80,6 +70,12 @@ pub enum Error {
     /// Failed to reset owner.
     #[error("failed to reset owner: {0}")]
     ResetOwner(VhostError),
+    /// Failed to restore.
+    #[error("failed to restore: {0}")]
+    Restore(VhostError),
+    /// Failed to convert serde Value to a slice.
+    #[error("failed to convert a serde Value to slice {0}")]
+    SerdeValueToSlice(serde_json::Error),
     /// Failed to set config.
     #[error("failed to set config: {0}")]
     SetConfig(VhostError),
@@ -119,6 +115,15 @@ pub enum Error {
     /// Error getting the shmem regions.
     #[error("failed to enumerate shmem regions {0}")]
     ShmemRegions(VhostError),
+    /// Failed to sleep the device.
+    #[error("failed to sleep the device {0}")]
+    Sleep(VhostError),
+    /// Failed to convert a slice to a serde Value.
+    #[error("Failed to convert a slice to a serde Value: {0}")]
+    SliceToSerdeValue(serde_json::Error),
+    /// Failed to snapshot.
+    #[error("failed to snapshot: {0}")]
+    Snapshot(VhostError),
     /// Failed to connect socket.
     #[error("failed to connect socket: {0}")]
     SocketConnect(std::io::Error),
@@ -134,6 +139,12 @@ pub enum Error {
     /// Too many shmem regions.
     #[error("too many shmem regions: {0} > 1")]
     TooManyShmemRegions(usize),
+    /// failed to wake the vhost user device.
+    #[error("failed to wake the vhost user device.")]
+    Wake(VhostError),
+    /// failed to wake the worker.
+    #[error("failed to wake the worker.")]
+    WakeWorker,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

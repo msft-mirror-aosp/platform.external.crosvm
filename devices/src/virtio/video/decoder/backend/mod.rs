@@ -233,6 +233,7 @@ mod tests {
     #[allow(dead_code)]
     pub fn build_object_handle(mem: &SharedMemory) -> GuestResourceHandle {
         GuestResourceHandle::VirtioObject(VirtioObjectHandle {
+            // SAFETY:
             // Safe because we are taking ownership of a just-duplicated FD.
             desc: unsafe {
                 SafeDescriptor::from_raw_descriptor(base::clone_descriptor(mem).unwrap())
@@ -246,6 +247,7 @@ mod tests {
     #[allow(dead_code)]
     pub fn build_guest_mem_handle(mem: &SharedMemory) -> GuestResourceHandle {
         GuestResourceHandle::GuestPages(GuestMemHandle {
+            // SAFETY:
             // Safe because we are taking ownership of a just-duplicated FD.
             desc: unsafe {
                 SafeDescriptor::from_raw_descriptor(base::clone_descriptor(mem).unwrap())
@@ -281,7 +283,6 @@ mod tests {
             .expect("Failed to add event pipe to wait context");
         // Output buffers suitable for receiving NV12 frames for our stream.
         let output_buffers = (0..NUM_OUTPUT_BUFFERS)
-            .into_iter()
             .map(|i| {
                 SharedMemory::new(
                     format!("video-output-buffer-{}", i),
@@ -354,28 +355,45 @@ mod tests {
                 )
                 .expect("Call to decode() failed.");
 
-            assert!(
-                matches!(session.read_event().unwrap(), DecoderEvent::NotifyEndOfBitstreamBuffer(index) if index == input_id as u32)
-            );
+            // Get all the events resulting from this submission.
+            let mut events = Vec::new();
+            while !wait_ctx.wait_timeout(Duration::ZERO).unwrap().is_empty() {
+                events.push(session.read_event().unwrap());
+            }
+
+            // Our bitstream buffer should have been returned.
+            let event_idx = events
+                .iter()
+                .position(|event| {
+                    let input_id = input_id as u32;
+                    matches!(event, DecoderEvent::NotifyEndOfBitstreamBuffer(index) if *index == input_id)
+                })
+                .unwrap();
+            events.remove(event_idx);
 
             // After sending the first buffer we should get the initial resolution change event and
             // can provide the frames to decode into.
             if input_id == 0 {
-                let event = session.read_event().unwrap();
-                assert!(matches!(
-                    event,
-                    DecoderEvent::ProvidePictureBuffers {
-                        width: H264_STREAM_WIDTH,
-                        height: H264_STREAM_HEIGHT,
-                        visible_rect: Rect {
-                            left: 0,
-                            top: 0,
-                            right: H264_STREAM_WIDTH,
-                            bottom: H264_STREAM_HEIGHT,
-                        },
-                        ..
-                    }
-                ));
+                let event_idx = events
+                    .iter()
+                    .position(|event| {
+                        matches!(
+                            event,
+                            DecoderEvent::ProvidePictureBuffers {
+                                width: H264_STREAM_WIDTH,
+                                height: H264_STREAM_HEIGHT,
+                                visible_rect: Rect {
+                                    left: 0,
+                                    top: 0,
+                                    right: H264_STREAM_WIDTH,
+                                    bottom: H264_STREAM_HEIGHT,
+                                },
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap();
+                events.remove(event_idx);
 
                 let out_format = Format::NV12;
 
@@ -405,6 +423,7 @@ mod tests {
                                 width: H264_STREAM_WIDTH as _,
                                 height: H264_STREAM_HEIGHT as _,
                                 format: out_format,
+                                guest_cpu_mappable: false,
                             },
                         )
                         .unwrap();
@@ -412,8 +431,8 @@ mod tests {
             }
 
             // If we have remaining events, they must be decoded frames. Get them and recycle them.
-            while wait_ctx.wait_timeout(Duration::ZERO).unwrap().len() > 0 {
-                match session.read_event().unwrap() {
+            for event in events {
+                match event {
                     DecoderEvent::PictureReady {
                         picture_buffer_id,
                         visible_rect,
@@ -428,7 +447,7 @@ mod tests {
 
         // Keep getting frames until the final event, which should be `FlushCompleted`.
         let mut received_flush_completed = false;
-        while wait_ctx.wait_timeout(Duration::ZERO).unwrap().len() > 0 {
+        while !wait_ctx.wait_timeout(Duration::ZERO).unwrap().is_empty() {
             match session.read_event().unwrap() {
                 DecoderEvent::PictureReady {
                     picture_buffer_id,
@@ -444,7 +463,7 @@ mod tests {
         }
 
         // Confirm that we got the FlushCompleted event.
-        assert_eq!(received_flush_completed, true);
+        assert!(received_flush_completed);
 
         // We should have read all the events for that session.
         assert_eq!(wait_ctx.wait_timeout(Duration::ZERO).unwrap().len(), 0);

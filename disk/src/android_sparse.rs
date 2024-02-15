@@ -20,15 +20,18 @@ use base::FileAllocate;
 use base::FileReadWriteAtVolatile;
 use base::FileSetLen;
 use base::RawDescriptor;
+use base::VolatileSlice;
 use cros_async::BackingMemory;
 use cros_async::Executor;
 use cros_async::IoSource;
-use data_model::DataInit;
+use data_model::zerocopy_from_reader;
 use data_model::Le16;
 use data_model::Le32;
-use data_model::VolatileSlice;
 use remain::sorted;
 use thiserror::Error;
+use zerocopy::AsBytes;
+use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use crate::AsyncDisk;
 use crate::DiskFile;
@@ -54,7 +57,7 @@ pub const SPARSE_HEADER_MAGIC: u32 = 0xed26ff3a;
 const MAJOR_VERSION: u16 = 1;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, AsBytes, FromZeroes, FromBytes)]
 struct SparseHeader {
     magic: Le32,          /* SPARSE_HEADER_MAGIC */
     major_version: Le16,  /* (0x1) - reject images with higher major versions */
@@ -69,23 +72,19 @@ struct SparseHeader {
                           /* table implementation */
 }
 
-unsafe impl DataInit for SparseHeader {}
-
 const CHUNK_TYPE_RAW: u16 = 0xCAC1;
 const CHUNK_TYPE_FILL: u16 = 0xCAC2;
 const CHUNK_TYPE_DONT_CARE: u16 = 0xCAC3;
 const CHUNK_TYPE_CRC32: u16 = 0xCAC4;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, AsBytes, FromZeroes, FromBytes)]
 struct ChunkHeader {
     chunk_type: Le16, /* 0xCAC1 -> raw; 0xCAC2 -> fill; 0xCAC3 -> don't care */
     reserved1: u16,
     chunk_sz: Le32, /* in blocks in output image */
     total_sz: Le32, /* in bytes of chunk input file including chunk header and data */
 }
-
-unsafe impl DataInit for ChunkHeader {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Chunk {
@@ -115,10 +114,10 @@ pub struct AndroidSparse {
 fn parse_chunk<T: Read + Seek>(mut input: &mut T, blk_sz: u64) -> Result<Option<ChunkWithSize>> {
     const HEADER_SIZE: usize = mem::size_of::<ChunkHeader>();
     let current_offset = input
-        .seek(SeekFrom::Current(0))
+        .stream_position()
         .map_err(Error::ReadSpecificationError)?;
-    let chunk_header =
-        ChunkHeader::from_reader(&mut input).map_err(Error::ReadSpecificationError)?;
+    let chunk_header: ChunkHeader =
+        zerocopy_from_reader(&mut input).map_err(Error::ReadSpecificationError)?;
     let chunk_body_size = (chunk_header.total_sz.to_native() as usize)
         .checked_sub(HEADER_SIZE)
         .ok_or(Error::InvalidSpecification(format!(
@@ -167,8 +166,8 @@ impl AndroidSparse {
     pub fn from_file(mut file: File) -> Result<AndroidSparse> {
         file.seek(SeekFrom::Start(0))
             .map_err(Error::ReadSpecificationError)?;
-        let sparse_header =
-            SparseHeader::from_reader(&mut file).map_err(Error::ReadSpecificationError)?;
+        let sparse_header: SparseHeader =
+            zerocopy_from_reader(&mut file).map_err(Error::ReadSpecificationError)?;
         if sparse_header.magic != SPARSE_HEADER_MAGIC {
             return Err(Error::InvalidSpecification(format!(
                 "Header did not match magic constant. Expected {:x}, was {:x}",
@@ -281,7 +280,7 @@ impl FileReadWriteAtVolatile for AndroidSparse {
         match chunk {
             Chunk::DontCare => {
                 subslice.write_bytes(0);
-                Ok(subslice.size() as usize)
+                Ok(subslice.size())
             }
             Chunk::Raw(file_offset) => self
                 .file
@@ -293,10 +292,10 @@ impl FileReadWriteAtVolatile for AndroidSparse {
                     .cloned()
                     .cycle()
                     .skip(chunk_offset_mod as usize)
-                    .take(subslice.size() as usize)
+                    .take(subslice.size())
                     .collect();
                 subslice.copy_from(&filled_memory);
-                Ok(subslice.size() as usize)
+                Ok(subslice.size())
             }
         }
     }
@@ -362,7 +361,17 @@ impl AsyncDisk for AsyncAndroidSparse {
         })
     }
 
+    async fn flush(&self) -> crate::Result<()> {
+        // android sparse is read-only, nothing to flush.
+        Ok(())
+    }
+
     async fn fsync(&self) -> DiskResult<()> {
+        // Do nothing because it's read-only.
+        Ok(())
+    }
+
+    async fn fdatasync(&self) -> DiskResult<()> {
         // Do nothing because it's read-only.
         Ok(())
     }
@@ -373,7 +382,7 @@ impl AsyncDisk for AsyncAndroidSparse {
         &'a self,
         file_offset: u64,
         mem: Arc<dyn BackingMemory + Send + Sync>,
-        mem_offsets: &'a [cros_async::MemRegion],
+        mem_offsets: cros_async::MemRegionIter<'a>,
     ) -> DiskResult<usize> {
         let found_chunk = self.chunks.range(..=file_offset).next_back();
         let (
@@ -390,13 +399,12 @@ impl AsyncDisk for AsyncAndroidSparse {
         let chunk_size = *expanded_size;
 
         // Truncate `mem_offsets` to the remaining size of the current chunk.
-        let mem_offsets =
-            cros_async::MemRegion::truncate((chunk_size - chunk_offset) as usize, mem_offsets);
-        let mem_size = mem_offsets.iter().map(|x| x.len).sum();
+        let mem_offsets = mem_offsets.take_bytes((chunk_size - chunk_offset) as usize);
+        let mem_size = mem_offsets.clone().map(|x| x.len).sum();
         match chunk {
             Chunk::DontCare => {
-                for region in mem_offsets.iter() {
-                    mem.get_volatile_slice(*region)
+                for region in mem_offsets {
+                    mem.get_volatile_slice(region)
                         .map_err(DiskError::GuestMemory)?
                         .write_bytes(0);
                 }
@@ -404,7 +412,7 @@ impl AsyncDisk for AsyncAndroidSparse {
             }
             Chunk::Raw(offset) => self
                 .inner
-                .read_to_mem(Some(offset + chunk_offset), mem, &mem_offsets)
+                .read_to_mem(Some(offset + chunk_offset), mem, mem_offsets)
                 .await
                 .map_err(DiskError::ReadToMem),
             Chunk::Fill(fill_bytes) => {
@@ -418,9 +426,9 @@ impl AsyncDisk for AsyncAndroidSparse {
                     .collect();
 
                 let mut filled_count = 0;
-                for region in mem_offsets.iter() {
+                for region in mem_offsets {
                     let buf = &filled_memory[filled_count..filled_count + region.len];
-                    mem.get_volatile_slice(*region)
+                    mem.get_volatile_slice(region)
                         .map_err(DiskError::GuestMemory)?
                         .copy_from(buf);
                     filled_count += region.len;
@@ -434,7 +442,7 @@ impl AsyncDisk for AsyncAndroidSparse {
         &'a self,
         _file_offset: u64,
         _mem: Arc<dyn BackingMemory + Send + Sync>,
-        _mem_offsets: &'a [cros_async::MemRegion],
+        _mem_offsets: cros_async::MemRegionIter<'a>,
     ) -> DiskResult<usize> {
         Err(DiskError::UnsupportedOperation)
     }
@@ -465,7 +473,7 @@ mod tests {
             chunk_sz: 1.into(),
             total_sz: (CHUNK_SIZE as u32 + 123).into(),
         };
-        let header_bytes = chunk_raw.as_slice();
+        let header_bytes = chunk_raw.as_bytes();
         let mut chunk_bytes: Vec<u8> = Vec::new();
         chunk_bytes.extend_from_slice(header_bytes);
         chunk_bytes.extend_from_slice(&[0u8; 123]);
@@ -488,7 +496,7 @@ mod tests {
             chunk_sz: 100.into(),
             total_sz: (CHUNK_SIZE as u32).into(),
         };
-        let header_bytes = chunk_raw.as_slice();
+        let header_bytes = chunk_raw.as_bytes();
         let mut chunk_cursor = Cursor::new(header_bytes);
         let chunk = parse_chunk(&mut chunk_cursor, 123)
             .expect("Failed to parse")
@@ -508,7 +516,7 @@ mod tests {
             chunk_sz: 100.into(),
             total_sz: (CHUNK_SIZE as u32 + 4).into(),
         };
-        let header_bytes = chunk_raw.as_slice();
+        let header_bytes = chunk_raw.as_bytes();
         let mut chunk_bytes: Vec<u8> = Vec::new();
         chunk_bytes.extend_from_slice(header_bytes);
         chunk_bytes.extend_from_slice(&[123u8; 4]);
@@ -531,7 +539,7 @@ mod tests {
             chunk_sz: 0.into(),
             total_sz: (CHUNK_SIZE as u32 + 4).into(),
         };
-        let header_bytes = chunk_raw.as_slice();
+        let header_bytes = chunk_raw.as_bytes();
         let mut chunk_bytes: Vec<u8> = Vec::new();
         chunk_bytes.extend_from_slice(header_bytes);
         chunk_bytes.extend_from_slice(&[123u8; 4]);
@@ -653,6 +661,7 @@ mod tests {
      * Tests for Async.
      */
     use cros_async::MemRegion;
+    use cros_async::MemRegionIter;
     use vm_memory::GuestAddress;
     use vm_memory::GuestMemory;
 
@@ -677,10 +686,10 @@ mod tests {
                 .read_to_mem(
                     (offset + count) as u64,
                     guest_mem.clone(),
-                    &[MemRegion {
+                    MemRegionIter::new(&[MemRegion {
                         offset: count as u64,
                         len: len - count,
-                    }],
+                    }]),
                 )
                 .await;
             count += result.unwrap();
@@ -726,10 +735,10 @@ mod tests {
                 .read_to_mem(
                     0,
                     guest_mem.clone(),
-                    &[
+                    MemRegionIter::new(&[
                         MemRegion { offset: 1, len: 3 },
                         MemRegion { offset: 6, len: 2 },
-                    ],
+                    ]),
                 )
                 .await
                 .unwrap();
@@ -777,10 +786,10 @@ mod tests {
                 .read_to_mem(
                     0,
                     guest_mem.clone(),
-                    &[
+                    MemRegionIter::new(&[
                         MemRegion { offset: 1, len: 3 },
                         MemRegion { offset: 6, len: 2 },
-                    ],
+                    ]),
                 )
                 .await
                 .unwrap();
@@ -870,10 +879,10 @@ mod tests {
                 .read_to_mem(
                     0,
                     guest_mem.clone(),
-                    &[
+                    MemRegionIter::new(&[
                         MemRegion { offset: 1, len: 3 },
                         MemRegion { offset: 6, len: 2 },
-                    ],
+                    ]),
                 )
                 .await
                 .unwrap();

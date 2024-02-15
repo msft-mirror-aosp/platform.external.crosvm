@@ -16,6 +16,9 @@ use crate::gpu::DisplayModeTrait;
 const DISPLAY_WIDTH_SOFT_MAX: u32 = 1920;
 const DISPLAY_HEIGHT_SOFT_MAX: u32 = 1080;
 
+const DISPLAY_WIDTH_SOFT_MAX_4K_UHD_ENABLED: u32 = 3840;
+const DISPLAY_HEIGHT_SOFT_MAX_4K_UHD_ENABLED: u32 = 2160;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WinDisplayMode<T> {
@@ -32,8 +35,12 @@ impl<T: ProvideDisplayData> DisplayModeTrait for WinDisplayMode<T> {
     }
 
     fn get_virtual_display_size(&self) -> (u32, u32) {
+        self.get_virtual_display_size_4k_uhd(vm_control_product::is_4k_uhd_enabled())
+    }
+
+    fn get_virtual_display_size_4k_uhd(&self, is_4k_uhd_enabled: bool) -> (u32, u32) {
         let (width, height) = self.get_window_size();
-        let (width, height) = adjust_virtual_display_size(width, height);
+        let (width, height) = adjust_virtual_display_size(width, height, is_4k_uhd_enabled);
         info!("Guest display size: {}x{}", width, height);
         (width, height)
     }
@@ -50,6 +57,7 @@ pub struct DisplayDataProvider;
 
 impl ProvideDisplayData for DisplayDataProvider {
     fn get_host_display_size() -> (u32, u32) {
+        // SAFETY:
         // Safe because we're passing valid values and screen size won't exceed u32 range.
         let (width, height) = unsafe {
             (
@@ -64,9 +72,17 @@ impl ProvideDisplayData for DisplayDataProvider {
     }
 }
 
-fn adjust_virtual_display_size(width: u32, height: u32) -> (u32, u32) {
-    let width = std::cmp::min(width, DISPLAY_WIDTH_SOFT_MAX);
-    let height = std::cmp::min(height, DISPLAY_HEIGHT_SOFT_MAX);
+fn adjust_virtual_display_size(width: u32, height: u32, is_4k_uhd_enabled: bool) -> (u32, u32) {
+    let (max_width, max_height) = if is_4k_uhd_enabled {
+        (
+            DISPLAY_WIDTH_SOFT_MAX_4K_UHD_ENABLED,
+            DISPLAY_HEIGHT_SOFT_MAX_4K_UHD_ENABLED,
+        )
+    } else {
+        (DISPLAY_WIDTH_SOFT_MAX, DISPLAY_HEIGHT_SOFT_MAX)
+    };
+    let width = std::cmp::min(width, max_width);
+    let height = std::cmp::min(height, max_height);
     // Widths that aren't a multiple of 8 break gfxstream: b/156110663.
     let width = width - (width % 8);
     (width, height)
@@ -87,7 +103,7 @@ mod tests {
         }
 
         let mode = WinDisplayMode::<MockDisplayDataProvider>::BorderlessFullScreen(PhantomData);
-        let (width, _) = mode.get_virtual_display_size();
+        let (width, _) = mode.get_virtual_display_size_4k_uhd(/* is_4k_uhd_enabled */ false);
         assert_eq!(width % 8, 0);
     }
 
@@ -102,7 +118,8 @@ mod tests {
         }
 
         let mode = WinDisplayMode::<MockDisplayDataProvider>::BorderlessFullScreen(PhantomData);
-        let (width, height) = mode.get_virtual_display_size();
+        let (width, height) =
+            mode.get_virtual_display_size_4k_uhd(/* is_4k_uhd_enabled */ false);
         assert!(width <= DISPLAY_WIDTH_SOFT_MAX);
         assert!(height <= DISPLAY_HEIGHT_SOFT_MAX);
     }

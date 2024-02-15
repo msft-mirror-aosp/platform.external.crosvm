@@ -6,24 +6,21 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use acpi_tables::sdt::SDT;
 use anyhow::bail;
-use anyhow::Context;
 use base::error;
-use base::Event;
+use base::trace;
+use base::warn;
 use base::MemoryMapping;
 use base::RawDescriptor;
-use base::Tube;
-use hypervisor::Datamatch;
+use base::SharedMemory;
 use remain::sorted;
 use resources::Error as SystemAllocatorFaliure;
 use resources::SystemAllocator;
 use sync::Mutex;
 use thiserror::Error;
-use vm_control::IoEventUpdateRequest;
-use vm_control::VmMemoryRequest;
-use vm_control::VmMemoryResponse;
+use vm_control::api::VmMemoryClient;
 
 use super::PciId;
 use crate::bus::BusDeviceObj;
@@ -39,6 +36,7 @@ use crate::pci::pci_configuration::NUM_BAR_REGS;
 use crate::pci::pci_configuration::PCI_ID_REG;
 use crate::pci::PciAddress;
 use crate::pci::PciAddressError;
+use crate::pci::PciBarIndex;
 use crate::pci::PciInterruptPin;
 use crate::virtio::ipc_memory_mapper::IpcMemoryMapper;
 #[cfg(all(unix, feature = "audio"))]
@@ -48,10 +46,20 @@ use crate::BusDevice;
 use crate::DeviceId;
 use crate::IrqLevelEvent;
 use crate::Suspendable;
+use crate::VirtioPciDevice;
 
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Deactivation of ACPI notifications failed
+    #[error("failed to disable ACPI notifications")]
+    AcpiNotifyDeactivationFailed,
+    /// Setup of ACPI notifications failed
+    #[error("failed to enable ACPI notifications")]
+    AcpiNotifySetupFailed,
+    /// Simulating ACPI notifications hardware triggering failed
+    #[error("failed to test ACPI notifications")]
+    AcpiNotifyTestFailed,
     /// Added pci device's parent bus does not belong to this bus
     #[error("pci device {0}'s parent bus does not belong to bus {1}")]
     AddedDeviceBusNotExist(PciAddress, u8),
@@ -93,6 +101,9 @@ pub enum Error {
     /// Registering an IO BAR failed.
     #[error("failed to register an IO BAR, addr={0} err={1}")]
     IoRegistrationFailed(u64, pci_configuration::Error),
+    /// Setting up MMIO mapping
+    #[error("failed to set up MMIO mapping: {0}")]
+    MmioSetup(anyhow::Error),
     /// Out-of-space encountered
     #[error("Out-of-space detected")]
     OutOfSpace,
@@ -384,15 +395,9 @@ pub trait PciDevice: Send + Suspendable {
         Ok(())
     }
 
-    /// Gets a list of ioevents that should be registered with the running VM. The list is
-    /// returned as a Vec of (event, addr, datamatch) tuples.
-    fn ioevents(&self) -> Vec<(&Event, u64, Datamatch)> {
-        Vec::new()
-    }
-
-    /// Gets a reference to the Tube for sending VmMemoryRequest. Any devices that uses ioevents
-    /// shall provide Tube.
-    fn get_vm_memory_request_tube(&self) -> Option<&Tube> {
+    /// Gets a reference to the API client for sending VmMemoryRequest. Any devices that uses ioevents
+    /// must provide this.
+    fn get_vm_memory_client(&self) -> Option<&VmMemoryClient> {
         None
     }
 
@@ -406,6 +411,30 @@ pub trait PciDevice: Send + Suspendable {
     /// * `data`    - The data to write.
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]);
 
+    /// Provides a memory region to back MMIO access to the configuration
+    /// space. If the device can keep the memory region up to date, then it
+    /// should return Ok(true), after which no more calls to read_config_register
+    /// will be made. If support isn't implemented, it should return Ok(false).
+    /// Otherwise, it should return an error (a failure here is not treated as
+    /// a fatal setup error).
+    ///
+    /// The device must set the header type register (0x0E) before returning
+    /// from this function, and must make no further modifications to it
+    /// after returning. This is to allow the caller to manage the multi-
+    /// function device bit without worrying about race conditions.
+    ///
+    /// * `shmem` - The shared memory to use for the configuration space.
+    /// * `base` - The base address of the memory region in shmem.
+    /// * `len` - The length of the memory region.
+    fn setup_pci_config_mapping(
+        &mut self,
+        _shmem: &SharedMemory,
+        _base: usize,
+        _len: usize,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Reads from a virtual config register.
     /// * `reg_idx` - virtual config register index (in units of 4 bytes).
     fn read_virtual_config_register(&self, _reg_idx: usize) -> u32 {
@@ -418,17 +447,21 @@ pub trait PciDevice: Send + Suspendable {
     fn write_virtual_config_register(&mut self, _reg_idx: usize, _value: u32) {}
 
     /// Reads from a BAR region mapped in to the device.
-    /// * `addr` - The guest address inside the BAR.
-    /// * `data` - Filled with the data from `addr`.
-    fn read_bar(&mut self, addr: u64, data: &mut [u8]);
+    /// * `bar_index` - The index of the PCI BAR.
+    /// * `offset` - The starting offset in bytes inside the BAR.
+    /// * `data` - Filled with the data from `offset`.
+    fn read_bar(&mut self, bar_index: PciBarIndex, offset: u64, data: &mut [u8]);
+
     /// Writes to a BAR region mapped in to the device.
-    /// * `addr` - The guest address inside the BAR.
+    /// * `bar_index` - The index of the PCI BAR.
+    /// * `offset` - The starting offset in bytes inside the BAR.
     /// * `data` - The data to write.
-    fn write_bar(&mut self, addr: u64, data: &[u8]);
+    fn write_bar(&mut self, bar_index: PciBarIndex, offset: u64, data: &[u8]);
+
     /// Invoked when the device is sandboxed.
     fn on_device_sandboxed(&mut self) {}
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
         Some(sdts)
     }
@@ -437,6 +470,10 @@ pub trait PciDevice: Send + Suspendable {
     /// shared memory
     fn generate_acpi_methods(&mut self) -> (Vec<u8>, Option<(u32, MemoryMapping)>) {
         (Vec::new(), None)
+    }
+
+    fn set_gpe(&mut self, _resources: &mut SystemAllocator) -> Option<u32> {
+        None
     }
 
     /// Invoked when the device is destroyed
@@ -472,6 +509,11 @@ pub trait PciDevice: Send + Suspendable {
     /// Sets the IOMMU for the device if `supports_iommu()`
     fn set_iommu(&mut self, _iommu: IpcMemoryMapper) -> anyhow::Result<()> {
         bail!("Iommu not supported.");
+    }
+
+    // Used for bootorder
+    fn as_virtio_pci_device(&self) -> Option<&VirtioPciDevice> {
+        None
     }
 }
 
@@ -513,6 +555,65 @@ fn update_ranges(
     (remove_ranges, add_ranges)
 }
 
+// Debug-only helper function to convert a slice of bytes into a u32.
+// This can be lossy - only use it for logging!
+fn trace_data(data: &[u8], offset: u64) -> u32 {
+    let mut data4 = [0u8; 4];
+    for (d, s) in data4.iter_mut().skip(offset as usize).zip(data.iter()) {
+        *d = *s;
+    }
+    u32::from_le_bytes(data4)
+}
+
+/// Find the BAR containing an access specified by `address` and `size`.
+///
+/// If found, returns the BAR index and offset in bytes within that BAR corresponding to `address`.
+///
+/// The BAR must fully contain the access region; partial overlaps will return `None`. Zero-sized
+/// accesses should not normally happen, but in case one does, this function will return `None`.
+///
+/// This function only finds memory BARs, not I/O BARs. If a device with a BAR in I/O address space
+/// is ever added, address space information will need to be added to `BusDevice::read()` and
+/// `BusDevice::write()` and passed along to this function.
+fn find_bar_and_offset(
+    device: &impl PciDevice,
+    address: u64,
+    size: usize,
+) -> Option<(PciBarIndex, u64)> {
+    if size == 0 {
+        return None;
+    }
+
+    for bar_index in 0..NUM_BAR_REGS {
+        if let Some(bar_info) = device.get_bar_configuration(bar_index) {
+            if !bar_info.is_memory() {
+                continue;
+            }
+
+            // If access address >= BAR address, calculate the offset of the access in bytes from
+            // the start of the BAR. If underflow occurs, the access begins before this BAR, so it
+            // cannot be fully contained in the BAR; skip to the next BAR.
+            let Some(offset) = address.checked_sub(bar_info.address()) else {
+                continue;
+            };
+
+            // Calculate the largest valid offset given the BAR size and access size. If underflow
+            // occurs, the access size is larger than the BAR size, so the access is definitely not
+            // fully contained in the BAR; skip to the next BAR.
+            let Some(max_offset) = bar_info.size().checked_sub(size as u64) else {
+                continue;
+            };
+
+            // If offset <= max_offset, then the access is entirely contained within the BAR.
+            if offset <= max_offset {
+                return Some((bar_index, offset));
+            }
+        }
+    }
+
+    None
+}
+
 impl<T: PciDevice> BusDevice for T {
     fn debug_label(&self) -> String {
         PciDevice::debug_label(self)
@@ -525,11 +626,19 @@ impl<T: PciDevice> BusDevice for T {
     }
 
     fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
-        self.read_bar(info.address, data)
+        if let Some((bar_index, offset)) = find_bar_and_offset(self, info.address, data.len()) {
+            self.read_bar(bar_index, offset, data);
+        } else {
+            error!("PciDevice::read({:#x}) did not match a BAR", info.address);
+        }
     }
 
     fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
-        self.write_bar(info.address, data)
+        if let Some((bar_index, offset)) = find_bar_and_offset(self, info.address, data.len()) {
+            self.write_bar(bar_index, offset, data);
+        } else {
+            error!("PciDevice::write({:#x}) did not match a BAR", info.address);
+        }
     }
 
     fn config_register_write(
@@ -541,6 +650,12 @@ impl<T: PciDevice> BusDevice for T {
         if offset as usize + data.len() > 4 {
             return Default::default();
         }
+
+        trace!(
+            "reg_idx {:02X} data {:08X}",
+            reg_idx,
+            trace_data(data, offset)
+        );
 
         let old_command_reg = self.read_config_register(COMMAND_REG);
         let old_ranges =
@@ -576,42 +691,27 @@ impl<T: PciDevice> BusDevice for T {
             &new_ranges,
         );
 
-        let result = ConfigWriteResult {
+        ConfigWriteResult {
             mmio_remove,
             mmio_add,
             io_remove,
             io_add,
             removed_pci_devices: self.get_removed_children_devices(),
-        };
-
-        // Handle ioevent changes
-        if !(result.io_add.is_empty()
-            && result.io_remove.is_empty()
-            && result.mmio_add.is_empty()
-            && result.mmio_remove.is_empty())
-        {
-            let ioevents = self.ioevents();
-            if !ioevents.is_empty() {
-                if let Err(e) = send_ioevent_updates(
-                    self.get_vm_memory_request_tube(),
-                    ioevents,
-                    old_ranges,
-                    new_ranges,
-                ) {
-                    error!(
-                        "send_ioevent_updates failed for {}: {:#}",
-                        self.debug_label(),
-                        e
-                    );
-                }
-            }
         }
-
-        result
     }
 
     fn config_register_read(&self, reg_idx: usize) -> u32 {
         self.read_config_register(reg_idx)
+    }
+
+    fn init_pci_config_mapping(&mut self, shmem: &SharedMemory, base: usize, len: usize) -> bool {
+        match self.setup_pci_config_mapping(shmem, base, len) {
+            Ok(res) => res,
+            Err(err) => {
+                warn!("Failed to create PCI mapping: {:#}", err);
+                false
+            }
+        }
     }
 
     fn virtual_config_register_write(&mut self, reg_idx: usize, value: u32) {
@@ -689,17 +789,14 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     fn register_device_capabilities(&mut self) -> Result<()> {
         (**self).register_device_capabilities()
     }
-    fn ioevents(&self) -> Vec<(&Event, u64, Datamatch)> {
-        (**self).ioevents()
-    }
     fn read_virtual_config_register(&self, reg_idx: usize) -> u32 {
         (**self).read_virtual_config_register(reg_idx)
     }
     fn write_virtual_config_register(&mut self, reg_idx: usize, value: u32) {
         (**self).write_virtual_config_register(reg_idx, value)
     }
-    fn get_vm_memory_request_tube(&self) -> Option<&Tube> {
-        (**self).get_vm_memory_request_tube()
+    fn get_vm_memory_client(&self) -> Option<&VmMemoryClient> {
+        (**self).get_vm_memory_client()
     }
     fn read_config_register(&self, reg_idx: usize) -> u32 {
         (**self).read_config_register(reg_idx)
@@ -707,24 +804,36 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
         (**self).write_config_register(reg_idx, offset, data)
     }
-    fn read_bar(&mut self, addr: u64, data: &mut [u8]) {
-        (**self).read_bar(addr, data)
+    fn setup_pci_config_mapping(
+        &mut self,
+        shmem: &SharedMemory,
+        base: usize,
+        len: usize,
+    ) -> Result<bool> {
+        (**self).setup_pci_config_mapping(shmem, base, len)
     }
-    fn write_bar(&mut self, addr: u64, data: &[u8]) {
-        (**self).write_bar(addr, data)
+    fn read_bar(&mut self, bar_index: PciBarIndex, offset: u64, data: &mut [u8]) {
+        (**self).read_bar(bar_index, offset, data)
+    }
+    fn write_bar(&mut self, bar_index: PciBarIndex, offset: u64, data: &[u8]) {
+        (**self).write_bar(bar_index, offset, data)
     }
     /// Invoked when the device is sandboxed.
     fn on_device_sandboxed(&mut self) {
         (**self).on_device_sandboxed()
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     fn generate_acpi(&mut self, sdts: Vec<SDT>) -> Option<Vec<SDT>> {
         (**self).generate_acpi(sdts)
     }
 
     fn generate_acpi_methods(&mut self) -> (Vec<u8>, Option<(u32, MemoryMapping)>) {
         (**self).generate_acpi_methods()
+    }
+
+    fn set_gpe(&mut self, resources: &mut SystemAllocator) -> Option<u32> {
+        (**self).set_gpe(resources)
     }
 
     fn destroy_device(&mut self) {
@@ -747,7 +856,7 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
 }
 
 impl<T: PciDevice + ?Sized> Suspendable for Box<T> {
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         (**self).snapshot()
     }
 
@@ -774,118 +883,6 @@ impl<T: 'static + PciDevice> BusDeviceObj for T {
     fn into_pci_device(self: Box<Self>) -> Option<Box<dyn PciDevice>> {
         Some(self)
     }
-}
-
-/// Gets the ioevent requests based on new ioevents and changes to the BAR.
-///
-/// Assumes the number of ioevents are unchanged after bar remapping, and corresponds to the same
-/// BAR regions.
-/// Returns pair (ioevent_unregister_requests, ioevent_register_requests) to be handled by device.
-fn get_ioevent_requests(
-    mut ioevents: Vec<(&Event, u64, Datamatch)>,
-    old_range: Vec<(BusRange, BusType)>,
-    new_range: Vec<(BusRange, BusType)>,
-) -> Result<(Vec<IoEventUpdateRequest>, Vec<IoEventUpdateRequest>)> {
-    // Finds all ioevents with addr within new_range. Updates ioevents whose range are within the
-    // changed windows. Bus ranges are disjoint since they are memory addresses. sort both ioevents
-    // and range to get asymptotic optimal solution.
-    ioevents.sort_by_key(|ioevent| ioevent.1);
-    // Old and new ranges are paired to be sorted together to keep the correspondence.
-    let mut range_pair: Vec<((BusRange, BusType), (BusRange, BusType))> =
-        new_range.into_iter().zip(old_range.into_iter()).collect();
-    range_pair.sort_by_key(|(new, _old)| new.0.base);
-    let mut range_pair_iter = range_pair.iter();
-    let mut cur_range_pair = range_pair_iter.next();
-    let mut ioevent_iter = ioevents.into_iter();
-    let mut cur_ioevent = ioevent_iter.next();
-    let mut ioevent_unregister_requests = Vec::new();
-    let mut ioevent_register_requests = Vec::new();
-    while let Some((event, addr, datamatch)) = cur_ioevent {
-        if let Some(((new_bus_range, _), (old_bus_range, _))) = cur_range_pair {
-            if new_bus_range.contains(addr) {
-                let offset = addr - new_bus_range.base;
-                ioevent_unregister_requests.push(IoEventUpdateRequest {
-                    event: event
-                        .try_clone()
-                        .map_err(|e| Error::IoEventRegisterFailed(IoEventError::CloneFail(e)))?,
-                    addr: offset + old_bus_range.base,
-                    datamatch,
-                    register: false,
-                });
-                ioevent_register_requests.push(IoEventUpdateRequest {
-                    event: event
-                        .try_clone()
-                        .map_err(|e| Error::IoEventRegisterFailed(IoEventError::CloneFail(e)))?,
-                    addr,
-                    datamatch,
-                    register: true,
-                });
-                cur_ioevent = ioevent_iter.next();
-                continue;
-            }
-            // Advance range if range upper bound is too small.
-            else if new_bus_range.base + new_bus_range.len <= addr {
-                cur_range_pair = range_pair_iter.next();
-                cur_ioevent = Some((event, addr, datamatch));
-                continue;
-            }
-            // Advance ioevent if ioevent is lower than range lower bound.
-            else {
-                cur_ioevent = ioevent_iter.next();
-                continue;
-            }
-        }
-        // Stop if range is depleted.
-        break;
-    }
-    Ok((ioevent_unregister_requests, ioevent_register_requests))
-}
-
-/// Sends ioevents through the tube, and returns result.
-fn send_ioevent_update_request(
-    tube: &Tube,
-    request: IoEventUpdateRequest,
-) -> std::result::Result<(), IoEventError> {
-    tube.send(&VmMemoryRequest::IoEventRaw(request))
-        .map_err(|_| IoEventError::TubeFail)?;
-    if let VmMemoryResponse::Err(e) = tube
-        .recv::<VmMemoryResponse>()
-        .map_err(|_| IoEventError::TubeFail)?
-    {
-        return Err(IoEventError::SystemError(e));
-    }
-    Ok(())
-}
-
-/// Sends register/unregister messages for ioevents based on the updated ranges.
-fn send_ioevent_updates(
-    vm_memory_request_tube: Option<&Tube>,
-    ioevents: Vec<(&Event, u64, Datamatch)>,
-    old_ranges: Vec<(BusRange, BusType)>,
-    new_ranges: Vec<(BusRange, BusType)>,
-) -> anyhow::Result<()> {
-    let tube = vm_memory_request_tube
-        .context("get_vm_memory_request_tube not implemented, device may malfunction")?;
-
-    let (ioevent_unregister_requests, ioevent_register_requests) =
-        get_ioevent_requests(ioevents, old_ranges, new_ranges)
-            .context("Failed to get ioevent requests")?;
-
-    for request in ioevent_unregister_requests {
-        match send_ioevent_update_request(tube, request) {
-            Err(IoEventError::SystemError(_)) => {
-                // Do nothing, as unregister may fail due to placeholder value
-            }
-            Err(e) => return Err(e).context("IoEvent unregister failed"),
-            Ok(()) => {}
-        }
-    }
-
-    for request in ioevent_register_requests {
-        send_ioevent_update_request(tube, request).context("IoEvent register failed")?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -923,12 +920,12 @@ mod tests {
         }
 
         fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
-            self.config_regs.write_reg(reg_idx, offset, data)
+            self.config_regs.write_reg(reg_idx, offset, data);
         }
 
-        fn read_bar(&mut self, _addr: u64, _data: &mut [u8]) {}
+        fn read_bar(&mut self, _bar_index: PciBarIndex, _offset: u64, _data: &mut [u8]) {}
 
-        fn write_bar(&mut self, _addr: u64, _data: &[u8]) {}
+        fn write_bar(&mut self, _bar_index: PciBarIndex, _offset: u64, _data: &[u8]) {}
 
         fn allocate_address(&mut self, _resources: &mut SystemAllocator) -> Result<PciAddress> {
             Err(Error::PciAllocationFailed)
@@ -1078,42 +1075,61 @@ mod tests {
     }
 
     #[test]
-    fn test_get_ioevent_request() {
-        // Of the ioevents, only 108, 112, 116 are within the changed windows.
-        // Corresponding old addresses are 208, 212, and 16.
-        let events = vec![
-            Event::new().unwrap(),
-            Event::new().unwrap(),
-            Event::new().unwrap(),
-            Event::new().unwrap(),
-            Event::new().unwrap(),
-        ];
-        let ioevents = vec![
-            (&events[0], 100, Datamatch::AnyLength),
-            (&events[1], 108, Datamatch::AnyLength),
-            (&events[2], 112, Datamatch::AnyLength),
-            (&events[3], 116, Datamatch::AnyLength),
-            (&events[4], 120, Datamatch::AnyLength),
-        ];
-        let old_range = vec![
-            (BusRange { base: 208, len: 8 }, BusType::Mmio),
-            (BusRange { base: 16, len: 4 }, BusType::Mmio),
-        ];
-        let new_range = vec![
-            (BusRange { base: 108, len: 8 }, BusType::Mmio),
-            (BusRange { base: 116, len: 4 }, BusType::Mmio),
-        ];
-        let (mut unregister_requests, mut register_requests) =
-            get_ioevent_requests(ioevents, old_range, new_range).unwrap();
-        unregister_requests.sort_by_key(|request| request.addr);
-        assert_eq!(unregister_requests.len(), 3);
-        assert_eq!(unregister_requests[0].addr, 16);
-        assert_eq!(unregister_requests[1].addr, 208);
-        assert_eq!(unregister_requests[2].addr, 212);
-        register_requests.sort_by_key(|request| request.addr);
-        assert_eq!(register_requests.len(), 3);
-        assert_eq!(register_requests[0].addr, 108);
-        assert_eq!(register_requests[1].addr, 112);
-        assert_eq!(register_requests[2].addr, 116);
+    fn find_bar() {
+        let mut dev = TestDev {
+            config_regs: PciConfiguration::new(
+                0x1234,
+                0xABCD,
+                PciClassCode::MultimediaController,
+                &PciMultimediaSubclass::AudioDevice,
+                None,
+                PciHeaderType::Device,
+                0x5678,
+                0xEF01,
+                0,
+            ),
+        };
+
+        let _ = dev.config_regs.add_pci_bar(
+            PciBarConfiguration::new(
+                0,
+                BAR0_SIZE,
+                PciBarRegionType::Memory64BitRegion,
+                PciBarPrefetchable::Prefetchable,
+            )
+            .set_address(BAR0_ADDR),
+        );
+        let _ = dev.config_regs.add_pci_bar(
+            PciBarConfiguration::new(
+                2,
+                BAR2_SIZE,
+                PciBarRegionType::IoRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(BAR2_ADDR),
+        );
+
+        // No matching BAR
+        assert_eq!(find_bar_and_offset(&dev, 0, 4), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xbfffffff, 4), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000000, 0), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000000, 0x1001), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xffff_ffff_ffff_ffff, 1), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xffff_ffff_ffff_ffff, 4), None);
+
+        // BAR0 (64-bit memory BAR at 0xc0000000, size 0x1000)
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000000, 4), Some((0, 0)));
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000001, 4), Some((0, 1)));
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000ffc, 4), Some((0, 0xffc)));
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000ffd, 4), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000ffe, 4), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000fff, 4), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000fff, 1), Some((0, 0xfff)));
+        assert_eq!(find_bar_and_offset(&dev, 0xc0001000, 1), None);
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000000, 0xfff), Some((0, 0)));
+        assert_eq!(find_bar_and_offset(&dev, 0xc0000000, 0x1000), Some((0, 0)));
+
+        // BAR2 (I/O BAR)
+        assert_eq!(find_bar_and_offset(&dev, 0x800, 1), None);
     }
 }

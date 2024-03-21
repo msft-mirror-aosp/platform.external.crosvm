@@ -50,6 +50,7 @@ rust_library {
         "libvm_memory",
     ],
     proc_macros: ["libremain"],
+    aliases: ["crypto_generic:crypto"],
     visibility: ["//packages/modules/Virtualization/virtualizationmanager"],
 }
 
@@ -97,4 +98,5 @@ rust_test {
         "libvm_memory",
     ],
     proc_macros: ["libremain"],
+    aliases: ["crypto_generic:crypto"],
 }

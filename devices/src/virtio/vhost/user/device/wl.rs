@@ -18,7 +18,6 @@ use argh::FromArgs;
 use base::clone_descriptor;
 use base::error;
 use base::warn;
-use base::FromRawDescriptor;
 use base::SafeDescriptor;
 use base::Tube;
 use base::UnixSeqpacket;
@@ -268,11 +267,7 @@ impl VhostUserDevice for WlBackend {
         let queue_task = match idx {
             0 => {
                 let wlstate_ctx = clone_descriptor(wlstate.borrow().wait_ctx())
-                    .map(|fd| {
-                        // SAFETY:
-                        // Safe because we just created this fd.
-                        AsyncWrapper::new(unsafe { SafeDescriptor::from_raw_descriptor(fd) })
-                    })
+                    .map(AsyncWrapper::new)
                     .context("failed to clone inner WaitContext for WlState")
                     .and_then(|ctx| {
                         self.ex
@@ -407,7 +402,7 @@ pub fn run_wl_device(opts: Options) -> anyhow::Result<()> {
 
     let listener = VhostUserListener::new_socket(&socket, None)?;
 
-    let backend = Box::new(WlBackend::new(&ex, wayland_paths, resource_bridge));
+    let backend = WlBackend::new(&ex, wayland_paths, resource_bridge);
     // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
     ex.run_until(listener.run_backend(backend, &ex))?
 }

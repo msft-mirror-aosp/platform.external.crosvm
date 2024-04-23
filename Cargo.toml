@@ -72,6 +72,7 @@ members = [
     "linux_input_sys",
     "media/ffmpeg",
     "metrics",
+    "metrics_events",
     "net_sys",
     "net_util",
     "power_monitor",
@@ -170,6 +171,9 @@ swap = ["aarch64/swap", "arch/swap", "devices/swap", "vm_control/swap", "x86_64/
 ## Enables collection of VM statistics.
 stats = ["devices/stats"]
 
+## Supports tokio as an asynchronous executor.
+tokio = ["cros_async/tokio"]
+
 ## Enables USB host device passthrough via an emulated XHCI controller.
 ## USB is supported only on unix/linux. The feature is a no-op on windows.
 usb = ["devices/usb"]
@@ -208,6 +212,14 @@ vulkan_display = ["gpu_display/vulkan_display"]
 # Enables the highly experimental vulkan graphics buffer allocator.
 # see rutabaga_gfx/Cargo.toml for instructions on building with enabled.
 vulkano = ["rutabaga_gfx/vulkano"]
+
+# Enables the GPU display backend for Android. The backend uses Android surface as the backing
+# store.
+android_display = ["devices/android_display"]
+
+# Stub implementation of the Android display backend. This is only used for building and testing the
+# Android display backend on a non-Android target
+android_display_stub = ["devices/android_display_stub"]
 
 #! ### Video features
 #!
@@ -339,6 +351,7 @@ all-default = [
     "registered_events",
     "slirp",
     "swap",
+    "tokio",
     "trace_marker",
     "vaapi",
     "video-decoder",
@@ -352,6 +365,8 @@ all-default = [
 ## All features that are compiled and tested for aarch64
 all-aarch64 = [
     "all-default",
+    "android_display",
+    "android_display_stub",
     "gunyah",
 ]
 
@@ -363,6 +378,8 @@ all-riscv64 = [
 ## All features that are compiled and tested for x86_64
 all-x86_64 = [
     "all-default",
+    "android_display",
+    "android_display_stub",
     "plugin",
     "pvclock",
     "scudo"

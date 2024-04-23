@@ -26,7 +26,7 @@ use winapi::um::minwinbase::OVERLAPPED;
 
 use crate::common_executor;
 use crate::common_executor::RawExecutor;
-use crate::sys::windows::executor::DEFAULT_IO_CONCURRENCY;
+use crate::common_executor::RawTaskHandle;
 use crate::sys::windows::io_completion_port::CompletionPacket;
 use crate::sys::windows::io_completion_port::IoCompletionPort;
 use crate::waker::WakerToken;
@@ -34,6 +34,9 @@ use crate::waker::WeakWake;
 use crate::AsyncError;
 use crate::AsyncResult;
 use crate::IoSource;
+use crate::TaskHandle;
+
+const DEFAULT_IO_CONCURRENCY: u32 = 1;
 
 #[derive(Debug, ThisError)]
 pub enum Error {
@@ -92,7 +95,7 @@ impl HandleReactor {
         })
     }
 
-    fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         Self::new_with(DEFAULT_IO_CONCURRENCY)
     }
 
@@ -213,6 +216,10 @@ impl common_executor::Reactor for HandleReactor {
         f: F,
     ) -> AsyncResult<IoSource<F>> {
         Ok(IoSource::Handle(super::HandleSource::new(f)?))
+    }
+
+    fn wrap_task_handle<R>(task: RawTaskHandle<HandleReactor, R>) -> TaskHandle<R> {
+        TaskHandle::Handle(task)
     }
 }
 
@@ -343,6 +350,7 @@ mod test {
     use futures::StreamExt;
 
     use crate::BlockingPool;
+    use crate::ExecutorTrait;
 
     #[test]
     fn run_future() {

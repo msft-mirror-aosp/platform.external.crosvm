@@ -23,18 +23,25 @@ license_kind(
     url = "https://spdx.org/licenses/Apache-2.0.html",
 )
 
+CRATE_FEATURES = [
+    "rutabaga_gfx/gfxstream",
+]
+
 rust_static_library(
     name = "ffi",
     srcs = glob(["src/**/*.rs"]),
+    crate_features = CRATE_FEATURES,
     edition = "2021",
     deps = [
-        ":ffi_build_script",
         "//external/crosvm/rutabaga_gfx",
         "//hardware/google/gfxstream/host:gfxstream_backend",
         "@libc",
         "@log",
         "@once_cell",
-    ],
+    ] + select({
+        "@platforms//os:linux": ["@nix"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -47,10 +54,6 @@ cc_library(
     }),
     deps = [":ffi"],
 )
-
-CRATE_FEATURES = [
-    "rutabaga_gfx/gfxstream",
-]
 
 cargo_build_script(
     name = "ffi_build_script",

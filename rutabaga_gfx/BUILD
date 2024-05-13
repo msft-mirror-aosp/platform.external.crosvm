@@ -32,12 +32,16 @@ license_kind(
 rust_library(
     name = "rutabaga_gfx",
     srcs = glob(["**/*.rs"]),
+    crate_features = [
+        "gfxstream",
+    ],
     edition = "2021",
     proc_macro_deps = [
         "@remain",
         "@thiserror-impl",
     ],
     deps = [
+        "//hardware/google/gfxstream/host:gfxstream_backend_shared",
         "@cfg-if",
         "@libc",
         "@log",

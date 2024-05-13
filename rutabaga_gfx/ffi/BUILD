@@ -1,7 +1,7 @@
 load("@rules_license//rules:license.bzl", "license")
 load("@rules_license//rules:license_kind.bzl", "license_kind")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library")
 
 package(
     default_applicable_licenses = [":license"],
@@ -27,8 +27,8 @@ CRATE_FEATURES = [
     "rutabaga_gfx/gfxstream",
 ]
 
-rust_static_library(
-    name = "ffi",
+rust_shared_library(
+    name = "rutabaga_ffi",
     srcs = glob(["src/**/*.rs"]),
     crate_features = CRATE_FEATURES,
     edition = "2021",
@@ -52,7 +52,7 @@ cc_library(
         "@platforms//os:windows": ["/DEFAULTLIB:Ntdll.lib"],
         "//conditions:default": [],
     }),
-    deps = [":ffi"],
+    deps = [":rutabaga_ffi"],
 )
 
 cargo_build_script(

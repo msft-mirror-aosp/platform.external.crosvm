@@ -81,7 +81,6 @@ use vm_control::BalloonControlCommand;
 use vm_control::DiskControlCommand;
 use vm_control::HotPlugDeviceInfo;
 use vm_control::HotPlugDeviceType;
-use vm_control::RestoreCommand;
 use vm_control::SnapshotCommand;
 use vm_control::SwapCommand;
 use vm_control::UsbControlResult;
@@ -503,7 +502,7 @@ fn create_qcow2(cmd: cmdline::CreateQcow2Command) -> std::result::Result<(), ()>
 
 fn start_device(opts: cmdline::DeviceCommand) -> std::result::Result<(), ()> {
     if let Some(async_executor) = opts.async_executor {
-        cros_async::Executor::set_default_executor_kind(async_executor.into())
+        cros_async::Executor::set_default_executor_kind(async_executor)
             .map_err(|e| error!("Failed to set the default async executor: {:#}", e))?;
     }
 
@@ -632,13 +631,6 @@ fn snapshot_vm(cmd: cmdline::SnapshotCommand) -> std::result::Result<(), ()> {
                 encrypt: take_cmd.encrypt,
             });
             (take_cmd.socket_path, req)
-        }
-        Restore(path) => {
-            let req = VmRequest::Restore(RestoreCommand::Apply {
-                restore_path: path.snapshot_path,
-                require_encrypted: path.require_encrypted,
-            });
-            (path.socket_path, req)
         }
     };
     let socket_path = Path::new(&socket_path);

@@ -1,8 +1,15 @@
 {
   "tests": true,
   "features": [
+    "android_display",
+    // "android_display_stub" is enabled only to allow the cargo build to succeed as
+    // part of cargo_embargo. Patch files are used to remove it from the
+    // generated Android.bp files (so that the real display backend implementation is
+    // used).
+    "android_display_stub",
     "android-sparse",
     "audio",
+    "audio_aaudio",
     "balloon",
     "config-file",
     // TODO: The "protos" crate has been modified such that it doesn't work with cargo. If we fix that,
@@ -19,6 +26,7 @@
     "gfxstream_stub",
     "gpu",
     "gunyah",
+    "libaaudio_stub",
     "net",
     "qcow",
     "usb",
@@ -121,6 +129,9 @@
     "aarch64": {
       "add_module_block": "aarch64/cargo2android_arch.bp"
     },
+    "android_audio": {
+      "patch": "android_audio/patches/Android.bp.patch"
+    },
     "base": {
       "patch": "base/patches/Android.bp.patch",
       "dep_blocklist": [
@@ -184,9 +195,6 @@
     },
     "kvm_sys": {
       "no_presubmit": true
-    },
-    "metrics": {
-      "copy_out": true
     },
     "net_util": {
       "no_presubmit": true

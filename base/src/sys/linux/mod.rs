@@ -503,17 +503,6 @@ pub fn poll_in<F: AsRawDescriptor>(fd: &F) -> bool {
     fds.revents & libc::POLLIN != 0
 }
 
-/// Return a timespec filed with the specified Duration `duration`.
-#[allow(clippy::useless_conversion)]
-pub fn duration_to_timespec(duration: Duration) -> libc::timespec {
-    // nsec always fits in i32 because subsec_nanos is defined to be less than one billion.
-    let nsec = duration.subsec_nanos() as i32;
-    libc::timespec {
-        tv_sec: duration.as_secs() as libc::time_t,
-        tv_nsec: nsec.into(),
-    }
-}
-
 /// Return the maximum Duration that can be used with libc::timespec.
 pub fn max_timeout() -> Duration {
     Duration::new(libc::time_t::max_value() as u64, 999999999)
@@ -639,6 +628,11 @@ pub fn logical_core_capacity(cpu_id: usize) -> Result<u32> {
         // cpu-freq is not enabled. Fall back to using the normalized capacity.
         Ok(cpu_capacity)
     }
+}
+
+/// Returns the cluster ID of a given logical core.
+pub fn logical_core_cluster_id(cpu_id: usize) -> Result<u32> {
+    parse_sysfs_cpu_info(cpu_id, "topology/physical_package_id")
 }
 
 /// Returns the maximum frequency (in kHz) of a given logical core.

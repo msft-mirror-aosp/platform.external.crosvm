@@ -22,11 +22,16 @@ use serde::Deserialize;
 use serde::Serialize;
 use sync::Waitable;
 use thiserror::Error;
+use vm_control::gpu::DisplayParameters;
 use vm_control::gpu::MouseMode;
 #[cfg(feature = "vulkan_display")]
 use vulkano::VulkanLibrary;
 
 mod event_device;
+#[cfg(feature = "android_display")]
+mod gpu_display_android;
+#[cfg(feature = "android_display_stub")]
+mod gpu_display_android_stub;
 mod gpu_display_stub;
 #[cfg(windows)]
 mod gpu_display_win;
@@ -42,8 +47,6 @@ pub mod vulkan;
 
 pub use event_device::EventDevice;
 pub use event_device::EventDeviceKind;
-#[cfg(windows)]
-pub use gpu_display_win::DisplayProperties as WinDisplayProperties;
 #[cfg(windows)]
 pub use gpu_display_win::WindowProcedureThread;
 #[cfg(windows)]
@@ -96,6 +99,9 @@ pub enum GpuDisplayError {
     /// Failed to import a buffer to the compositor.
     #[error("failed to import a buffer to the compositor")]
     FailedImport,
+    /// Android display service name is invalid.
+    #[error("invalid Android display service name: {0}")]
+    InvalidAndroidDisplayServiceName(String),
     /// The import ID is invalid.
     #[error("invalid import ID")]
     InvalidImportId,
@@ -312,8 +318,7 @@ trait DisplayT: AsRawDescriptor {
         parent_surface_id: Option<u32>,
         surface_id: u32,
         scanout_id: Option<u32>,
-        width: u32,
-        height: u32,
+        display_params: &DisplayParameters,
         surf_type: SurfaceType,
     ) -> GpuDisplayResult<Box<dyn GpuDisplaySurface>>;
 
@@ -440,6 +445,27 @@ impl GpuDisplay {
         Err(GpuDisplayError::Unsupported)
     }
 
+    pub fn open_android(service_name: &str) -> GpuDisplayResult<GpuDisplay> {
+        let _ = service_name;
+        #[cfg(feature = "android_display")]
+        {
+            let display = gpu_display_android::DisplayAndroid::new(service_name)?;
+
+            let wait_ctx = WaitContext::new()?;
+            wait_ctx.add(&display, DisplayEventToken::Display)?;
+
+            Ok(GpuDisplay {
+                inner: Box::new(display),
+                next_id: 1,
+                event_devices: Default::default(),
+                surfaces: Default::default(),
+                wait_ctx,
+            })
+        }
+        #[cfg(not(feature = "android_display"))]
+        Err(GpuDisplayError::Unsupported)
+    }
+
     pub fn open_stub() -> GpuDisplayResult<GpuDisplay> {
         let display = gpu_display_stub::DisplayStub::new()?;
         let wait_ctx = WaitContext::new()?;
@@ -536,8 +562,7 @@ impl GpuDisplay {
         &mut self,
         parent_surface_id: Option<u32>,
         scanout_id: Option<u32>,
-        width: u32,
-        height: u32,
+        display_params: &DisplayParameters,
         surf_type: SurfaceType,
     ) -> GpuDisplayResult<u32> {
         if let Some(parent_id) = parent_surface_id {
@@ -551,8 +576,7 @@ impl GpuDisplay {
             parent_surface_id,
             new_surface_id,
             scanout_id,
-            width,
-            height,
+            display_params,
             surf_type,
         )?;
 

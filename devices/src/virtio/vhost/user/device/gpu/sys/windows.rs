@@ -286,9 +286,7 @@ pub fn run_gpu_device_worker(
             .push(GpuDisplayParameters::default());
     }
 
-    let display_backends = vec![virtio::DisplayBackend::WinApi(
-        (&config.params.display_params[0]).into(),
-    )];
+    let display_backends = vec![virtio::DisplayBackend::WinApi];
 
     let mut gpu_params = config.params.clone();
 
@@ -312,7 +310,7 @@ pub fn run_gpu_device_worker(
 
     let ex = Executor::new().context("failed to create executor")?;
 
-    let backend = Box::new(GpuBackend {
+    let backend = GpuBackend {
         ex: ex.clone(),
         gpu,
         resource_bridges: Default::default(),
@@ -322,7 +320,7 @@ pub fn run_gpu_device_worker(
         queue_workers: Default::default(),
         platform_workers: Default::default(),
         shmem_mapper: Arc::new(Mutex::new(None)),
-    });
+    };
 
     let handler = DeviceRequestHandler::new(backend);
 

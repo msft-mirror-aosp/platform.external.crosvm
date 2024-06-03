@@ -57,6 +57,7 @@
 mod async_types;
 pub mod audio_streams_async;
 mod blocking;
+mod common_executor;
 mod complete;
 mod event;
 mod executor;
@@ -67,12 +68,9 @@ mod queue;
 mod select;
 pub mod sync;
 pub mod sys;
-#[cfg(any(target_os = "android", target_os = "linux"))]
-pub use sys::linux::uring_executor::is_uring_stable;
-pub use sys::Executor;
-pub use sys::TaskHandle;
-mod common_executor;
 mod timer;
+#[cfg(feature = "tokio")]
+mod tokio_executor;
 mod waker;
 
 use std::future::Future;
@@ -89,7 +87,10 @@ pub use blocking::BlockingPool;
 pub use blocking::CancellableBlockingPool;
 pub use blocking::TimeoutAction;
 pub use event::EventAsync;
+pub use executor::Executor;
 pub use executor::ExecutorKind;
+pub(crate) use executor::ExecutorTrait;
+pub use executor::TaskHandle;
 #[cfg(windows)]
 pub use futures::executor::block_on;
 use futures::stream::FuturesUnordered;
@@ -104,6 +105,8 @@ pub use mem::MemRegionIter;
 pub use mem::VecIoWrapper;
 use remain::sorted;
 pub use select::SelectResult;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use sys::linux::uring_executor::is_uring_stable;
 use thiserror::Error as ThisError;
 pub use timer::TimerAsync;
 

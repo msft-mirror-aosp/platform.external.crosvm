@@ -1,8 +1,8 @@
 diff --git a/rutabaga_gfx/Android.bp b/rutabaga_gfx/Android.bp
-index 3384aee72..6bd5aa066 100644
+index b99e49886..6c37c03da 100644
 --- a/rutabaga_gfx/Android.bp
 +++ b/rutabaga_gfx/Android.bp
-@@ -22,7 +22,6 @@ rust_library {
+@@ -23,7 +23,6 @@ rust_library {
      edition: "2021",
      features: [
          "gfxstream",
@@ -10,7 +10,7 @@ index 3384aee72..6bd5aa066 100644
          "virgl_renderer",
      ],
      rustlibs: [
-@@ -34,12 +33,46 @@ rust_library {
+@@ -35,14 +34,75 @@ rust_library {
          "libzerocopy",
      ],
      proc_macros: ["libremain"],
@@ -19,16 +19,33 @@ index 3384aee72..6bd5aa066 100644
 +    ],
      shared_libs: [
 -        "libdrm",
++        "libc++",
++        "libbase",
++    ],
++    target: {
++        android: {
++            shared_libs: [
++                "libnativewindow",
++                "libcutils",
++                "liblog",
++            ],
++        },
++        host: {
++            features: ["vulkano"],
++            rustlibs: [
++                "libvulkano",
++            ],
++        },
++    },
++    static_libs: [
          "libepoxy",
          "libgbm",
++        "libdrm",
 +        "libgfxstream_backend",
          "libvirglrenderer",
      ],
-+    static_libs: [
-+        "libdrm",
-+    ],
-+}
-+
+ }
+ 
 +rust_library {
 +    name: "librutabaga_gfx_gfxstream",
 +    defaults: ["crosvm_inner_defaults"],
@@ -51,14 +68,26 @@ index 3384aee72..6bd5aa066 100644
 +    cfgs: [
 +        "gfxstream_unstable",
 +    ],
-+    features: ["gfxstream"],
++    features: [
++        "gfxstream",
++    ],
 +    shared_libs: [
 +        "libgfxstream_backend",
 +    ],
- }
- 
++    target: {
++        host: {
++            features: ["vulkano"],
++            rustlibs: [
++                "libvulkano",
++            ],
++        },
++    },
++}
++
  rust_test {
-@@ -58,7 +91,6 @@ rust_test {
+     name: "rutabaga_gfx_test_src_lib",
+     defaults: ["crosvm_inner_defaults"],
+@@ -59,7 +119,6 @@ rust_test {
      edition: "2021",
      features: [
          "gfxstream",
@@ -66,7 +95,7 @@ index 3384aee72..6bd5aa066 100644
          "virgl_renderer",
      ],
      rustlibs: [
-@@ -71,9 +103,12 @@ rust_test {
+@@ -72,9 +131,12 @@ rust_test {
      ],
      proc_macros: ["libremain"],
      shared_libs: [

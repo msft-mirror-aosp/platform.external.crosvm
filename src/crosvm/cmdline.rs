@@ -289,7 +289,11 @@ pub struct MakeRTCommand {
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "resume")]
-/// Resumes the crosvm instance
+/// Resumes the crosvm instance. No-op if already running. When starting crosvm with `--restore`,
+/// this command can be used to wait until the restore is complete
+// Implementation note: All the restore work happens before crosvm becomes able to process incoming
+// commands, so really all commands can be used to wait for restore to complete, but few are side
+// effect free.
 pub struct ResumeCommand {
     #[argh(positional, arg_name = "VM_SOCKET")]
     /// VM Socket path
@@ -742,26 +746,10 @@ pub struct SnapshotTakeCommand {
 }
 
 #[derive(FromArgs)]
-#[argh(subcommand, name = "restore")]
-/// Restore VM state from a snapshot created by take
-pub struct SnapshotRestoreCommand {
-    #[argh(positional)]
-    /// path to snapshot to restore
-    pub snapshot_path: PathBuf,
-    #[argh(positional, arg_name = "VM_SOCKET")]
-    /// VM Socket path
-    pub socket_path: String,
-    /// true to require an encrypted snapshot
-    #[argh(switch, arg_name = "require_encrypted")]
-    pub require_encrypted: bool,
-}
-
-#[derive(FromArgs)]
 #[argh(subcommand)]
 /// Snapshot commands
 pub enum SnapshotSubCommands {
     Take(SnapshotTakeCommand),
-    Restore(SnapshotRestoreCommand),
 }
 
 /// Container for GpuParameters that have been fixed after parsing using serde.
@@ -945,6 +933,12 @@ pub struct RunCommand {
     #[merge(strategy = append)]
     /// path to user provided ACPI table
     pub acpi_table: Vec<PathBuf>,
+
+    #[cfg(feature = "android_display")]
+    #[argh(option, arg_name = "NAME")]
+    #[merge(strategy = overwrite_option)]
+    /// name that the Android display backend will be registered to the service manager.
+    pub android_display_service: Option<String>,
 
     #[argh(option)]
     #[serde(skip)] // TODO(b/255223604)
@@ -1153,6 +1147,7 @@ pub struct RunCommand {
     ///       core-types=[atom=[0,1],core=[2,3]] - set vCPU 0 and
     ///       vCPU 1 as intel Atom type, also set vCPU 2 and vCPU 3
     ///       as intel Core type.
+    ///     boot-cpu=NUM - Select vCPU to boot from. (default: 0) (aarch64 only)
     pub cpus: Option<CpuOptions>,
 
     #[cfg(feature = "crash-report")]
@@ -1327,9 +1322,13 @@ pub struct RunCommand {
     /// Possible key values:
     ///     backend=(2d|virglrenderer|gfxstream) - Which backend to
     ///        use for virtio-gpu (determining rendering protocol)
+    ///     max_num_displays=INT - The maximum number of concurrent
+    ///        virtual displays in this VM. This must not exceed
+    ///        VIRTIO_GPU_MAX_SCANOUTS (i.e. 16).
     ///     displays=[[GpuDisplayParameters]] - The list of virtual
-    ///         displays to create. See the possible key values for
-    ///         GpuDisplayParameters in the section below.
+    ///        displays to create when booting this VM. Displays may
+    ///        be hotplugged after booting. See the possible key
+    ///        values for GpuDisplayParameters in the section below.
     ///     context-types=LIST - The list of supported context
     ///       types, separated by ':' (default: no contexts enabled)
     ///     width=INT - The width of the virtual display connected
@@ -2601,6 +2600,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         {
             let cpus = cmd.cpus.unwrap_or_default();
             cfg.vcpu_count = cpus.num_cores;
+            cfg.boot_cpu = cpus.boot_cpu.unwrap_or_default();
 
             // Only allow deprecated `--cpu-cluster` option only if `--cpu clusters=[...]` is not
             // used.
@@ -3145,6 +3145,11 @@ impl TryFrom<RunCommand> for super::config::Config {
                     .get_or_insert_with(Default::default)
                     .display_params
                     .extend(cmd.gpu_display.into_iter().map(|p| p.0));
+
+                #[cfg(feature = "android_display")]
+                {
+                    cfg.android_display_service = cmd.android_display_service;
+                }
             }
 
             #[cfg(windows)]

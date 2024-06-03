@@ -164,6 +164,7 @@ use jail_warden::JailWardenImpl;
 #[cfg(feature = "pci-hotplug")]
 use jail_warden::PermissiveJailWarden;
 use libc;
+use metrics::MetricsController;
 use minijail::Minijail;
 #[cfg(feature = "pci-hotplug")]
 use pci_hotplug_manager::PciHotPlugManager;
@@ -173,6 +174,7 @@ use resources::SystemAllocator;
 #[cfg(target_arch = "riscv64")]
 use riscv64::Riscv64 as Arch;
 use rutabaga_gfx::RutabagaGralloc;
+use rutabaga_gfx::RutabagaGrallocBackendFlags;
 use smallvec::SmallVec;
 #[cfg(feature = "swap")]
 use swap::SwapController;
@@ -568,7 +570,8 @@ fn create_virtio_devices(
 
     #[cfg(feature = "balloon")]
     if let (Some(balloon_device_tube), Some(dynamic_mapping_device_tube)) =
-        (balloon_device_tube, dynamic_mapping_device_tube) {
+        (balloon_device_tube, dynamic_mapping_device_tube)
+    {
         let balloon_features = (cfg.balloon_page_reporting as u64)
             << BalloonFeatures::PageReporting as u64
             | (cfg.balloon_ws_reporting as u64) << BalloonFeatures::WSReporting as u64;
@@ -1306,6 +1309,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         #[cfg(target_arch = "x86_64")]
         pci_low_start: cfg.pci_low_start,
         dynamic_power_coefficient: cfg.dynamic_power_coefficient.clone(),
+        boot_cpu: cfg.boot_cpu,
     })
 }
 
@@ -1634,7 +1638,7 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
     if let Some(async_executor) = cfg.async_executor {
-        Executor::set_default_executor_kind(async_executor.into())
+        Executor::set_default_executor_kind(async_executor)
             .context("Failed to set the default async executor")?;
     }
 
@@ -1680,6 +1684,10 @@ where
         // access to those files will not be possible.
         info!("crosvm entering multiprocess mode");
     }
+
+    let (metrics_send, metrics_recv) = Tube::directional_pair().context("metrics tube")?;
+    metrics::initialize(metrics_send);
+
     #[cfg(all(feature = "pci-hotplug", feature = "swap"))]
     let swap_device_helper = match &swap_controller {
         Some(swap_controller) => Some(swap_controller.create_device_helper()?),
@@ -2174,7 +2182,8 @@ where
             })?
     };
 
-    let gralloc = RutabagaGralloc::new().context("failed to create gralloc")?;
+    let flags = RutabagaGrallocBackendFlags::new().disable_vulkano();
+    let gralloc = RutabagaGralloc::new(flags).context("failed to create gralloc")?;
 
     run_control(
         linux,
@@ -2210,6 +2219,7 @@ where
         guest_suspended_cvar,
         #[cfg(feature = "pvclock")]
         pvclock_host_tube,
+        metrics_recv,
     )
 }
 
@@ -2964,6 +2974,7 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         }
         _ => {
             let response = request.execute(
+                &state.linux.vm,
                 &mut run_mode_opt,
                 state.disk_host_tubes,
                 &mut state.linux.pm,
@@ -2983,13 +2994,6 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         msg,
                     )
                 },
-                |msg, index| {
-                    vcpu::kick_vcpu(
-                        &state.vcpu_handles.get(index),
-                        state.linux.irq_chip.as_irq_chip(),
-                        msg,
-                    )
-                },
                 state.cfg.force_s2idle,
                 #[cfg(feature = "swap")]
                 state.swap_controller.as_ref(),
@@ -2997,13 +3001,6 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 state.vcpu_handles.len(),
                 state.irq_handler_control,
                 || state.linux.irq_chip.snapshot(state.linux.vcpu_count),
-                |image| {
-                    state
-                        .linux
-                        .irq_chip
-                        .try_box_clone()?
-                        .restore(image, state.linux.vcpu_count)
-                },
             );
             if state.cfg.force_s2idle {
                 if let VmRequest::SuspendVcpus = request {
@@ -3276,6 +3273,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     #[cfg(feature = "registered_events")] reg_evt_rdtube: RecvTube,
     guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
     #[cfg(feature = "pvclock")] pvclock_host_tube: Option<Tube>,
+    metrics_tube: RecvTube,
 ) -> Result<ExitState> {
     #[derive(EventToken)]
     enum Token {
@@ -3595,6 +3593,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     if let Some(path) = &cfg.restore_path {
         vm_control::do_restore(
             path.clone(),
+            &linux.vm,
             |msg| vcpu::kick_all_vcpus(&vcpu_handles, linux.irq_chip.as_irq_chip(), msg),
             |msg, index| {
                 vcpu::kick_vcpu(&vcpu_handles.get(index), linux.irq_chip.as_irq_chip(), msg)
@@ -3624,6 +3623,21 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             .on_static_devices_setup_complete()
             .context("static device setup complete")?;
     }
+
+    let metrics_thread = if metrics::is_initialized() {
+        Some(
+            std::thread::Builder::new()
+                .name("metrics_thread".into())
+                .spawn(move || {
+                    if let Err(e) = MetricsController::new(vec![metrics_tube]).run() {
+                        error!("Metrics controller error: {:?}", e);
+                    }
+                })
+                .context("metrics thread failed")?,
+        )
+    } else {
+        None
+    };
 
     let mut exit_state = ExitState::Stop;
     let mut pvpanic_code = PvPanicCode::Unknown;
@@ -3953,6 +3967,20 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // Explicitly drop the VM structure here to allow the devices to clean up before the
     // control sockets are closed when this function exits.
     mem::drop(linux);
+
+    // Drop the hotplug manager to tell the warden process to exit before we try to join
+    // the metrics thread.
+    #[cfg(feature = "pci-hotplug")]
+    mem::drop(hotplug_manager);
+
+    // All our children should have exited by now, so closing our fd should
+    // terminate metrics. Then join so that everything gets flushed.
+    metrics::get_destructor().cleanup();
+    if let Some(metrics_thread) = metrics_thread {
+        if let Err(e) = metrics_thread.join() {
+            error!("failed to exit irq handler thread: {:?}", e);
+        }
+    }
 
     stdin()
         .set_canon_mode()
@@ -4399,6 +4427,7 @@ fn jail_and_start_vu_device<T: VirtioDeviceBuilder>(
 
     base::syslog::push_descriptors(&mut keep_rds);
     cros_tracing::push_descriptors!(&mut keep_rds);
+    metrics::push_descriptors(&mut keep_rds);
 
     let jail_type = VirtioDeviceType::VhostUser;
 
@@ -4537,7 +4566,7 @@ fn start_vhost_user_control_server(
 
 pub fn start_devices(opts: DevicesCommand) -> anyhow::Result<()> {
     if let Some(async_executor) = opts.async_executor {
-        Executor::set_default_executor_kind(async_executor.into())
+        Executor::set_default_executor_kind(async_executor)
             .context("Failed to set the default async executor")?;
     }
 

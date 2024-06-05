@@ -22,10 +22,10 @@ use crate::IrqEdgeEvent;
 use crate::IrqLevelEvent;
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
         mod kvm;
         pub use self::kvm::KvmKernelIrqChip;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         pub use self::kvm::KvmSplitIrqChip;
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         pub use self::kvm::{AARCH64_GIC_NR_IRQS, AARCH64_GIC_NR_SPIS};
@@ -43,7 +43,7 @@ cfg_if::cfg_if! {
 }
 
 cfg_if::cfg_if! {
-    if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
+    if #[cfg(target_arch = "x86_64")] {
         mod x86_64;
         pub use x86_64::*;
         mod pic;
@@ -57,19 +57,28 @@ cfg_if::cfg_if! {
     } else if #[cfg(any(target_arch = "arm", target_arch = "aarch64"))] {
         mod aarch64;
         pub use aarch64::*;
+    } else if #[cfg(target_arch = "riscv64")] {
+        mod riscv64;
+        pub use riscv64::*;
+        pub use self::kvm::aia_addr_imsic;
+        pub use self::kvm::aia_aplic_addr;
+        pub use self::kvm::aia_imsic_addr;
+        pub use self::kvm::aia_imsic_size;
+        pub use self::kvm::AIA_APLIC_SIZE;
+        pub use self::kvm::AIA_IMSIC_BASE;
+        pub use self::kvm::IMSIC_MAX_INT_IDS;
     }
+
 }
 
-#[cfg(any(target_arch = "aarch64"))]
-#[cfg(feature = "geniezone")]
+#[cfg(all(target_arch = "aarch64", feature = "geniezone"))]
 mod geniezone;
-#[cfg(any(target_arch = "aarch64"))]
-#[cfg(feature = "geniezone")]
+#[cfg(all(target_arch = "aarch64", feature = "geniezone"))]
 pub use self::geniezone::GeniezoneKernelIrqChip;
 
 pub type IrqEventIndex = usize;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 struct IrqEvent {
     event: Event,
     gsi: u32,
@@ -152,7 +161,8 @@ pub trait IrqChip: Send {
     /// Add a vcpu to the irq chip.
     fn add_vcpu(&mut self, vcpu_id: usize, vcpu: &dyn Vcpu) -> Result<()>;
 
-    /// Register an event with edge-trigger semantic that can trigger an interrupt for a particular GSI.
+    /// Register an event with edge-trigger semantic that can trigger an interrupt for a particular
+    /// GSI.
     fn register_edge_irq_event(
         &mut self,
         irq: u32,
@@ -163,7 +173,8 @@ pub trait IrqChip: Send {
     /// Unregister an event with edge-trigger semantic for a particular GSI.
     fn unregister_edge_irq_event(&mut self, irq: u32, irq_event: &IrqEdgeEvent) -> Result<()>;
 
-    /// Register an event with level-trigger semantic that can trigger an interrupt for a particular GSI.
+    /// Register an event with level-trigger semantic that can trigger an interrupt for a particular
+    /// GSI.
     fn register_level_irq_event(
         &mut self,
         irq: u32,
@@ -254,6 +265,9 @@ pub enum IrqChipCap {
     TscDeadlineTimer,
     /// Extended xAPIC (x2APIC) standard.
     X2Apic,
+    /// Irqchip exposes mp_state_get/set methods. Calling these methods on chips
+    /// without this capability will result in undefined behavior.
+    MpStateGetSet,
 }
 
 /// A capability the `IrqChip` can possibly expose.

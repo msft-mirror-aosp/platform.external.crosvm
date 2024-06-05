@@ -5,15 +5,18 @@
 use std::cmp::min;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::Context;
 use base::custom_serde::deserialize_seq_to_arr;
 use base::custom_serde::serialize_arr;
 use base::error;
+use base::info;
 use base::Event;
 use base::EventToken;
 use base::Timer;
+use base::TimerTrait;
 use base::Tube;
 use base::WaitContext;
 use base::WorkerThread;
@@ -22,6 +25,8 @@ use chrono::Datelike;
 use chrono::TimeZone;
 use chrono::Timelike;
 use chrono::Utc;
+use metrics::log_metric;
+use metrics::MetricEventType;
 use serde::Deserialize;
 use serde::Serialize;
 use sync::Mutex;
@@ -41,30 +46,30 @@ const INDEX_OFFSET: u64 = 0x0;
 const DATA_OFFSET: u64 = 0x1;
 const DATA_LEN: usize = 128;
 
-const RTC_REG_SEC: usize = 0x0;
-const RTC_REG_ALARM_SEC: usize = 0x1;
-const RTC_REG_MIN: usize = 0x2;
-const RTC_REG_ALARM_MIN: usize = 0x3;
-const RTC_REG_HOUR: usize = 0x4;
-const RTC_REG_ALARM_HOUR: usize = 0x5;
-const RTC_REG_WEEK_DAY: usize = 0x6;
-const RTC_REG_DAY: usize = 0x7;
-const RTC_REG_MONTH: usize = 0x8;
-const RTC_REG_YEAR: usize = 0x9;
-pub const RTC_REG_CENTURY: usize = 0x32;
-pub const RTC_REG_ALARM_DAY: usize = 0x33;
-pub const RTC_REG_ALARM_MONTH: usize = 0x34;
+const RTC_REG_SEC: u8 = 0x0;
+const RTC_REG_ALARM_SEC: u8 = 0x1;
+const RTC_REG_MIN: u8 = 0x2;
+const RTC_REG_ALARM_MIN: u8 = 0x3;
+const RTC_REG_HOUR: u8 = 0x4;
+const RTC_REG_ALARM_HOUR: u8 = 0x5;
+const RTC_REG_WEEK_DAY: u8 = 0x6;
+const RTC_REG_DAY: u8 = 0x7;
+const RTC_REG_MONTH: u8 = 0x8;
+const RTC_REG_YEAR: u8 = 0x9;
+pub const RTC_REG_CENTURY: u8 = 0x32;
+pub const RTC_REG_ALARM_DAY: u8 = 0x33;
+pub const RTC_REG_ALARM_MONTH: u8 = 0x34;
 
-const RTC_REG_B: usize = 0x0b;
+const RTC_REG_B: u8 = 0x0b;
 const RTC_REG_B_UNSUPPORTED: u8 = 0xdd;
 const RTC_REG_B_24_HOUR_MODE: u8 = 0x02;
 const RTC_REG_B_ALARM_ENABLE: u8 = 0x20;
 
-const RTC_REG_C: usize = 0x0c;
+const RTC_REG_C: u8 = 0x0c;
 const RTC_REG_C_IRQF: u8 = 0x80;
 const RTC_REG_C_AF: u8 = 0x20;
 
-const RTC_REG_D: usize = 0x0d;
+const RTC_REG_D: u8 = 0x0d;
 const RTC_REG_D_VRT: u8 = 0x80; // RAM and time valid
 
 pub type CmosNowFn = fn() -> DateTime<Utc>;
@@ -84,16 +89,34 @@ pub struct Cmos {
     alarm_fn: Option<AlarmFn>,
     #[serde(skip_serializing)] // skip serializing the worker thread
     worker: Option<WorkerThread<AlarmFn>>,
+    #[serde(skip_serializing)] // skip serializing the armed time
+    armed_time: Option<Arc<Mutex<Instant>>>,
 }
 
 struct AlarmFn {
     irq: IrqEdgeEvent,
     vm_control: Tube,
+    armed_time: Arc<Mutex<Instant>>,
 }
 
 impl AlarmFn {
+    fn new(irq: IrqEdgeEvent, vm_control: Tube) -> Self {
+        Self {
+            irq,
+            vm_control,
+            // Not actually armed, but simpler than wrapping with an Option.
+            armed_time: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
     fn fire(&self) -> anyhow::Result<()> {
         self.irq.trigger().context("failed to trigger irq")?;
+
+        let elapsed = self.armed_time.lock().elapsed().as_millis();
+        log_metric(
+            MetricEventType::RtcWakeup,
+            elapsed.try_into().unwrap_or(i64::MAX),
+        );
 
         // The Linux kernel expects wakeups to come via ACPI when ACPI is enabled. There's
         // no real way to determine that here, so just send this unconditionally.
@@ -123,7 +146,7 @@ impl Cmos {
             mem_below_4g,
             mem_above_4g,
             now_fn,
-            Some(AlarmFn { irq, vm_control }),
+            Some(AlarmFn::new(irq, vm_control)),
         )
     }
 
@@ -151,6 +174,7 @@ impl Cmos {
         data[0x5c] = (high_mem >> 8) as u8;
         data[0x5d] = (high_mem >> 16) as u8;
 
+        let armed_time = alarm_fn.as_ref().map(|a| a.armed_time.clone());
         Ok(Cmos {
             index: 0,
             data,
@@ -159,6 +183,7 @@ impl Cmos {
             alarm_time: None,
             alarm_fn,
             worker: None,
+            armed_time,
         })
     }
 
@@ -174,7 +199,7 @@ impl Cmos {
     }
 
     fn set_alarm(&mut self) {
-        if self.data[RTC_REG_B] & RTC_REG_B_ALARM_ENABLE != 0 {
+        if self.data[RTC_REG_B as usize] & RTC_REG_B_ALARM_ENABLE != 0 {
             let now = (self.now_fn)();
             let target = alarm_from_registers(now.year(), &self.data).and_then(|this_year| {
                 // There is no year register for the alarm. If the alarm target has
@@ -199,6 +224,9 @@ impl Cmos {
 
                     if self.alarm_fn.is_some() {
                         self.spawn_worker();
+                    }
+                    if let Some(armed_time) = self.armed_time.as_ref() {
+                        *armed_time.lock() = Instant::now();
                     }
 
                     let duration = target
@@ -260,15 +288,13 @@ fn from_bcd(v: u8) -> Option<u32> {
 }
 
 fn alarm_from_registers(year: i32, data: &[u8; DATA_LEN]) -> Option<DateTime<Utc>> {
-    Utc.ymd_opt(
+    Utc.with_ymd_and_hms(
         year,
-        from_bcd(data[RTC_REG_ALARM_MONTH])?,
-        from_bcd(data[RTC_REG_ALARM_DAY])?,
-    )
-    .and_hms_opt(
-        from_bcd(data[RTC_REG_ALARM_HOUR])?,
-        from_bcd(data[RTC_REG_ALARM_MIN])?,
-        from_bcd(data[RTC_REG_ALARM_SEC])?,
+        from_bcd(data[RTC_REG_ALARM_MONTH as usize])?,
+        from_bcd(data[RTC_REG_ALARM_DAY as usize])?,
+        from_bcd(data[RTC_REG_ALARM_HOUR as usize])?,
+        from_bcd(data[RTC_REG_ALARM_MIN as usize])?,
+        from_bcd(data[RTC_REG_ALARM_SEC as usize])?,
     )
     .single()
 }
@@ -291,23 +317,30 @@ impl BusDevice for Cmos {
             INDEX_OFFSET => self.index = data[0] & INDEX_MASK,
             DATA_OFFSET => {
                 let mut data = data[0];
-                if self.index == RTC_REG_B as u8 {
+                if self.index == RTC_REG_B {
+                    // The features which we don't support are:
+                    //   0x80 (SET)  - disable clock updates (i.e. let guest configure the clock)
+                    //   0x40 (PIE)  - enable periodic interrupts
+                    //   0x10 (IUE)  - enable interrupts after clock updates
+                    //   0x08 (SQWE) - enable square wave generation
+                    //   0x04 (DM)   - use binary data format (instead of BCD)
+                    //   0x01 (DSE)  - control daylight savings (we just do what the host does)
                     if data & RTC_REG_B_UNSUPPORTED != 0 {
-                        error!(
+                        info!(
                             "Ignoring unsupported bits: {:x}",
                             data & RTC_REG_B_UNSUPPORTED
                         );
                         data &= !RTC_REG_B_UNSUPPORTED;
                     }
                     if data & RTC_REG_B_24_HOUR_MODE == 0 {
-                        error!("12-hour mode unsupported");
+                        info!("12-hour mode unsupported");
                         data |= RTC_REG_B_24_HOUR_MODE;
                     }
                 }
 
                 self.data[self.index as usize] = data;
 
-                if self.index == RTC_REG_B as u8 {
+                if self.index == RTC_REG_B {
                     self.set_alarm();
                 }
             }
@@ -336,7 +369,7 @@ impl BusDevice for Cmos {
                 let day = now.day(); // 1..=31
                 let month = now.month(); // 1..=12
                 let year = now.year();
-                match self.index as usize {
+                match self.index {
                     RTC_REG_SEC => to_bcd(seconds as u8),
                     RTC_REG_MIN => to_bcd(minutes as u8),
                     RTC_REG_HOUR => to_bcd(hours as u8),
@@ -371,7 +404,7 @@ impl BusDevice for Cmos {
 }
 
 impl Suspendable for Cmos {
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         serde_json::to_value(self).context("failed to serialize Cmos")
     }
 
@@ -409,8 +442,6 @@ impl Suspendable for Cmos {
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDateTime;
-
     use super::*;
     use crate::suspendable_tests;
 
@@ -464,7 +495,7 @@ mod tests {
     }
 
     fn timestamp_to_datetime(timestamp: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc)
+        DateTime::from_timestamp(timestamp, 0).unwrap()
     }
 
     fn test_now_party_like_its_1999() -> DateTime<Utc> {
@@ -685,10 +716,7 @@ mod tests {
     fn cmos_sleep_wake() {
         // 2000-01-02T03:04:05+00:00
         let now_fn = || timestamp_to_datetime(946782245);
-        let alarm_fn = AlarmFn {
-            irq: IrqEdgeEvent::new().unwrap(),
-            vm_control: Tube::pair().unwrap().0,
-        };
+        let alarm_fn = AlarmFn::new(IrqEdgeEvent::new().unwrap(), Tube::pair().unwrap().0);
         let mut cmos = Cmos::new_inner(1024, 0, now_fn, Some(alarm_fn)).unwrap();
 
         // A date later this year

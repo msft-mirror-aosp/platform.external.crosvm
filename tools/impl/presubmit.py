@@ -4,28 +4,29 @@
 # found in the LICENSE file.
 
 import os
-import re
 import subprocess
+import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from fnmatch import fnmatch
 from pathlib import Path
-import sys
 from time import sleep
-from typing import Callable, List, NamedTuple, Optional, Set, Union
-from datetime import datetime, timedelta
+from typing import Callable, List, Sequence, NamedTuple, Optional, Union
 
-from impl.common import Command, all_tracked_files, cmd, console, verbose
-
-import rich
-import rich.console
-import rich.live
-import rich.spinner
-import rich.text
+from impl.common import (
+    Command,
+    ParallelCommands,
+    all_tracked_files,
+    cmd,
+    console,
+    rich,
+    strip_ansi_escape_sequences,
+    verbose,
+)
 
 git = cmd("git")
-
-ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 @dataclass
@@ -34,9 +35,6 @@ class CheckContext(object):
 
     # Whether or not --fix was set and checks should attempt to fix problems they encounter.
     fix: bool
-
-    # Use rust nightly version for rust checks
-    nightly_fmt: bool
 
     # All files that this check should cover (e.g. all python files on a python check).
     all_files: List[Path]
@@ -159,7 +157,7 @@ class Task(object):
     This information can then be rendered from a separate thread via `Task.status_widget()`
     """
 
-    def __init__(self, title: str, commands: List[Command], priority: bool):
+    def __init__(self, title: str, commands: Sequence[Command], priority: bool):
         "Display title."
         self.title = title
         "Commands to execute."
@@ -204,7 +202,7 @@ class Task(object):
             *(
                 # Print last log lines without it's original colors
                 rich.text.Text(
-                    "│ " + ansi_escape.sub("", log_line),
+                    "│ " + strip_ansi_escape_sequences(log_line),
                     style="light_slate_grey",
                     overflow="ellipsis",
                     no_wrap=True,
@@ -218,20 +216,38 @@ class Task(object):
 
     def execute(self):
         "Execute the task while updating the status variables."
-        self.start_time = datetime.now()
-        success = True
-        for command in self.commands:
+        try:
+            self.start_time = datetime.now()
+            success = True
             if verbose():
-                self.log_lines.append(f"$ {command}")
-            process = command.popen(stderr=subprocess.STDOUT)
-            assert process.stdout
-            for line in iter(process.stdout.readline, ""):
-                self.log_lines.append(line.strip())
-            if process.wait() != 0:
-                success = False
-        self.duration = datetime.now() - self.start_time
-        self.success = success
-        self.done = True
+                for command in self.commands:
+                    self.log_lines.append(f"$ {command}")
+
+            # Spawn all commands as separate processes
+            processes = [
+                command.popen(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, errors="replace")
+                for command in self.commands
+            ]
+
+            # The stdout is collected before we wait for the processes to exit so that the UI is
+            # at least real-time for the first process. Note that in this way, the output for
+            # other processes other than the first process are not real-time. In addition, we
+            # can't proactively kill other processes in the same task if any process fails.
+            for process in processes:
+                assert process.stdout
+                for line in iter(process.stdout.readline, ""):
+                    self.log_lines.append(line.strip())
+
+            # Wait for all processes to finish and check return code
+            for process in processes:
+                if process.wait() != 0:
+                    success = False
+
+            self.duration = datetime.now() - self.start_time
+            self.success = success
+            self.done = True
+        except Exception:
+            self.log_lines.append(traceback.format_exc())
 
 
 def print_logs(tasks: List[Task]):
@@ -313,7 +329,6 @@ def generate_plan(
     checks_list: List[Check],
     fix: bool,
     run_on_all_files: bool,
-    nightly_fmt: bool,
 ):
     "Generates a list of `Task`s to execute the checks provided in `checks_list`"
     all_files = [*all_tracked_files()]
@@ -323,7 +338,6 @@ def generate_plan(
         modified_files = all_files
     else:
         modified_files = [f for (s, f) in file_diff if s in ("M", "A")]
-
     tasks: List[Task] = []
     unsupported_checks: List[str] = []
     for check in checks_list:
@@ -331,20 +345,18 @@ def generate_plan(
             continue
         context = CheckContext(
             fix=fix,
-            nightly_fmt=nightly_fmt,
             all_files=[f for f in all_files if should_run_check_on_file(check, f)],
             modified_files=[f for f in modified_files if should_run_check_on_file(check, f)],
             new_files=[f for f in new_files if should_run_check_on_file(check, f)],
         )
         if context.modified_files:
-            commands = check.check_function(context)
-            if commands is None:
+            maybe_commands = check.check_function(context)
+            if maybe_commands is None:
                 unsupported_checks.append(check.name)
                 continue
-            if not isinstance(commands, list):
-                commands = [commands]
+            commands_list = maybe_commands if isinstance(maybe_commands, list) else [maybe_commands]
             title = f"fixing {check.name}" if fix else check.name
-            tasks.append(Task(title, commands, check.priority))
+            tasks.append(Task(title, commands_list, check.priority))
 
     if unsupported_checks:
         console.print("[yellow]Warning:[/yellow] The following checks cannot be run:")
@@ -358,6 +370,9 @@ def generate_plan(
         )
         console.print()
 
+    if not os.access("/dev/kvm", os.W_OK):
+        console.print("[yellow]Warning:[/yellow] Cannot access KVM. Integration tests are not run.")
+
     # Sort so that priority tasks are launched (and rendered) first
     tasks.sort(key=lambda t: (t.priority, t.title), reverse=True)
     return tasks
@@ -367,7 +382,6 @@ def run_checks(
     checks_list: List[Check],
     fix: bool,
     run_on_all_files: bool,
-    nightly_fmt: bool,
     parallel: bool,
 ):
     """
@@ -379,7 +393,7 @@ def run_checks(
         nightly_fmt: Use nightly version of rust tooling.
         parallel: Run tasks in parallel.
     """
-    tasks = generate_plan(checks_list, fix, run_on_all_files, nightly_fmt)
+    tasks = generate_plan(checks_list, fix, run_on_all_files)
     if len(tasks) == 1:
         parallel = False
 

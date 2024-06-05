@@ -8,7 +8,7 @@ use std::convert::TryFrom;
 use anyhow::anyhow;
 use base::Error;
 use base::Result;
-use cros_fdt::FdtWriter;
+use cros_fdt::Fdt;
 use downcast_rs::impl_downcast;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
@@ -77,13 +77,9 @@ pub trait VmAArch64: Vm {
     fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuAArch64>>;
 
     /// Create DT configuration node for the hypervisor.
-    /// `fdt` - FdtWriter initialized at the root node.
+    /// `fdt` - Fdt initialized at the root node.
     /// `phandles` - Map of strings to a phandle.
-    fn create_fdt(
-        &self,
-        fdt: &mut FdtWriter,
-        phandles: &BTreeMap<&str, u32>,
-    ) -> cros_fdt::Result<()>;
+    fn create_fdt(&self, fdt: &mut Fdt, phandles: &BTreeMap<&str, u32>) -> cros_fdt::Result<()>;
 
     // Initialize a VM. Called after building the VM. Presently called before vCPUs are initialized.
     fn init_arch(
@@ -117,6 +113,23 @@ pub trait VcpuAArch64: Vcpu {
 
     /// Gets the value of a register on this VCPU.
     fn get_one_reg(&self, reg_id: VcpuRegAArch64) -> Result<u64>;
+
+    /// Sets the value of a Neon vector register (V0-V31) on this VCPU.
+    fn set_vector_reg(&self, reg_num: u8, data: u128) -> Result<()>;
+
+    /// Gets the value of a Neon vector register (V0-V31) on this VCPU.
+    fn get_vector_reg(&self, reg_num: u8) -> Result<u128>;
+
+    /// Gets the value of MPIDR_EL1 on this VCPU.
+    fn get_mpidr(&self) -> Result<u64> {
+        const RES1: u64 = 1 << 31;
+
+        // Assume that MPIDR_EL1.{U,MT} = {0,0}.
+
+        let aff = u64::try_from(self.id()).unwrap();
+
+        Ok(RES1 | aff)
+    }
 
     /// Gets the current PSCI version.
     fn get_psci_version(&self) -> Result<PsciVersion>;

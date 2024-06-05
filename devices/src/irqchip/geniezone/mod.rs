@@ -78,8 +78,8 @@ impl GeniezoneKernelIrqChip {
             dev_type: gzvm_device_type_GZVM_DEV_TYPE_ARM_VGIC_V3_DIST,
             id: 0,
             flags: 0,
-            dev_addr: dist_if_addr as u64,
-            dev_reg_size: AARCH64_GIC_DIST_SIZE as u64,
+            dev_addr: dist_if_addr,
+            dev_reg_size: AARCH64_GIC_DIST_SIZE,
             attr_addr: 0_u64,
             attr_size: 0_u64,
         };
@@ -96,8 +96,8 @@ impl GeniezoneKernelIrqChip {
             dev_type: gzvm_device_type_GZVM_DEV_TYPE_ARM_VGIC_V3_REDIST,
             id: 0,
             flags: 0,
-            dev_addr: redist_addr as u64,
-            dev_reg_size: AARCH64_GIC_REDIST_SIZE as u64,
+            dev_addr: redist_addr,
+            dev_reg_size: AARCH64_GIC_REDIST_SIZE,
             attr_addr: 0_u64,
             attr_size: 0_u64,
         };
@@ -214,8 +214,8 @@ impl IrqChip for GeniezoneKernelIrqChip {
 
     /// Return a vector of all registered irq numbers and their associated events and event
     /// indices. These should be used by the main thread to wait for irq events.
-    /// For the GeniezoneKernelIrqChip, the kernel handles listening to irq events being triggered by
-    /// devices, so this function always returns an empty Vec.
+    /// For the GeniezoneKernelIrqChip, the kernel handles listening to irq events being triggered
+    /// by devices, so this function always returns an empty Vec.
     fn irq_event_tokens(&self) -> Result<Vec<(IrqEventIndex, IrqEventSource, Event)>> {
         Ok(Vec::new())
     }

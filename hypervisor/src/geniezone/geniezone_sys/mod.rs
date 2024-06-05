@@ -4,12 +4,12 @@
 
 //! Bindings for the GZVM (Geniezone Hypervisor) API.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-#[cfg(any(target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub mod aarch64 {
     pub mod bindings;
     use base::ioctl_io_nr;
@@ -43,9 +43,9 @@ pub mod aarch64 {
     ioctl_iow_nr!(GZVM_ENABLE_CAP, GZVM_IOC_MAGIC, 0xa3, gzvm_enable_cap);
     ioctl_iow_nr!(GZVM_GET_ONE_REG, GZVM_IOC_MAGIC, 0xab, gzvm_one_reg);
     ioctl_iow_nr!(GZVM_SET_ONE_REG, GZVM_IOC_MAGIC, 0xac, gzvm_one_reg);
-
     ioctl_iowr_nr!(GZVM_CREATE_DEVICE, GZVM_IOC_MAGIC, 0xe0, gzvm_create_device);
+    ioctl_iow_nr!(GZVM_SET_DTB_CONFIG, GZVM_IOC_MAGIC, 0xff, gzvm_dtb_config);
 }
 
-#[cfg(any(target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub use aarch64::*;

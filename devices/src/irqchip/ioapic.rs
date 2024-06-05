@@ -19,7 +19,6 @@ use hypervisor::IoapicState;
 use hypervisor::MsiAddressMessage;
 use hypervisor::MsiDataMessage;
 use hypervisor::TriggerMode;
-use hypervisor::MAX_IOAPIC_PINS;
 use hypervisor::NUM_IOAPIC_PINS;
 use remain::sorted;
 use serde::Deserialize;
@@ -97,10 +96,10 @@ struct OutEventSnapshot {
 }
 
 /// Snapshot of [Ioapic] state. Some fields were intentionally excluded:
-/// * [Ioapic::resample_events]: these will get re-registered when the VM is
-///   created (e.g. prior to restoring a snapshot).
-/// * [Ioapic::out_events]: this isn't serializable as it contains Events.
-///   Replaced by [IoapicSnapshot::out_event_snapshots].
+/// * [Ioapic::resample_events]: these will get re-registered when the VM is created (e.g. prior to
+///   restoring a snapshot).
+/// * [Ioapic::out_events]: this isn't serializable as it contains Events. Replaced by
+///   [IoapicSnapshot::out_event_snapshots].
 /// * [Ioapic::irq_tube]: will be set up as part of creating the VM.
 ///
 /// See [Ioapic] for descriptions of fields by the same names.
@@ -132,8 +131,8 @@ pub struct Ioapic {
     ioregsel: u8,
     /// ioapicid register. Bits 24 - 27 contain the APIC ID for this device.
     ioapicid: u32,
-    /// Remote IRR for Edge Triggered Real Time Clock interrupts, which allows the CMOS to know when
-    /// one of its interrupts is being coalesced.
+    /// Remote IRR for Edge Triggered Real Time Clock interrupts, which allows the CMOS to know
+    /// when one of its interrupts is being coalesced.
     rtc_remote_irr: bool,
     /// Outgoing irq events that are used to inject MSI interrupts.
     /// Also contains the serializable form used for snapshotting.
@@ -214,7 +213,8 @@ impl BusDevice for Ioapic {
 
 impl Ioapic {
     pub fn new(irq_tube: Tube, num_pins: usize) -> Result<Ioapic> {
-        let num_pins = num_pins.max(NUM_IOAPIC_PINS).min(MAX_IOAPIC_PINS);
+        // TODO(dverkamp): clean this up once we are sure all callers use 24 pins.
+        assert_eq!(num_pins, NUM_IOAPIC_PINS);
         let mut entry = IoapicRedirectionTableEntry::new();
         entry.set_interrupt_mask(true);
         Ok(Ioapic {
@@ -228,32 +228,6 @@ impl Ioapic {
             interrupt_level: (0..num_pins).map(|_| false).collect(),
             irq_tube,
         })
-    }
-
-    pub fn init_direct_gsi<F>(&mut self, register_irqfd: F) -> Result<()>
-    where
-        F: Fn(u32, &Event) -> Result<()>,
-    {
-        for (gsi, out_event) in self.out_events.iter_mut().enumerate() {
-            let event = Event::new()?;
-            register_irqfd(gsi as u32, &event)?;
-            *out_event = Some(OutEvent {
-                irq_event: IrqEvent {
-                    gsi: gsi as u32,
-                    event,
-                    resample_event: None,
-                    source: IrqEventSource {
-                        device_id: CrosvmDeviceId::DirectGsi.into(),
-                        queue_id: 0,
-                        device_name: "direct_gsi".into(),
-                    },
-                },
-                // TODO(b/275124020): make sure this works with snapshotting by restoring
-                // the ioapic first, and then calling this function.
-                snapshot: None,
-            });
-        }
-        Ok(())
     }
 
     pub fn get_ioapic_state(&self) -> IoapicState {
@@ -678,7 +652,7 @@ impl Ioapic {
 }
 
 impl Suspendable for Ioapic {
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         serde_json::to_value(IoapicSnapshot {
             num_pins: self.num_pins,
             ioregsel: self.ioregsel,
@@ -764,10 +738,11 @@ enum IoapicError {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use hypervisor::DeliveryMode;
     use hypervisor::DeliveryStatus;
     use hypervisor::DestinationMode;
-    use std::thread;
 
     use super::*;
 
@@ -1287,7 +1262,7 @@ mod tests {
         // Creates an ioapic w/ an MSI for GSI = NUM_IOAPIC_PINS, MSI
         // address 0xa, and data 0xd. The irq index (pin number) is 10, but
         // this is not meaningful.
-        let saved_ioapic = set_up_with_irq(10, TriggerMode::Level);
+        let mut saved_ioapic = set_up_with_irq(10, TriggerMode::Level);
 
         // Take a snapshot of the ioapic.
         let snapshot = saved_ioapic.snapshot().unwrap();

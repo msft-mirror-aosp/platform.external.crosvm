@@ -18,14 +18,14 @@ set -eu
 common_device="$1"
 gpu_common="$2"
 serial="$3"
-block="$4"
-vvu="$5"
+net="$4"
+block="$5"
 vhost_user="$6"
 vhost_vsock="$7"
 # NOTE: We can't require all of the files to exist because aarch64 doesn't have
 # all of them.
-if ! [[ -f $common_device ]] || ! [[ -f $gpu_common ]] || ! [[ -f $serial ]]; then
-  echo "usage: $0 /path/to/common_device.policy /path/to/gpu_common.policy /path/to/serial.policy /path/to/block.policy /path/to/vvu.policy /path/to/vhost_user.policy <input.policy >output.policy"
+if ! [[ -f $common_device ]] || ! [[ -f $gpu_common ]] || ! [[ -f $serial ]] || ! [[ -f $net ]]; then
+  echo "usage: $0 /path/to/common_device.policy /path/to/gpu_common.policy /path/to/serial.policy/ /path/to/net.policy /path/to/block.policy /path/to/vhost_user.policy <input.policy >output.policy"
   exit 1
 fi
 
@@ -40,11 +40,11 @@ do
   elif echo "$line" | egrep "@include[[:space:]]+/usr/share/policy/crosvm/serial.policy" > /dev/null; then
     cat $serial
     continue
+  elif echo "$line" | egrep "@include[[:space:]]+/usr/share/policy/crosvm/net.policy" > /dev/null; then
+    cat $net
+    continue
   elif echo "$line" | egrep "@include[[:space:]]+/usr/share/policy/crosvm/block.policy" > /dev/null; then
     cat $block
-    continue
-  elif echo "$line" | egrep "@include[[:space:]]+/usr/share/policy/crosvm/vvu.policy" > /dev/null; then
-    cat $vvu
     continue
   elif echo "$line" | egrep "@include[[:space:]]+/usr/share/policy/crosvm/vhost_user.policy" > /dev/null; then
     cat $vhost_user

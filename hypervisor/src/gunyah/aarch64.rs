@@ -4,18 +4,18 @@
 
 use std::collections::BTreeMap;
 
-use cros_fdt::FdtWriter;
-use libc::ENOENT;
-use libc::ENOTSUP;
-use vm_memory::GuestAddress;
-use vm_memory::MemoryRegionInformation;
-use vm_memory::MemoryRegionOptions;
-use vm_memory::MemoryRegionPurpose;
-
 use base::error;
 use base::Error;
 use base::Result;
+use cros_fdt::Fdt;
+use cros_fdt::FdtNode;
+use libc::ENOENT;
+use libc::ENOTSUP;
+use vm_memory::GuestAddress;
+use vm_memory::MemoryRegionPurpose;
 
+use super::GunyahVcpu;
+use super::GunyahVm;
 use crate::Hypervisor;
 use crate::PsciVersion;
 use crate::VcpuAArch64;
@@ -23,31 +23,29 @@ use crate::VcpuRegAArch64;
 use crate::VmAArch64;
 use crate::PSCI_0_2;
 
-use super::GunyahVcpu;
-use super::GunyahVm;
-
 const GIC_FDT_IRQ_TYPE_SPI: u32 = 0;
 
 const IRQ_TYPE_EDGE_RISING: u32 = 0x00000001;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 0x00000004;
 
 fn fdt_create_shm_device(
-    fdt: &mut FdtWriter,
+    parent: &mut FdtNode,
     index: u32,
     guest_addr: GuestAddress,
-    options: MemoryRegionOptions,
 ) -> cros_fdt::Result<()> {
     let shm_name = format!("shm-{:x}", index);
-    let shm_node = fdt.begin_node(&shm_name)?;
-    fdt.property_string("vdevice-type", "shm")?;
-    fdt.property_null("peer-default")?;
-    fdt.property_u64("dma_base", 0)?;
-    let mem_node = fdt.begin_node("memory")?;
-    fdt.property_u32("label", index)?;
-    fdt.property_u32("#address-cells", 2)?;
-    fdt.property_u64("base", guest_addr.offset() as u64)?;
-    fdt.end_node(mem_node)?;
-    fdt.end_node(shm_node)
+    let shm_node = parent.subnode_mut(&shm_name)?;
+    shm_node.set_prop("vdevice-type", "shm")?;
+    shm_node.set_prop("peer-default", ())?;
+    shm_node.set_prop("dma_base", 0u64)?;
+    let mem_node = shm_node.subnode_mut("memory")?;
+    // We have to add the shm device for RM to accept the swiotlb memparcel.
+    // Memparcel is only used on android14-6.1. Once android14-6.1 is EOL
+    // we should be able to remove all the times we call fdt_create_shm_device()
+    mem_node.set_prop("optional", ())?;
+    mem_node.set_prop("label", index)?;
+    mem_node.set_prop("#address-cells", 2u32)?;
+    mem_node.set_prop("base", guest_addr.offset())
 }
 
 impl VmAArch64 for GunyahVm {
@@ -67,73 +65,58 @@ impl VmAArch64 for GunyahVm {
         Ok(Box::new(GunyahVm::create_vcpu(self, id)?))
     }
 
-    fn create_fdt(
-        &self,
-        fdt: &mut FdtWriter,
-        phandles: &BTreeMap<&str, u32>,
-    ) -> cros_fdt::Result<()> {
-        let top_node = fdt.begin_node("gunyah-vm-config")?;
+    fn create_fdt(&self, fdt: &mut Fdt, phandles: &BTreeMap<&str, u32>) -> cros_fdt::Result<()> {
+        let top_node = fdt.root_mut().subnode_mut("gunyah-vm-config")?;
 
-        fdt.property_string("image-name", "crosvm-vm")?;
-        fdt.property_string("os-type", "linux")?;
+        top_node.set_prop("image-name", "crosvm-vm")?;
+        top_node.set_prop("os-type", "linux")?;
 
-        let memory_node = fdt.begin_node("memory")?;
-        fdt.property_u32("#address-cells", 2)?;
-        fdt.property_u32("#size-cells", 2)?;
+        let memory_node = top_node.subnode_mut("memory")?;
+        memory_node.set_prop("#address-cells", 2u32)?;
+        memory_node.set_prop("#size-cells", 2u32)?;
 
         let mut base_set = false;
         let mut firmware_set = false;
-        self.guest_mem.with_regions(
-            |MemoryRegionInformation {
-                 guest_addr,
-                 options,
-                 ..
-             }| {
-                match options.purpose {
-                    MemoryRegionPurpose::GuestMemoryRegion => {
-                        // Assume first GuestMemoryRegion contains the payload
-                        if !base_set {
-                            base_set = true;
-                            fdt.property_u64("base-address", guest_addr.offset())
-                        } else {
-                            Ok(())
-                        }
+        for region in self.guest_mem.regions() {
+            match region.options.purpose {
+                MemoryRegionPurpose::GuestMemoryRegion => {
+                    // Assume first GuestMemoryRegion contains the payload
+                    if !base_set {
+                        base_set = true;
+                        memory_node.set_prop("base-address", region.guest_addr.offset())?;
                     }
-                    MemoryRegionPurpose::ProtectedFirmwareRegion => {
-                        if firmware_set {
-                            // Should only have one protected firmware memory region.
-                            error!("Multiple ProtectedFirmwareRegions unexpected.");
-                            unreachable!()
-                        }
-                        firmware_set = true;
-                        fdt.property_u64("firmware-address", guest_addr.offset())
-                    }
-                    _ => Ok(()),
                 }
-            },
-        )?;
+                MemoryRegionPurpose::ProtectedFirmwareRegion => {
+                    if firmware_set {
+                        // Should only have one protected firmware memory region.
+                        error!("Multiple ProtectedFirmwareRegions unexpected.");
+                        unreachable!()
+                    }
+                    firmware_set = true;
+                    memory_node.set_prop("firmware-address", region.guest_addr.offset())?;
+                }
+                _ => {}
+            }
+        }
 
-        fdt.end_node(memory_node)?;
+        let interrupts_node = top_node.subnode_mut("interrupts")?;
+        interrupts_node.set_prop("config", *phandles.get("intc").unwrap())?;
 
-        let interrupts_node = fdt.begin_node("interrupts")?;
-        fdt.property_u32("config", *phandles.get("intc").unwrap())?;
-        fdt.end_node(interrupts_node)?;
+        let vcpus_node = top_node.subnode_mut("vcpus")?;
+        vcpus_node.set_prop("affinity", "proxy")?;
 
-        let vcpus_node = fdt.begin_node("vcpus")?;
-        fdt.property_string("affinity", "proxy")?;
-        fdt.end_node(vcpus_node)?;
+        let vdev_node = top_node.subnode_mut("vdevices")?;
+        vdev_node.set_prop("generate", "/hypervisor")?;
 
-        let vdev_node = fdt.begin_node("vdevices")?;
-        fdt.property_string("generate", "/hypervisor")?;
         for irq in self.routes.lock().iter() {
             let bell_name = format!("bell-{:x}", irq.irq);
-            let bell_node = fdt.begin_node(&bell_name)?;
-            fdt.property_string("vdevice-type", "doorbell")?;
+            let bell_node = vdev_node.subnode_mut(&bell_name)?;
+            bell_node.set_prop("vdevice-type", "doorbell")?;
             let path_name = format!("/hypervisor/bell-{:x}", irq.irq);
-            fdt.property_string("generate", &path_name)?;
-            fdt.property_u32("label", irq.irq)?;
-            fdt.property_null("peer-default")?;
-            fdt.property_null("source-can-clear")?;
+            bell_node.set_prop("generate", path_name)?;
+            bell_node.set_prop("label", irq.irq)?;
+            bell_node.set_prop("peer-default", ())?;
+            bell_node.set_prop("source-can-clear", ())?;
 
             let interrupt_type = if irq.level {
                 IRQ_TYPE_LEVEL_HIGH
@@ -141,43 +124,33 @@ impl VmAArch64 for GunyahVm {
                 IRQ_TYPE_EDGE_RISING
             };
             let interrupts = [GIC_FDT_IRQ_TYPE_SPI, irq.irq, interrupt_type];
-            fdt.property_array_u32("interrupts", &interrupts)?;
-            fdt.end_node(bell_node)?;
+            bell_node.set_prop("interrupts", &interrupts)?;
         }
 
         let mut base_set = false;
-        self.guest_mem.with_regions(
-            |MemoryRegionInformation {
-                 index,
-                 guest_addr,
-                 options,
-                 ..
-             }| {
-                let create_shm_node = match options.purpose {
-                    MemoryRegionPurpose::GuestMemoryRegion => {
-                        // Assume first GuestMemoryRegion contains the payload
-                        // This memory region is described by the "base-address" property
-                        // and doesn't get re-described as a separate shm node.
-                        let ret = base_set;
-                        base_set = true;
-                        ret
-                    }
-                    // Described by the "firmware-address" property
-                    MemoryRegionPurpose::ProtectedFirmwareRegion => false,
-                    MemoryRegionPurpose::StaticSwiotlbRegion => true,
-                };
-
-                if create_shm_node {
-                    fdt_create_shm_device(fdt, index.try_into().unwrap(), guest_addr, options)?;
+        for region in self.guest_mem.regions() {
+            let create_shm_node = match region.options.purpose {
+                MemoryRegionPurpose::GuestMemoryRegion => {
+                    // Assume first GuestMemoryRegion contains the payload
+                    // This memory region is described by the "base-address" property
+                    // and doesn't get re-described as a separate shm node.
+                    let ret = base_set;
+                    base_set = true;
+                    ret
                 }
+                // Described by the "firmware-address" property
+                MemoryRegionPurpose::ProtectedFirmwareRegion => false,
+                MemoryRegionPurpose::StaticSwiotlbRegion => true,
+            };
 
-                Ok(())
-            },
-        )?;
-
-        fdt.end_node(vdev_node)?;
-
-        fdt.end_node(top_node)?;
+            if create_shm_node {
+                fdt_create_shm_device(
+                    vdev_node,
+                    region.index.try_into().unwrap(),
+                    region.guest_addr,
+                )?;
+            }
+        }
 
         Ok(())
     }
@@ -242,6 +215,14 @@ impl VcpuAArch64 for GunyahVcpu {
 
     fn get_one_reg(&self, _reg_id: VcpuRegAArch64) -> Result<u64> {
         Err(Error::new(ENOTSUP))
+    }
+
+    fn set_vector_reg(&self, _reg_num: u8, _data: u128) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn get_vector_reg(&self, _reg_num: u8) -> Result<u128> {
+        unimplemented!()
     }
 
     fn get_psci_version(&self) -> Result<PsciVersion> {

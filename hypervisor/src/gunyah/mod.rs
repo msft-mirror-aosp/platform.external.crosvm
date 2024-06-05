@@ -6,57 +6,47 @@
 mod aarch64;
 
 mod gunyah_sys;
-use gunyah_sys::*;
-
-use std::collections::HashSet;
-
-use std::cell::RefCell;
 use std::cmp::min;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
+use std::collections::HashSet;
 use std::ffi::CString;
-use std::mem::ManuallyDrop;
+use std::mem::size_of;
 use std::os::raw::c_ulong;
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-
-use std::mem::size_of;
-
-use crate::*;
 
 use base::errno_result;
 use base::info;
 use base::ioctl;
 use base::ioctl_with_ref;
 use base::ioctl_with_val;
+use base::linux::MemoryMappingBuilderUnix;
 use base::pagesize;
-use base::sys::BlockedSignal;
 use base::warn;
 use base::Error;
 use base::FromRawDescriptor;
 use base::MemoryMapping;
 use base::MemoryMappingBuilder;
-use base::MemoryMappingBuilderUnix;
 use base::MmapError;
 use base::RawDescriptor;
+use gunyah_sys::*;
 use libc::open;
-use libc::EBUSY;
 use libc::EFAULT;
 use libc::EINVAL;
 use libc::EIO;
 use libc::ENOENT;
 use libc::ENOSPC;
-use libc::ENOTSUP;
 use libc::EOVERFLOW;
 use libc::O_CLOEXEC;
 use libc::O_RDWR;
 use sync::Mutex;
-use vm_memory::MemoryRegionInformation;
 use vm_memory::MemoryRegionPurpose;
+
+use crate::*;
 
 pub struct Gunyah {
     gunyah: SafeDescriptor,
@@ -70,14 +60,16 @@ impl AsRawDescriptor for Gunyah {
 
 impl Gunyah {
     pub fn new_with_path(device_path: &Path) -> Result<Gunyah> {
-        // Open calls are safe because we give a nul-terminated string and verify the result.
         let c_path = CString::new(device_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY:
+        // Open calls are safe because we give a nul-terminated string and verify the result.
         let ret = unsafe { open(c_path.as_ptr(), O_RDWR | O_CLOEXEC) };
         if ret < 0 {
             return errno_result();
         }
-        // Safe because we verify that ret is valid and we own the fd.
         Ok(Gunyah {
+            // SAFETY:
+            // Safe because we verify that ret is valid and we own the fd.
             gunyah: unsafe { SafeDescriptor::from_raw_descriptor(ret) },
         })
     }
@@ -105,7 +97,7 @@ impl Hypervisor for Gunyah {
             HypervisorCap::StaticSwiotlbAllocationRequired => true,
             HypervisorCap::HypervisorInitializedBootContext => true,
             HypervisorCap::S390UserSigp | HypervisorCap::TscDeadlineTimer => false,
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             HypervisorCap::Xcrs | HypervisorCap::CalibratedTscLeafRequired => false,
         }
     }
@@ -145,6 +137,7 @@ unsafe fn android_lend_user_memory_region(
 // Wrapper around GH_SET_USER_MEMORY_REGION ioctl, which creates, modifies, or deletes a mapping
 // from guest physical to host user pages.
 //
+// SAFETY:
 // Safe when the guest regions are guaranteed not to overlap.
 unsafe fn set_user_memory_region(
     vm: &SafeDescriptor,
@@ -202,6 +195,7 @@ impl AsRawDescriptor for GunyahVm {
 
 impl GunyahVm {
     pub fn new(gh: &Gunyah, guest_mem: GuestMemory, cfg: Config) -> Result<GunyahVm> {
+        // SAFETY:
         // Safe because we know gunyah is a real gunyah fd as this module is the only one that can
         // make Gunyah objects.
         let ret = unsafe { ioctl_with_val(gh, GH_CREATE_VM(), 0 as c_ulong) };
@@ -209,55 +203,49 @@ impl GunyahVm {
             return errno_result();
         }
 
+        // SAFETY:
         // Safe because we verify that ret is valid and we own the fd.
         let vm_descriptor = unsafe { SafeDescriptor::from_raw_descriptor(ret) };
-        guest_mem.with_regions(
-            |MemoryRegionInformation {
-                 index,
-                 guest_addr,
-                 size,
-                 host_addr,
-                 options,
-                 ..
-             }| {
-                let lend = if cfg.protection_type.isolates_memory() {
-                    match options.purpose {
-                        MemoryRegionPurpose::GuestMemoryRegion => true,
-                        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                        MemoryRegionPurpose::ProtectedFirmwareRegion => true,
-                        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                        MemoryRegionPurpose::StaticSwiotlbRegion => false,
-                    }
-                } else {
-                    false
-                };
-                if lend {
-                    unsafe {
-                        // Safe because the guest regions are guarnteed not to overlap.
-                        android_lend_user_memory_region(
-                            &vm_descriptor,
-                            index as MemSlot,
-                            false,
-                            guest_addr.offset(),
-                            size.try_into().unwrap(),
-                            host_addr as *mut u8,
-                        )
-                    }
-                } else {
-                    unsafe {
-                        // Safe because the guest regions are guarnteed not to overlap.
-                        set_user_memory_region(
-                            &vm_descriptor,
-                            index as MemSlot,
-                            false,
-                            guest_addr.offset(),
-                            size.try_into().unwrap(),
-                            host_addr as *mut u8,
-                        )
-                    }
+        for region in guest_mem.regions() {
+            let lend = if cfg.protection_type.isolates_memory() {
+                match region.options.purpose {
+                    MemoryRegionPurpose::GuestMemoryRegion => true,
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::ProtectedFirmwareRegion => true,
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::StaticSwiotlbRegion => false,
                 }
-            },
-        )?;
+            } else {
+                false
+            };
+            if lend {
+                // SAFETY:
+                // Safe because the guest regions are guarnteed not to overlap.
+                unsafe {
+                    android_lend_user_memory_region(
+                        &vm_descriptor,
+                        region.index as MemSlot,
+                        false,
+                        region.guest_addr.offset(),
+                        region.size.try_into().unwrap(),
+                        region.host_addr as *mut u8,
+                    )?;
+                }
+            } else {
+                // SAFETY:
+                // Safe because the guest regions are guarnteed not to overlap.
+                unsafe {
+                    set_user_memory_region(
+                        &vm_descriptor,
+                        region.index as MemSlot,
+                        false,
+                        region.guest_addr.offset(),
+                        region.size.try_into().unwrap(),
+                        region.host_addr as *mut u8,
+                    )?;
+                }
+            }
+        }
 
         Ok(GunyahVm {
             gh: gh.try_clone()?,
@@ -282,16 +270,19 @@ impl GunyahVm {
             arg: &gh_fn_vcpu_arg as *const gh_fn_vcpu_arg as u64,
         };
 
+        // SAFETY:
         // Safe because we know that our file is a VM fd and we verify the return result.
         let fd = unsafe { ioctl_with_ref(self, GH_VM_ADD_FUNCTION(), &function_desc) };
         if fd < 0 {
             return errno_result();
         }
 
+        // SAFETY:
         // Wrap the vcpu now in case the following ? returns early. This is safe because we verified
         // the value of the fd and we own the fd.
         let vcpu = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
 
+        // SAFETY:
         // Safe because we know this is a Gunyah VCPU
         let res = unsafe { ioctl(&vcpu, GH_VCPU_MMAP_SIZE()) };
         if res < 0 {
@@ -308,8 +299,7 @@ impl GunyahVm {
             vm: self.vm.try_clone()?,
             vcpu,
             id,
-            run_mmap,
-            vcpu_run_handle_fingerprint: Default::default(),
+            run_mmap: Arc::new(run_mmap),
         })
     }
 
@@ -324,10 +314,12 @@ impl GunyahVm {
         let function_desc = gh_fn_desc {
             type_: GH_FN_IRQFD,
             arg_size: size_of::<gh_fn_irqfd_arg>() as u32,
+            // SAFETY:
             // Safe because kernel is expecting pointer with non-zero arg_size
             arg: &gh_fn_irqfd_arg as *const gh_fn_irqfd_arg as u64,
         };
 
+        // SAFETY: safe because the return value is checked.
         let ret = unsafe { ioctl_with_ref(self, GH_VM_ADD_FUNCTION(), &function_desc) };
         if ret == 0 {
             self.routes
@@ -339,8 +331,26 @@ impl GunyahVm {
         }
     }
 
-    pub fn unregister_irqfd(&self, _label: u32, _evt: &Event) -> Result<()> {
-        unimplemented!()
+    pub fn unregister_irqfd(&self, label: u32, _evt: &Event) -> Result<()> {
+        let gh_fn_irqfd_arg = gh_fn_irqfd_arg {
+            label,
+            ..Default::default()
+        };
+
+        let function_desc = gh_fn_desc {
+            type_: GH_FN_IRQFD,
+            arg_size: size_of::<gh_fn_irqfd_arg>() as u32,
+            // Safe because kernel is expecting pointer with non-zero arg_size
+            arg: &gh_fn_irqfd_arg as *const gh_fn_irqfd_arg as u64,
+        };
+
+        // SAFETY: safe because memory is not modified and the return value is checked.
+        let ret = unsafe { ioctl_with_ref(self, GH_VM_REMOVE_FUNCTION(), &function_desc) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            errno_result()
+        }
     }
 
     pub fn try_clone(&self) -> Result<Self>
@@ -364,6 +374,7 @@ impl GunyahVm {
             size: fdt_size.try_into().unwrap(),
         };
 
+        // SAFETY:
         // Safe because we know this is a Gunyah VM
         let ret = unsafe { ioctl_with_ref(self, GH_VM_SET_DTB_CONFIG(), &dtb_config) };
         if ret == 0 {
@@ -379,6 +390,7 @@ impl GunyahVm {
             size: fw_size,
         };
 
+        // SAFETY:
         // Safe because we know this is a Gunyah VM
         let ret = unsafe { ioctl_with_ref(self, GH_VM_ANDROID_SET_FW_CONFIG(), &fw_config) };
         if ret == 0 {
@@ -389,6 +401,7 @@ impl GunyahVm {
     }
 
     fn start(&self) -> Result<()> {
+        // SAFETY: safe because memory is not modified and the return value is checked.
         let ret = unsafe { ioctl(self, GH_VM_START()) };
         if ret == 0 {
             Ok(())
@@ -420,11 +433,12 @@ impl Vm for GunyahVm {
             // Strictly speaking, Gunyah supports pvclock, but Gunyah takes care
             // of it and crosvm doesn't need to do anything for it
             VmCap::PvClock => false,
-            VmCap::PvClockSuspend => false,
             VmCap::Protected => true,
             VmCap::EarlyInitCpuid => false,
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             VmCap::BusLockDetect => false,
+            VmCap::ReadOnlyMemoryRegion => false,
+            VmCap::MemNoncoherentDma => false,
         }
     }
 
@@ -442,6 +456,7 @@ impl Vm for GunyahVm {
         mem_region: Box<dyn MappedRegion>,
         read_only: bool,
         _log_dirty_pages: bool,
+        _cache: MemCacheType,
     ) -> Result<MemSlot> {
         let pgsz = pagesize() as u64;
         // Gunyah require to set the user memory region with page size aligned size. Safe to extend
@@ -461,12 +476,13 @@ impl Vm for GunyahVm {
             None => (regions.len() + self.guest_mem.num_regions() as usize) as MemSlot,
         };
 
+        // SAFETY: safe because memory is not modified and the return value is checked.
         let res = unsafe {
             set_user_memory_region(
                 &self.vm,
                 slot,
                 read_only,
-                guest_addr.offset() as u64,
+                guest_addr.offset(),
                 size,
                 mem_region.as_ptr(),
             )
@@ -525,7 +541,7 @@ impl Vm for GunyahVm {
                 None => (false, 0, 4),
             },
             Datamatch::U64(v) => match v {
-                Some(u) => (true, u as u64, 8),
+                Some(u) => (true, u, 8),
                 None => (false, 0, 8),
             },
         };
@@ -542,7 +558,7 @@ impl Vm for GunyahVm {
         };
 
         let gh_fn_ioeventfd_arg = gh_fn_ioeventfd_arg {
-            fd: evt.as_raw_descriptor() as i32,
+            fd: evt.as_raw_descriptor(),
             datamatch: datamatch_value,
             len: datamatch_len,
             addr: maddr,
@@ -556,6 +572,7 @@ impl Vm for GunyahVm {
             arg: &gh_fn_ioeventfd_arg as *const gh_fn_ioeventfd_arg as u64,
         };
 
+        // SAFETY: safe because memory is not modified and the return value is checked.
         let ret = unsafe { ioctl_with_ref(self, GH_VM_ADD_FUNCTION(), &function_desc) };
         if ret == 0 {
             Ok(())
@@ -567,10 +584,33 @@ impl Vm for GunyahVm {
     fn unregister_ioevent(
         &mut self,
         _evt: &Event,
-        _addr: IoEventAddress,
+        addr: IoEventAddress,
         _datamatch: Datamatch,
     ) -> Result<()> {
-        unimplemented!()
+        let maddr = if let IoEventAddress::Mmio(maddr) = addr {
+            maddr
+        } else {
+            todo!()
+        };
+
+        let gh_fn_ioeventfd_arg = gh_fn_ioeventfd_arg {
+            addr: maddr,
+            ..Default::default()
+        };
+
+        let function_desc = gh_fn_desc {
+            type_: GH_FN_IOEVENTFD,
+            arg_size: size_of::<gh_fn_ioeventfd_arg>() as u32,
+            arg: &gh_fn_ioeventfd_arg as *const gh_fn_ioeventfd_arg as u64,
+        };
+
+        // SAFETY: safe because memory is not modified and the return value is checked.
+        let ret = unsafe { ioctl_with_ref(self, GH_VM_REMOVE_FUNCTION(), &function_desc) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            errno_result()
+        }
     }
 
     fn handle_io_events(&self, _addr: IoEventAddress, _data: &[u8]) -> Result<()> {
@@ -615,11 +655,7 @@ impl Vm for GunyahVm {
         }
     }
 
-    fn handle_inflate(&mut self, _guest_address: GuestAddress, _size: u64) -> Result<()> {
-        unimplemented!()
-    }
-
-    fn handle_deflate(&mut self, _guest_address: GuestAddress, _size: u64) -> Result<()> {
+    fn handle_balloon_event(&mut self, _event: BalloonEvent) -> Result<()> {
         unimplemented!()
     }
 }
@@ -637,16 +673,23 @@ pub struct GunyahVcpu {
     vm: SafeDescriptor,
     vcpu: SafeDescriptor,
     id: usize,
-    run_mmap: MemoryMapping,
-    vcpu_run_handle_fingerprint: Arc<AtomicU64>,
+    run_mmap: Arc<MemoryMapping>,
 }
 
-pub(super) struct VcpuThread {
-    run: *mut gh_vcpu_run,
-    signal_num: Option<c_int>,
+struct GunyahVcpuSignalHandle {
+    run_mmap: Arc<MemoryMapping>,
 }
 
-thread_local!(static VCPU_THREAD: RefCell<Option<VcpuThread>> = RefCell::new(None));
+impl VcpuSignalHandleInner for GunyahVcpuSignalHandle {
+    fn signal_immediate_exit(&self) {
+        // SAFETY: we ensure `run_mmap` is a valid mapping of `kvm_run` at creation time, and the
+        // `Arc` ensures the mapping still exists while we hold a reference to it.
+        unsafe {
+            let run = self.run_mmap.as_ptr() as *mut gh_vcpu_run;
+            (*run).immediate_exit = 1;
+        }
+    }
+}
 
 impl AsRawDescriptor for GunyahVcpu {
     fn as_raw_descriptor(&self) -> RawDescriptor {
@@ -660,16 +703,12 @@ impl Vcpu for GunyahVcpu {
         Self: Sized,
     {
         let vcpu = self.vcpu.try_clone()?;
-        let run_mmap = MemoryMappingBuilder::new(self.run_mmap.size())
-            .from_descriptor(&vcpu)
-            .build()
-            .map_err(|_| Error::new(ENOSPC))?;
+
         Ok(GunyahVcpu {
             vm: self.vm.try_clone()?,
             vcpu,
             id: self.id,
-            run_mmap,
-            vcpu_run_handle_fingerprint: self.vcpu_run_handle_fingerprint.clone(),
+            run_mmap: self.run_mmap.clone(),
         })
     }
 
@@ -677,83 +716,24 @@ impl Vcpu for GunyahVcpu {
         self
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
-    fn take_run_handle(&self, signal_num: Option<c_int>) -> Result<VcpuRunHandle> {
-        fn vcpu_run_handle_drop() {
-            VCPU_THREAD.with(|v| {
-                // This assumes that a failure in `BlockedSignal::new` means the signal is already
-                // blocked and there it should not be unblocked on exit.
-                let _blocked_signal = &(*v.borrow())
-                    .as_ref()
-                    .and_then(|state| state.signal_num)
-                    .map(BlockedSignal::new);
-
-                *v.borrow_mut() = None;
-            });
-        }
-
-        // Prevent `vcpu_run_handle_drop` from being called until we actually setup the signal
-        // blocking. The handle needs to be made now so that we can use the fingerprint.
-        let vcpu_run_handle = ManuallyDrop::new(VcpuRunHandle::new(vcpu_run_handle_drop));
-
-        // AcqRel ordering is sufficient to ensure only one thread gets to set its fingerprint to
-        // this Vcpu and subsequent `run` calls will see the fingerprint.
-        if self
-            .vcpu_run_handle_fingerprint
-            .compare_exchange(
-                0,
-                vcpu_run_handle.fingerprint().as_u64(),
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return Err(Error::new(EBUSY));
-        }
-
-        // Block signal while we add -- if a signal fires (very unlikely,
-        // as this means something is trying to pause the vcpu before it has
-        // even started) it'll try to grab the read lock while this write
-        // lock is grabbed and cause a deadlock.
-        // Assuming that a failure to block means it's already blocked.
-        let _blocked_signal = signal_num.map(BlockedSignal::new);
-
-        VCPU_THREAD.with(|v| {
-            if v.borrow().is_none() {
-                *v.borrow_mut() = Some(VcpuThread {
-                    run: self.run_mmap.as_ptr() as *mut gh_vcpu_run,
-                    signal_num,
-                });
-                Ok(())
-            } else {
-                Err(Error::new(EBUSY))
-            }
-        })?;
-
-        Ok(ManuallyDrop::into_inner(vcpu_run_handle))
-    }
-
-    fn run(&mut self, run_handle: &VcpuRunHandle) -> Result<VcpuExit> {
-        if self
-            .vcpu_run_handle_fingerprint
-            .load(std::sync::atomic::Ordering::Acquire)
-            != run_handle.fingerprint().as_u64()
-        {
-            panic!("invalid VcpuRunHandle used to run Vcpu");
-        }
-
+    fn run(&mut self) -> Result<VcpuExit> {
+        // SAFETY:
         // Safe because we know our file is a VCPU fd and we verify the return result.
         let ret = unsafe { ioctl(self, GH_VCPU_RUN()) };
         if ret != 0 {
             return errno_result();
         }
 
+        // SAFETY:
         // Safe because we know we mapped enough memory to hold the gh_vcpu_run struct
         // because the kernel told us how large it is.
         let run = unsafe { &mut *(self.run_mmap.as_ptr() as *mut gh_vcpu_run) };
         match run.exit_reason {
             GH_VCPU_EXIT_MMIO => Ok(VcpuExit::Mmio),
             GH_VCPU_EXIT_STATUS => {
+                // SAFETY:
+                // Safe because the exit_reason (which comes from the kernel) told us which
+                // union field to use.
                 let status = unsafe { &mut run.__bindgen_anon_1.status };
                 match status.status {
                     GH_VM_STATUS_GH_VM_STATUS_LOAD_FAILED => Ok(VcpuExit::FailEntry {
@@ -795,6 +775,7 @@ impl Vcpu for GunyahVcpu {
     }
 
     fn set_immediate_exit(&self, exit: bool) {
+        // SAFETY:
         // Safe because we know we mapped enough memory to hold the kvm_run struct because the
         // kernel told us how large it was. The pointer is page aligned so casting to a different
         // type is well defined, hence the clippy allow attribute.
@@ -802,33 +783,23 @@ impl Vcpu for GunyahVcpu {
         run.immediate_exit = exit.into();
     }
 
-    fn set_local_immediate_exit(exit: bool)
-    where
-        Self: Sized,
-    {
-        VCPU_THREAD.with(|v| {
-            if let Some(state) = &(*v.borrow()) {
-                unsafe {
-                    (*state.run).immediate_exit = exit.into();
-                };
-            }
-        });
-    }
-
-    fn set_local_immediate_exit_fn(&self) -> extern "C" fn() {
-        extern "C" fn f() {
-            GunyahVcpu::set_local_immediate_exit(true);
+    fn signal_handle(&self) -> VcpuSignalHandle {
+        VcpuSignalHandle {
+            inner: Box::new(GunyahVcpuSignalHandle {
+                run_mmap: self.run_mmap.clone(),
+            }),
         }
-        f
     }
 
     fn handle_mmio(&self, handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()> {
+        // SAFETY:
         // Safe because we know we mapped enough memory to hold the gh_vcpu_run struct because the
         // kernel told us how large it was. The pointer is page aligned so casting to a different
         // type is well defined
         let run = unsafe { &mut *(self.run_mmap.as_ptr() as *mut gh_vcpu_run) };
         // Verify that the handler is called in the right context.
         assert!(run.exit_reason == GH_VCPU_EXIT_MMIO);
+        // SAFETY:
         // Safe because the exit_reason (which comes from the kernel) told us which
         // union field to use.
         let mmio = unsafe { &mut run.__bindgen_anon_1.mmio };
@@ -869,12 +840,8 @@ impl Vcpu for GunyahVcpu {
         unreachable!()
     }
 
-    fn pvclock_ctrl(&self) -> Result<()> {
-        Err(Error::new(ENOTSUP))
-    }
-
-    fn set_signal_mask(&self, _signals: &[c_int]) -> Result<()> {
-        unimplemented!()
+    fn on_suspend(&self) -> Result<()> {
+        Ok(())
     }
 
     unsafe fn enable_raw_capability(&self, _cap: u32, _args: &[u64; 4]) -> Result<()> {

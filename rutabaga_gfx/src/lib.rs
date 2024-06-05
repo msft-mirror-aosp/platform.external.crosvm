@@ -17,6 +17,7 @@ mod rutabaga_2d;
 mod rutabaga_core;
 mod rutabaga_gralloc;
 mod rutabaga_os;
+mod rutabaga_snapshot;
 mod rutabaga_utils;
 mod virgl_renderer;
 
@@ -28,6 +29,7 @@ pub use crate::rutabaga_gralloc::DrmFormat;
 pub use crate::rutabaga_gralloc::ImageAllocationInfo;
 pub use crate::rutabaga_gralloc::ImageMemoryRequirements;
 pub use crate::rutabaga_gralloc::RutabagaGralloc;
+pub use crate::rutabaga_gralloc::RutabagaGrallocBackendFlags;
 pub use crate::rutabaga_gralloc::RutabagaGrallocFlags;
 pub use crate::rutabaga_os::AsRawDescriptor;
 pub use crate::rutabaga_os::FromRawDescriptor as RutabagaFromRawDescriptor;

@@ -5,18 +5,15 @@
 pub mod sys;
 use std::any::Any;
 use std::pin::Pin;
-use std::sync::Mutex;
 
 use base::RawDescriptor;
 use cros_async::Executor;
 use futures::Future;
 pub use sys::VhostUserListener;
-use vmm_vhost::VhostUserSlaveReqHandler;
 
 use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
-use crate::virtio::vhost::user::device::handler::VhostUserBackend;
-use crate::virtio::vhost::user::device::handler::VhostUserPlatformOps;
-use crate::virtio::vhost::user::VhostUserDevice;
+use crate::virtio::vhost::user::device::handler::VhostUserDevice;
+use crate::virtio::vhost::user::VhostUserDeviceBuilder;
 
 /// Trait that the platform-specific type `VhostUserListener` needs to implement. It contains all
 /// the methods that are ok to call from non-platform specific code.
@@ -24,12 +21,10 @@ pub trait VhostUserListenerTrait {
     /// Creates a VhostUserListener from `path`, which is a platform-specific string describing how
     /// to establish the vhost-user channel. For instance, it can be a path to a socket.
     ///
-    /// `max_num_queues` is the maximum number of queues we will supports through this channel.
     /// `keep_rds` is a vector of `RawDescriptor`s to which the descriptors needed for this listener
     /// to operate properly will be added if it is `Some()`.
     fn new(
         path: &str,
-        max_num_queues: usize,
         keep_rds: Option<&mut Vec<RawDescriptor>>,
     ) -> anyhow::Result<VhostUserListener>;
 
@@ -51,18 +46,13 @@ pub trait VhostUserListenerTrait {
         None
     }
 
-    /// Returns a `Future` that processes requests for a `VhostUserSlaveReqHandler`. The future
-    /// exits when the front-end side disconnects or an error occurs.
-    ///
-    /// The `VhostUserSlaveReqHandler` is built from `handler_builder` after being passed the ops
-    /// that correspond to the kind of transport used for vhost-user.
-    fn run_req_handler<'e, F>(
+    /// Returns a `Future` that processes requests for `handler`. The future exits when the
+    /// front-end side disconnects or an error occurs.
+    fn run_req_handler<'e>(
         self,
-        handler_builder: F,
+        handler: Box<dyn vmm_vhost::Backend>,
         ex: &'e Executor,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'e>>
-    where
-        F: FnOnce(Box<dyn VhostUserPlatformOps>) -> Box<dyn VhostUserSlaveReqHandler> + 'e;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'e>>;
 
     /// Returns a `Future` that will process requests from `backend` when polled. The future exits
     /// when the front-end side disconnects or an error occurs.
@@ -70,27 +60,21 @@ pub trait VhostUserListenerTrait {
     /// This is a legacy way to run devices - prefer `run_device`.
     fn run_backend<'e>(
         self,
-        backend: Box<dyn VhostUserBackend>,
+        backend: impl VhostUserDevice + 'static,
         ex: &'e Executor,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'e>>
     where
         Self: Sized,
     {
-        self.run_req_handler(
-            |ops| {
-                Box::new(Mutex::new(DeviceRequestHandler::new(backend, ops)))
-                    as Box<dyn VhostUserSlaveReqHandler>
-            },
-            ex,
-        )
+        self.run_req_handler(Box::new(DeviceRequestHandler::new(backend)), ex)
     }
 
     /// Start processing requests for a `VhostUserDevice` on `listener`. Returns when the front-end
     /// side disconnects or an error occurs.
-    fn run_device(self, ex: Executor, device: Box<dyn VhostUserDevice>) -> anyhow::Result<()>
+    fn run_device(self, ex: Executor, device: Box<dyn VhostUserDeviceBuilder>) -> anyhow::Result<()>
     where
         Self: Sized,
     {
-        ex.run_until(self.run_req_handler(|ops| device.into_req_handler(ops, &ex).unwrap(), &ex))?
+        ex.run_until(self.run_req_handler(device.build(&ex).unwrap(), &ex))?
     }
 }

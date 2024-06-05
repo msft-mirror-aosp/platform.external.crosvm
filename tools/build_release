@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, NamedTuple
 
 from impl.common import CROSVM_ROOT, Triple, verbose
+from impl.test_config import DO_NOT_BUILD_RISCV64
 
 USAGE = """\
 Build crosvm with release (optimized) profile.
@@ -134,6 +135,9 @@ def main():
         help="Output in JSON instead of human readable format.",
     )
     parser.add_argument("--strip", action="store_true", help="Strip output binaries")
+    parser.add_argument(
+        "--build-profile", help="Select compile profile, default to release.", default="release"
+    )
     pgo_group = parser.add_mutually_exclusive_group()
     pgo_group.add_argument(
         "--profile-generate",
@@ -158,13 +162,20 @@ def main():
     build_target = Triple.from_shorthand(args.build_target) if args.build_target else None
     build_target = build_target or Triple.host_default()
 
+    exclude_args = [
+        f"--exclude={x}" for x in PGO_EXCLUDE if args.profile_generate or args.profile_use
+    ]
+    if build_target == Triple.from_shorthand("riscv64"):
+        exclude_args += ["--exclude=" + s for s in DO_NOT_BUILD_RISCV64]
+
     features = build_target.feature_flag
     cargo_args = [
-        "--release",
+        "--profile",
+        args.build_profile,
         "--features=" + features,
         f"--target={build_target}",
         "--workspace",
-        *[f"--exclude={x}" for x in PGO_EXCLUDE if args.profile_generate or args.profile_use],
+        *exclude_args,
         *args.cargo_arguments,
     ]
 

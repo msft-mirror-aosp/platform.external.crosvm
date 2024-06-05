@@ -9,11 +9,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#if defined(__WIN32__)
-struct iovec {
-    void *iov_base; /* Starting address */
-    size_t iov_len; /* Length in bytes */
-};
+#if defined(_WIN32)
+struct iovec;
 #else
 #include <sys/uio.h>
 #endif
@@ -30,7 +27,20 @@ extern "C" {
  */
 #define RUTABAGA_VERSION_MAJOR 0
 #define RUTABAGA_VERSION_MINOR 1
-#define RUTABAGA_VERSION_PATCH 1
+#define RUTABAGA_VERSION_PATCH 3
+
+/**
+ * Rutabaga capsets.
+ */
+#define RUTABAGA_CAPSET_VIRGL 1
+#define RUTABAGA_CAPSET_VIRGL2 2
+#define RUTABAGA_CAPSET_GFXSTREAM_VULKAN 3
+#define RUTABAGA_CAPSET_VENUS 4
+#define RUTABAGA_CAPSET_CROSS_DOMAIN 5
+#define RUTABAGA_CAPSET_DRM 6
+#define RUTABAGA_CAPSET_GFXSTREAM_MAGMA 7
+#define RUTABAGA_CAPSET_GFXSTREAM_GLES 8
+#define RUTABAGA_CAPSET_GFXSTREAM_COMPOSER 9
 
 /**
  * Blob resource creation parameters.
@@ -44,32 +54,20 @@ extern "C" {
 #define RUTABAGA_BLOB_FLAG_USE_CROSS_DEVICE 4
 
 /**
- * Rutabaga capsets.
- */
-#define RUTABAGA_CAPSET_VIRGL 1
-#define RUTABAGA_CAPSET_VIRGL2 2
-#define RUTABAGA_CAPSET_GFXSTREAM 3
-#define RUTABAGA_CAPSET_VENUS 4
-#define RUTABAGA_CAPSET_CROSS_DOMAIN 5
-#define RUTABAGA_CAPSET_DRM 6
-
-/**
  * Mapped memory caching flags (see virtio_gpu spec)
  */
-#define RUTABAGA_MAP_CACHE_CACHED 1
-#define RUTABAGA_MAP_CACHE_UNCACHED 2
-#define RUTABAGA_MAP_CACHE_WC 3
+#define RUTABAGA_MAP_CACHE_MASK 0x0f
+#define RUTABAGA_MAP_CACHE_CACHED 0x01
+#define RUTABAGA_MAP_CACHE_UNCACHED 0x02
+#define RUTABAGA_MAP_CACHE_WC 0x03
 
 /**
- * Rutabaga flags for creating fences.
+ * Mapped memory access flags (not in virtio_gpu spec)
  */
-#define RUTABAGA_FLAG_FENCE (1 << 0)
-#define RUTABAGA_FLAG_INFO_RING_IDX (1 << 1)
-
-/**
- * Rutabaga channel types
- */
-#define RUTABAGA_CHANNEL_TYPE_WAYLAND 1
+#define RUTABAGA_MAP_ACCESS_MASK 0xf0
+#define RUTABAGA_MAP_ACCESS_READ 0x10
+#define RUTABAGA_MAP_ACCESS_WRITE 0x20
+#define RUTABAGA_MAP_ACCESS_RW 0x30
 
 /**
  * Rutabaga handle types
@@ -78,19 +76,38 @@ extern "C" {
 #define RUTABAGA_MEM_HANDLE_TYPE_DMABUF 0x2
 #define RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_WIN32 0x3
 #define RUTABAGA_MEM_HANDLE_TYPE_SHM 0x4
+#define RUTABAGA_MEM_HANDLE_TYPE_ZIRCON 0x5
 
-#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD 0x10
-#define RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD 0x20
-#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x40
+#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD 0x6
+#define RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD 0x7
+#define RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32 0x8
+#define RUTABAGA_FENCE_HANDLE_TYPE_ZIRCON 0x9
+
+/**
+ * Rutabaga channel types
+ */
+#define RUTABAGA_CHANNEL_TYPE_WAYLAND 1
+
+/**
+ * Rutabaga WSI
+ */
+#define RUTABAGA_WSI_SURFACELESS 0x1
+
+/**
+ * Rutabaga flags for creating fences.
+ */
+#define RUTABAGA_FLAG_FENCE (1 << 0)
+#define RUTABAGA_FLAG_INFO_RING_IDX (1 << 1)
+#define RUTABAGA_FLAG_FENCE_SHAREABLE (1 << 2)
+
+/**
+ * Rutabaga Debug
+ */
+#define RUTABAGA_DEBUG_ERROR 0x1
+#define RUTABAGA_DEBUG_WARN 0x2
+#define RUTABAGA_DEBUG_INFO 0x3
 
 struct rutabaga;
-
-struct rutabaga_fence {
-    uint32_t flags;
-    uint64_t fence_id;
-    uint32_t ctx_id;
-    uint32_t ring_idx;
-};
 
 struct rutabaga_create_blob {
     uint32_t blob_mem;
@@ -136,8 +153,20 @@ struct rutabaga_handle {
 };
 
 struct rutabaga_mapping {
-    uint64_t ptr;
+    void *ptr;
     uint64_t size;
+};
+
+struct rutabaga_command {
+    uint32_t ctx_id;
+    uint32_t cmd_size;
+    uint8_t *cmd;
+
+    /**
+     * Unstable, don't use until version > 0.1.3
+     */
+    uint32_t num_in_fences;
+    uint64_t *fence_ids;
 };
 
 /**
@@ -153,22 +182,60 @@ struct rutabaga_channels {
     size_t num_channels;
 };
 
+struct rutabaga_fence {
+    uint32_t flags;
+    uint64_t fence_id;
+    uint32_t ctx_id;
+    uint32_t ring_idx;
+};
+
+struct rutabaga_debug {
+    uint32_t debug_type;
+    const char *message;
+};
+
 /**
  * Throwing an exception inside this callback is not allowed.
  */
-typedef void (*write_fence_cb)(uint64_t user_data, struct rutabaga_fence fence_data);
+typedef void (*rutabaga_fence_callback)(uint64_t user_data, const struct rutabaga_fence *fence);
+
+/**
+ * # Safety
+ * - Throwing an exception inside this callback is not allowed.
+ * - `rutabaga_debug` and contained values only valid for the duration of callback.
+ */
+typedef void (*rutabaga_debug_callback)(uint64_t user_data, const struct rutabaga_debug *debug);
 
 struct rutabaga_builder {
     // Required for correct functioning
     uint64_t user_data;
     uint64_t capset_mask;
-    write_fence_cb fence_cb;
+    uint64_t wsi;
+    rutabaga_fence_callback fence_cb;
+
+    // Optional for debugging.
+    rutabaga_debug_callback debug_cb;
 
     // Optional and platform specific
     struct rutabaga_channels *channels;
+
+    // Optional, renderer specific, null-terminated C-string.
+    const char *renderer_features;
 };
 
 /**
+ * Expects `capset_names` to delimited by a colon, i.e.: "gfxstream:cross_domain:magma".
+ *
+ * # Safety
+ * - - `capset_names` must be a null-terminated C-string.
+ */
+int32_t rutabaga_calculate_capset_mask(const char *capset_names, uint64_t *capset_mask);
+
+/**
+ * Initialize rutabaga.
+ *
+ * All API calls using `ptr` must on the same thread that called `rutabaga_init`.
+ *
  * # Safety
  * - If `(*builder).channels` is not null, the caller must ensure `(*channels).channels` points to
  *   a valid array of `struct rutabaga_channel` of size `(*channels).num_channels`.
@@ -218,7 +285,7 @@ int32_t rutabaga_resource_create_3d(struct rutabaga *ptr, uint32_t resource_id,
  * - If `iovecs` is not null, the caller must ensure `(*iovecs).iovecs` points to a valid array of
  *   iovecs of size `(*iovecs).num_iovecs`.
  * - Each iovec must point to valid memory starting at `iov_base` with length `iov_len`.
- * - Each iovec must valid until the resource's backing is explictly detached or the resource is
+ * - Each iovec must valid until the resource's backing is explicitly detached or the resource is
  *   is unreferenced.
  */
 int32_t rutabaga_resource_attach_backing(struct rutabaga *ptr, uint32_t resource_id,
@@ -244,8 +311,8 @@ int32_t rutabaga_resource_transfer_write(struct rutabaga *ptr, uint32_t ctx_id,
  * - If `iovecs` is not null, the caller must ensure `(*iovecs).iovecs` points to a valid array of
  *   iovecs of size `(*iovecs).num_iovecs`.
  * - If `handle` is not null, the caller must ensure it is a valid OS-descriptor.  Ownership is
- *   transfered to rutabaga.
- * - Each iovec must valid until the resource's backing is explictly detached or the resource is
+ *   transferred to rutabaga.
+ * - Each iovec must valid until the resource's backing is explicitly detached or the resource is
  *   is unreferenced.
  */
 int32_t rutabaga_resource_create_blob(struct rutabaga *ptr, uint32_t ctx_id, uint32_t resource_id,
@@ -271,12 +338,31 @@ int32_t rutabaga_resource_map_info(struct rutabaga *ptr, uint32_t resource_id, u
 
 /**
  * # Safety
- * - `commands` must point to a contiguous memory region of `size` bytes.
+ * - `cmd` must be not null
+ * - `cmd->cmd` point to a contiguous memory region of `cmd_size` bytes.
+ * - `cmd->fence_ids` must point to a contiguous array of `num_in_fences` elements
  */
-int32_t rutabaga_submit_command(struct rutabaga *ptr, uint32_t ctx_id, uint8_t *commands,
-                                size_t size);
+int32_t rutabaga_submit_command(struct rutabaga *ptr, struct rutabaga_command *cmd);
 
 int32_t rutabaga_create_fence(struct rutabaga *ptr, const struct rutabaga_fence *fence);
+
+/**
+ * Write a snapshot to `dir`. The directory is expected to already exist and to be empty.
+ *
+ * # Safety
+ * - `dir` must be a null-terminated C-string.
+ * - Unstable, don't use until version > 0.1.3
+ */
+int32_t rutabaga_snapshot(struct rutabaga *ptr, const char *dir);
+
+/**
+ * Restore from a snapshot at `dir`.
+ *
+ * # Safety
+ * - `dir` must be a null-terminated C-string.
+ * - Unstable, don't use until version > 0.1.3
+ */
+int32_t rutabaga_restore(struct rutabaga *ptr, const char *dir);
 
 #ifdef __cplusplus
 }

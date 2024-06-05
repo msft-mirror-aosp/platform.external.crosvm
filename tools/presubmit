@@ -3,6 +3,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+import os
 import typing
 from typing import Generator, List, Literal, Optional, Tuple
 
@@ -13,7 +14,6 @@ from impl.common import (
     argh,
     chdir,
     cmd,
-    is_kiwi_repo,
     run_main,
 )
 from impl.presubmit import Check, CheckContext, run_checks, Group
@@ -49,7 +49,8 @@ def platform_is_supported(platform: Platform):
 def check_python_tests(_: CheckContext):
     "Runs unit tests for python dev tooling."
     PYTHON_TESTS = [
-        "tests.cl_tests",
+        # Disabled due to b/309148074
+        # "tests.cl_tests",
         "impl.common",
     ]
     return [python.with_cwd(TOOLS_ROOT).with_args("-m", file) for file in PYTHON_TESTS]
@@ -84,22 +85,28 @@ def check_markdown_format(context: CheckContext):
 
 def check_rust_format(context: CheckContext):
     "Runs rustfmt on all modified files."
-    if context.nightly_fmt:
-        rustfmt = cmd(
-            cmd("rustup +nightly which rustfmt"),
-            "--config imports_granularity=item,group_imports=StdExternalCrate",
-        )
-    else:
-        rustfmt = cmd(cmd("rustup which rustfmt"))
-    return rustfmt.with_color_flag().with_args(
-        "--check" if not context.fix else "",
-        *context.modified_files,
+    rustfmt = cmd(cmd("rustup +nightly which rustfmt").stdout())
+    # Windows doesn't accept very long arguments: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa#:~:text=The%20maximum%20length%20of%20this%20string%20is%2032%2C767%20characters%2C%20including%20the%20Unicode%20terminating%20null%20character.%20If%20lpApplicationName%20is%20NULL%2C%20the%20module%20name%20portion%20of%20lpCommandLine%20is%20limited%20to%20MAX_PATH%20characters.
+    return list(
+        rustfmt.with_color_flag()
+        .with_args("--check" if not context.fix else "")
+        .foreach(context.modified_files, batch_size=10)
     )
 
 
 def check_cargo_doc(_: CheckContext):
     "Runs cargo-doc and verifies that no warnings are emitted."
     return cmd("./tools/cargo-doc").with_env("RUSTDOCFLAGS", "-D warnings").with_color_flag()
+
+
+def check_doc_tests(_: CheckContext):
+    "Runs cargo doc tests. These cannot be run via nextest and run_tests."
+    return cmd(
+        "cargo test",
+        "--doc",
+        "--workspace",
+        "--features=all-x86_64",
+    ).with_color_flag()
 
 
 def check_mdbook(_: CheckContext):
@@ -112,11 +119,12 @@ def check_crosvm_tests(platform: Platform):
         if not platform_is_supported(platform):
             return None
         dut = None
-        if platform == "x86_64":
-            dut = "--dut=host"
-        elif platform == "aarch64":
-            dut = "--dut=vm"
-        return cmd("./tools/run_tests --platform", platform, dut).with_color_flag()
+        if os.access("/dev/kvm", os.W_OK):
+            if platform == "x86_64":
+                dut = "--dut=vm"
+            elif platform == "aarch64":
+                dut = "--dut=vm"
+        return cmd("./tools/run_tests --verbose --platform", platform, dut).with_color_flag()
 
     check.__doc__ = f"Runs all crosvm tests for {platform}."
 
@@ -127,19 +135,22 @@ def check_crosvm_unit_tests(platform: Platform):
     def check(_: CheckContext):
         if not platform_is_supported(platform):
             return None
-        return cmd("./tools/run_tests --platform", platform).with_color_flag()
+        return cmd("./tools/run_tests --verbose --platform", platform).with_color_flag()
 
     check.__doc__ = f"Runs crosvm unit tests for {platform}."
 
     return check
 
 
-def check_crosvm_build(platform: Platform, features: Optional[str]):
+def check_crosvm_build(
+    platform: Platform, features: Optional[str] = None, no_default_features: bool = False
+):
     def check(_: CheckContext):
         return cmd(
-            "./tools/run_tests --no-run --platform",
+            "./tools/run_tests --no-run --verbose --platform",
             platform,
             f"--features={features}" if features is not None else None,
+            "--no-default-features" if no_default_features else None,
         ).with_color_flag()
 
     check.__doc__ = f"Builds crosvm for {platform} with features {features}."
@@ -160,18 +171,6 @@ def check_clippy(platform: Platform):
     check.__doc__ = f"Runs clippy for {platform}."
 
     return check
-
-
-def check_infra_configs(context: CheckContext):
-    "Validate luci configs by sending them to luci-config."
-    # TODO: Validate config files. Requires authentication with luci inside docker.
-    return [lucicfg("fmt --dry-run", file) for file in context.modified_files]
-
-
-def check_infra_tests(_: CheckContext):
-    "Run recipe.py tests, all of them, regardless of which files were modified."
-    recipes = cmd("infra/recipes.py").with_path_env("third_party/depot_tools")
-    return recipes("test run")
 
 
 def custom_check(name: str, can_fix: bool = False):
@@ -213,6 +212,11 @@ CHECKS: List[Check] = [
         priority=True,
     ),
     Check(
+        check_doc_tests,
+        files=["**.rs", "**Cargo.toml"],
+        priority=True,
+    ),
+    Check(
         check_python_tests,
         files=["tools/**.py"],
         python_tools=True,
@@ -221,7 +225,11 @@ CHECKS: List[Check] = [
     Check(
         check_python_types,
         files=["tools/**.py"],
-        exclude=["tools/windows/*"],
+        exclude=[
+            "tools/windows/*",
+            "tools/contrib/memstats_chart/*",
+            "tools/contrib/cros_tracing_analyser/*",
+        ],
         python_tools=True,
     ),
     Check(
@@ -240,12 +248,6 @@ CHECKS: List[Check] = [
         ],
         can_fix=True,
     ),
-    Check(
-        check_crosvm_build("x86_64", features="direct"),
-        custom_name=f"crosvm_build_direct",
-        files=["**.rs"],
-        priority=True,
-    ),
     *(
         Check(
             check_crosvm_build(platform, features="default"),
@@ -254,6 +256,17 @@ CHECKS: List[Check] = [
             priority=True,
         )
         for platform in PLATFORMS
+    ),
+    *(
+        Check(
+            check_crosvm_build(platform, features="", no_default_features=True),
+            custom_name=f"crosvm_build_no_default_{platform}",
+            files=["**.rs"],
+            priority=True,
+        )
+        # TODO: b/260607247 crosvm does not compile with no-default-features on mingw64
+        for platform in PLATFORMS
+        if platform != "mingw64"
     ),
     *(
         Check(
@@ -319,27 +332,11 @@ CHECKS: List[Check] = [
             "**.min.js",
             "**.drawio",
             "**.json",
+            "**.dtb",
+            "**.dtbo",
         ],
     ),
 ]
-
-# We disable LUCI infra related tests because kokoro doesn't have internet connectivity that
-# the tests rely on.
-if not is_kiwi_repo():
-    CHECKS.extend(
-        [
-            Check(
-                check_infra_configs,
-                files=["infra/config/**.star"],
-                can_fix=True,
-            ),
-            Check(
-                check_infra_tests,
-                files=["infra/**.py"],
-                can_fix=True,
-            ),
-        ]
-    )
 
 ####################################################################################################
 # Group configuration
@@ -353,7 +350,7 @@ GROUPS: List[Group] = [
         name="default",
         doc="Checks run by default",
         checks=[
-            "health_checks",
+            "default_health_checks",
             # Run only one task per platform to prevent blocking on the build cache.
             "crosvm_tests_x86_64",
             "crosvm_unit_tests_aarch64",
@@ -365,7 +362,7 @@ GROUPS: List[Group] = [
         name="quick",
         doc="Runs a quick subset of presubmit checks.",
         checks=[
-            "health_checks",
+            "default_health_checks",
             "crosvm_unit_tests_x86_64",
             "clippy_aarch64",
         ],
@@ -376,7 +373,6 @@ GROUPS: List[Group] = [
         checks=[
             "health_checks",
             *(f"linux_{platform}" for platform in PLATFORMS),
-            "linux_x86_64_direct",
         ],
     ),
     # Convenience groups for local usage:
@@ -399,25 +395,32 @@ GROUPS: List[Group] = [
             "python_format",
         ],
     ),
-    # The groups below are used by builders in CI:
     Group(
-        name="health_checks",
-        doc="Checks run on the health_check builder",
+        name="default_health_checks",
+        doc="Health checks to run by default",
         checks=[
+            # Check if lockfiles need updating first. Otherwise another step may do the update.
+            "rust_lockfiles",
             "copyright_header",
             "file_ends_with_newline",
-            "infra_configs",
-            "infra_tests",
             "line_endings",
             "markdown_format",
             "mdbook",
             "cargo_doc",
             "python_format",
-            "python_tests",
             "python_types",
             "rust_features",
             "rust_format",
-            "rust_lockfiles",
+        ],
+    ),
+    # The groups below are used by builders in CI:
+    Group(
+        name="health_checks",
+        doc="Checks run on the health_check builder",
+        checks=[
+            "default_health_checks",
+            "doc_tests",
+            "python_tests",
         ],
     ),
     *(
@@ -428,16 +431,11 @@ GROUPS: List[Group] = [
                 f"crosvm_tests_{platform}",
                 f"clippy_{platform}",
                 f"crosvm_build_default_{platform}",
-            ],
+            ]
+            # TODO: b/260607247 crosvm does not compile with no-default-features on mingw64
+            + ([f"crosvm_build_no_default_{platform}"] if platform != "mingw64" else []),
         )
         for platform in PLATFORMS
-    ),
-    Group(
-        name=f"linux_x86_64_direct",
-        doc=f"Checks run on the linux_x86_64_direct builder",
-        checks=[
-            "crosvm_build_direct",
-        ],
     ),
 ]
 
@@ -481,7 +479,6 @@ def get_check_names_in_group(group: Group) -> Generator[str, None, None]:
 @argh.arg("--fix", default=False, help="Asks checks to fix problems where possible.")
 @argh.arg("--no-delta", default=False, help="Run on all files instead of just modified files.")
 @argh.arg("--no-parallel", default=False, help="Do not run checks in parallel.")
-@argh.arg("--nightly-fmt", default=False, help="Use nightly rust for rustfmt")
 @argh.arg(
     "checks_or_groups",
     help="List of checks or groups to run. Defaults to run the `default` group.",
@@ -491,7 +488,6 @@ def main(
     fix: bool = False,
     no_delta: bool = False,
     no_parallel: bool = False,
-    nightly_fmt: bool = False,
     *checks_or_groups: str,
 ):
     chdir(CROSVM_ROOT)
@@ -524,7 +520,6 @@ def main(
         check_list,
         fix=fix,
         run_on_all_files=no_delta,
-        nightly_fmt=nightly_fmt,
         parallel=not no_parallel,
     )
 

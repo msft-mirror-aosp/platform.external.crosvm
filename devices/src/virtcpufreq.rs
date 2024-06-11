@@ -77,7 +77,7 @@ fn get_cpu_util_factor(cpu_id: u32) -> Result<u32, Error> {
 }
 
 impl VirtCpufreq {
-    pub fn new(pcpu: u32) -> Self {
+    pub fn new(pcpu: u32, cpu_capacity: u32, cpu_fmax: u32) -> Self {
         let cpu_capacity = get_cpu_capacity(pcpu).expect("Error reading capacity");
         let cpu_fmax = get_cpu_maxfreq_khz(pcpu).expect("Error reading max freq");
         let util_factor = get_cpu_util_factor(pcpu).expect("Error getting util factor");

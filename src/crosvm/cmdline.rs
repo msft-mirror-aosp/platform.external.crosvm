@@ -230,7 +230,7 @@ pub struct CreateCompositeCommand {
     #[argh(positional, arg_name = "PATH")]
     /// image path
     pub path: String,
-    #[argh(positional, arg_name = "LABEL:PARTITION<:writable>")]
+    #[argh(positional, arg_name = "LABEL:PARTITION[:writable][:<GUID>]")]
     /// partitions
     pub partitions: Vec<String>,
 }
@@ -1492,6 +1492,7 @@ pub struct RunCommand {
     ///     single-touch[path=PATH,width=W,height=H,name=N]
     ///     switches[path=PATH]
     ///     trackpad[path=PATH,width=W,height=H,name=N]
+    ///     multi-touch-trackpad[path=PATH,width=W,height=H,name=N]
     /// See <https://crosvm.dev/book/devices/input.html> for more
     /// information.
     pub input: Vec<InputDeviceOption>,

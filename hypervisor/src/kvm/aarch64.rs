@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::mem::offset_of;
 
+use anyhow::Context;
 use base::errno_result;
 use base::error;
 use base::ioctl_with_mut_ref;
@@ -18,11 +20,14 @@ use base::warn;
 use base::Error;
 use base::Result;
 use cros_fdt::Fdt;
+use data_model::vec_with_array_field;
 use kvm_sys::*;
 use libc::EINVAL;
 use libc::ENOMEM;
 use libc::ENOTSUP;
 use libc::ENXIO;
+use serde::Deserialize;
+use serde::Serialize;
 use vm_memory::GuestAddress;
 
 use super::Config;
@@ -43,6 +48,7 @@ use crate::VcpuFeature;
 use crate::VcpuRegAArch64;
 use crate::VmAArch64;
 use crate::VmCap;
+use crate::AARCH64_MAX_REG_COUNT;
 use crate::PSCI_0_2;
 
 impl Kvm {
@@ -54,7 +60,7 @@ impl Kvm {
         // SAFETY:
         // Safe because we know self is a real kvm fd
         let ipa_size = match unsafe {
-            ioctl_with_val(self, KVM_CHECK_EXTENSION(), KVM_CAP_ARM_VM_IPA_SIZE.into())
+            ioctl_with_val(self, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE.into())
         } {
             // Not supported? Use 0 as the machine type, which implies 40bit IPA
             ret if ret < 0 => 0,
@@ -73,8 +79,7 @@ impl Kvm {
     pub fn get_guest_phys_addr_bits(&self) -> u8 {
         // SAFETY:
         // Safe because we know self is a real kvm fd
-        match unsafe { ioctl_with_val(self, KVM_CHECK_EXTENSION(), KVM_CAP_ARM_VM_IPA_SIZE.into()) }
-        {
+        match unsafe { ioctl_with_val(self, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE.into()) } {
             // Default physical address size is 40 bits if the extension is not supported.
             ret if ret <= 0 => 40,
             ipa => ipa as u8,
@@ -228,7 +233,7 @@ impl VmAArch64 for KvmVm {
             reserved: 0,
         };
         // SAFETY: self.vm is a valid KVM fd
-        let ret = unsafe { ioctl_with_ref(&self.vm, KVM_ARM_SET_COUNTER_OFFSET(), &off) };
+        let ret = unsafe { ioctl_with_ref(&self.vm, KVM_ARM_SET_COUNTER_OFFSET, &off) };
         if ret != 0 {
             return errno_result();
         }
@@ -296,7 +301,7 @@ impl KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, KVM_SET_ONE_REG(), &onereg) };
+        let ret = unsafe { ioctl_with_ref(self, KVM_SET_ONE_REG, &onereg) };
         if ret == 0 {
             Ok(())
         } else {
@@ -335,7 +340,7 @@ impl KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, KVM_GET_ONE_REG(), &onereg) };
+        let ret = unsafe { ioctl_with_ref(self, KVM_GET_ONE_REG, &onereg) };
         if ret == 0 {
             Ok(())
         } else {
@@ -348,6 +353,28 @@ impl KvmVcpu {
         // No aarch64-specific exits (for now)
         None
     }
+
+    fn get_reg_list(&self) -> Result<Vec<u64>> {
+        let mut kvm_reg_list = vec_with_array_field::<kvm_reg_list, u64>(AARCH64_MAX_REG_COUNT);
+        kvm_reg_list[0].n = AARCH64_MAX_REG_COUNT as u64;
+        let ret =
+            // SAFETY:
+            // We trust the kernel not to read/write past the end of kvm_reg_list struct.
+            unsafe { ioctl_with_mut_ref(self, KVM_GET_REG_LIST, &mut kvm_reg_list[0]) };
+        if ret < 0 {
+            return errno_result();
+        }
+        let n = kvm_reg_list[0].n;
+        assert!(
+            n <= AARCH64_MAX_REG_COUNT as u64,
+            "Get reg list returned more registers than possible"
+        );
+        // SAFETY:
+        // Mapping the unsized array to a slice is unsafe because the length isn't known.
+        // Providing the length used to create the struct guarantees the entire slice is valid.
+        let reg_list: &[u64] = unsafe { kvm_reg_list[0].reg.as_slice(n as usize) };
+        Ok(reg_list.to_vec())
+    }
 }
 
 /// KVM registers as used by the `GET_ONE_REG`/`SET_ONE_REG` ioctl API
@@ -357,7 +384,7 @@ impl KvmVcpu {
 /// pseudo-registers (`Firmware`) and multiplexed registers (`Ccsidr`).
 ///
 /// See https://docs.kernel.org/virt/kvm/api.html for more details.
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub enum KvmVcpuRegister {
     /// General Purpose Registers X0-X30
     X(u8),
@@ -427,18 +454,15 @@ impl From<KvmVcpuRegister> for u64 {
 
         fn spsr_reg(spsr_reg: u32) -> u64 {
             let n = std::mem::size_of::<u64>() * (spsr_reg as usize);
-            kvm_reg(memoffset::offset_of!(kvm_regs, spsr) + n)
+            kvm_reg(offset_of!(kvm_regs, spsr) + n)
         }
 
         fn user_pt_reg(offset: usize) -> u64 {
-            kvm_regs_reg(
-                KVM_REG_SIZE_U64,
-                memoffset::offset_of!(kvm_regs, regs) + offset,
-            )
+            kvm_regs_reg(KVM_REG_SIZE_U64, offset_of!(kvm_regs, regs) + offset)
         }
 
         fn user_fpsimd_state_reg(size: u64, offset: usize) -> u64 {
-            kvm_regs_reg(size, memoffset::offset_of!(kvm_regs, fp_regs) + offset)
+            kvm_regs_reg(size, offset_of!(kvm_regs, fp_regs) + offset)
         }
 
         const fn reg_u64(kind: u64, fields: u64) -> u64 {
@@ -457,39 +481,34 @@ impl From<KvmVcpuRegister> for u64 {
             KvmVcpuRegister::X(n @ 0..=30) => {
                 let n = std::mem::size_of::<u64>() * (n as usize);
 
-                user_pt_reg(memoffset::offset_of!(user_pt_regs, regs) + n)
+                user_pt_reg(offset_of!(user_pt_regs, regs) + n)
             }
             KvmVcpuRegister::X(n) => unreachable!("invalid KvmVcpuRegister Xn index: {n}"),
-            KvmVcpuRegister::Sp => user_pt_reg(memoffset::offset_of!(user_pt_regs, sp)),
-            KvmVcpuRegister::Pc => user_pt_reg(memoffset::offset_of!(user_pt_regs, pc)),
-            KvmVcpuRegister::Pstate => user_pt_reg(memoffset::offset_of!(user_pt_regs, pstate)),
+            KvmVcpuRegister::Sp => user_pt_reg(offset_of!(user_pt_regs, sp)),
+            KvmVcpuRegister::Pc => user_pt_reg(offset_of!(user_pt_regs, pc)),
+            KvmVcpuRegister::Pstate => user_pt_reg(offset_of!(user_pt_regs, pstate)),
             KvmVcpuRegister::V(n @ 0..=31) => {
                 let n = std::mem::size_of::<u128>() * (n as usize);
 
-                user_fpsimd_state_reg(
-                    KVM_REG_SIZE_U128,
-                    memoffset::offset_of!(user_fpsimd_state, vregs) + n,
-                )
+                user_fpsimd_state_reg(KVM_REG_SIZE_U128, offset_of!(user_fpsimd_state, vregs) + n)
             }
             KvmVcpuRegister::V(n) => unreachable!("invalid KvmVcpuRegister Vn index: {n}"),
-            KvmVcpuRegister::System(AArch64SysRegId::FPSR) => user_fpsimd_state_reg(
-                KVM_REG_SIZE_U32,
-                memoffset::offset_of!(user_fpsimd_state, fpsr),
-            ),
-            KvmVcpuRegister::System(AArch64SysRegId::FPCR) => user_fpsimd_state_reg(
-                KVM_REG_SIZE_U32,
-                memoffset::offset_of!(user_fpsimd_state, fpcr),
-            ),
+            KvmVcpuRegister::System(AArch64SysRegId::FPSR) => {
+                user_fpsimd_state_reg(KVM_REG_SIZE_U32, offset_of!(user_fpsimd_state, fpsr))
+            }
+            KvmVcpuRegister::System(AArch64SysRegId::FPCR) => {
+                user_fpsimd_state_reg(KVM_REG_SIZE_U32, offset_of!(user_fpsimd_state, fpcr))
+            }
             KvmVcpuRegister::System(AArch64SysRegId::SPSR_EL1) => spsr_reg(KVM_SPSR_EL1),
             KvmVcpuRegister::System(AArch64SysRegId::SPSR_abt) => spsr_reg(KVM_SPSR_ABT),
             KvmVcpuRegister::System(AArch64SysRegId::SPSR_und) => spsr_reg(KVM_SPSR_UND),
             KvmVcpuRegister::System(AArch64SysRegId::SPSR_irq) => spsr_reg(KVM_SPSR_IRQ),
             KvmVcpuRegister::System(AArch64SysRegId::SPSR_fiq) => spsr_reg(KVM_SPSR_FIQ),
             KvmVcpuRegister::System(AArch64SysRegId::SP_EL1) => {
-                kvm_reg(memoffset::offset_of!(kvm_regs, sp_el1))
+                kvm_reg(offset_of!(kvm_regs, sp_el1))
             }
             KvmVcpuRegister::System(AArch64SysRegId::ELR_EL1) => {
-                kvm_reg(memoffset::offset_of!(kvm_regs, elr_el1))
+                kvm_reg(offset_of!(kvm_regs, elr_el1))
             }
             // The KVM API accidentally swapped CNTV_CVAL_EL0 and CNTVCT_EL0.
             KvmVcpuRegister::System(AArch64SysRegId::CNTV_CVAL_EL0) => reg_u64(
@@ -518,7 +537,7 @@ impl VcpuAArch64 for KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will write exactly the size
         // of the struct.
-        let ret = unsafe { ioctl_with_mut_ref(&self.vm, KVM_ARM_PREFERRED_TARGET(), &mut kvi) };
+        let ret = unsafe { ioctl_with_mut_ref(&self.vm, KVM_ARM_PREFERRED_TARGET, &mut kvi) };
         if ret != 0 {
             return errno_result();
         }
@@ -535,7 +554,7 @@ impl VcpuAArch64 for KvmVcpu {
         let check_extension = |ext: u32| -> bool {
             // SAFETY:
             // Safe because we know self.vm is a real kvm fd
-            unsafe { ioctl_with_val(&self.vm, KVM_CHECK_EXTENSION(), ext.into()) == 1 }
+            unsafe { ioctl_with_val(&self.vm, KVM_CHECK_EXTENSION, ext.into()) == 1 }
         };
         if check_extension(KVM_CAP_ARM_PTRAUTH_ADDRESS)
             && check_extension(KVM_CAP_ARM_PTRAUTH_GENERIC)
@@ -547,7 +566,7 @@ impl VcpuAArch64 for KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, KVM_ARM_VCPU_INIT(), &kvi) };
+        let ret = unsafe { ioctl_with_ref(self, KVM_ARM_VCPU_INIT, &kvi) };
         if ret == 0 {
             Ok(())
         } else {
@@ -570,7 +589,7 @@ impl VcpuAArch64 for KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_HAS_DEVICE_ATTR(), &irq_attr) };
+        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_HAS_DEVICE_ATTR, &irq_attr) };
         if ret < 0 {
             return errno_result();
         }
@@ -578,7 +597,7 @@ impl VcpuAArch64 for KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_SET_DEVICE_ATTR(), &irq_attr) };
+        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_SET_DEVICE_ATTR, &irq_attr) };
         if ret < 0 {
             return errno_result();
         }
@@ -592,7 +611,7 @@ impl VcpuAArch64 for KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_SET_DEVICE_ATTR(), &init_attr) };
+        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_SET_DEVICE_ATTR, &init_attr) };
         if ret < 0 {
             return errno_result();
         }
@@ -612,7 +631,7 @@ impl VcpuAArch64 for KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_HAS_DEVICE_ATTR(), &pvtime_attr) };
+        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_HAS_DEVICE_ATTR, &pvtime_attr) };
         ret >= 0
     }
 
@@ -631,7 +650,7 @@ impl VcpuAArch64 for KvmVcpu {
         // SAFETY:
         // Safe because we allocated the struct and we know the kernel will read exactly the size of
         // the struct.
-        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_SET_DEVICE_ATTR(), &pvtime_attr) };
+        let ret = unsafe { ioctl_with_ref(self, kvm_sys::KVM_SET_DEVICE_ATTR, &pvtime_attr) };
         if ret < 0 {
             return errno_result();
         }
@@ -699,7 +718,7 @@ impl VcpuAArch64 for KvmVcpu {
         let max_hw_bps = unsafe {
             ioctl_with_val(
                 &self.vm,
-                KVM_CHECK_EXTENSION(),
+                KVM_CHECK_EXTENSION,
                 KVM_CAP_GUEST_DEBUG_HW_BPS.into(),
             )
         };
@@ -709,6 +728,92 @@ impl VcpuAArch64 for KvmVcpu {
         } else {
             Ok(max_hw_bps.try_into().expect("can't represent u64 as usize"))
         }
+    }
+
+    fn get_system_regs(&self) -> Result<BTreeMap<AArch64SysRegId, u64>> {
+        let reg_list = self.get_reg_list()?;
+        let cntvct_el0: u16 = AArch64SysRegId::CNTVCT_EL0.encoded();
+        let cntv_cval_el0: u16 = AArch64SysRegId::CNTV_CVAL_EL0.encoded();
+        let mut sys_regs = BTreeMap::new();
+        for reg in reg_list {
+            if (reg as u32) & KVM_REG_ARM_COPROC_MASK == KVM_REG_ARM64_SYSREG {
+                if reg as u16 == cntvct_el0 {
+                    sys_regs.insert(
+                        AArch64SysRegId::CNTV_CVAL_EL0,
+                        self.get_one_reg(VcpuRegAArch64::System(AArch64SysRegId::CNTV_CVAL_EL0))?,
+                    );
+                } else if reg as u16 == cntv_cval_el0 {
+                    sys_regs.insert(
+                        AArch64SysRegId::CNTVCT_EL0,
+                        self.get_one_reg(VcpuRegAArch64::System(AArch64SysRegId::CNTVCT_EL0))?,
+                    );
+                } else {
+                    sys_regs.insert(
+                        AArch64SysRegId::from_encoded((reg & 0xFFFF) as u16),
+                        self.get_one_reg(VcpuRegAArch64::System(AArch64SysRegId::from_encoded(
+                            (reg & 0xFFFF) as u16,
+                        )))?,
+                    );
+                }
+            }
+        }
+        Ok(sys_regs)
+    }
+
+    fn get_cache_info(&self) -> Result<BTreeMap<u8, u64>> {
+        const KVM_REG_CCSIDR: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U32 | (KVM_REG_ARM_DEMUX as u64);
+        const CCSIDR_INDEX_MASK: u64 = 0xFF;
+        let reg_list = self.get_reg_list()?;
+        let mut cache_info = BTreeMap::new();
+        for reg in reg_list {
+            if (reg & !CCSIDR_INDEX_MASK) == KVM_REG_CCSIDR {
+                let idx = reg as u8;
+                cache_info.insert(
+                    idx,
+                    self.get_one_kvm_reg_u32(KvmVcpuRegister::Ccsidr(idx))?
+                        .into(),
+                );
+            }
+        }
+        Ok(cache_info)
+    }
+
+    fn set_cache_info(&self, cache_info: BTreeMap<u8, u64>) -> Result<()> {
+        for (idx, val) in cache_info {
+            self.set_one_kvm_reg_u32(
+                KvmVcpuRegister::Ccsidr(idx),
+                val.try_into()
+                    .expect("trying to set a u32 register with a u64 value"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn hypervisor_specific_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        let reg_list = self.get_reg_list()?;
+        let mut firmware_regs = BTreeMap::new();
+        for reg in reg_list {
+            if (reg as u32) & KVM_REG_ARM_COPROC_MASK == KVM_REG_ARM_FW {
+                firmware_regs.insert(
+                    reg as u16,
+                    self.get_one_kvm_reg_u64(KvmVcpuRegister::Firmware(reg as u16))?,
+                );
+            }
+        }
+
+        serde_json::to_value(KvmSnapshot { firmware_regs })
+            .context("Failed to serialize KVM specific data")
+    }
+
+    fn hypervisor_specific_restore(&self, data: serde_json::Value) -> anyhow::Result<()> {
+        let deser: KvmSnapshot =
+            serde_json::from_value(data).context("Failed to deserialize KVM specific data")?;
+        // TODO: need to set firmware registers before "create_fdt" is called, earlier in the
+        // stack.
+        for (id, val) in &deser.firmware_regs {
+            self.set_one_kvm_reg_u64(KvmVcpuRegister::Firmware(*id), *val)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::unusual_byte_groupings)]
@@ -749,13 +854,18 @@ impl VcpuAArch64 for KvmVcpu {
 
         // SAFETY:
         // Safe because the kernel won't read past the end of the kvm_guest_debug struct.
-        let ret = unsafe { ioctl_with_ref(self, KVM_SET_GUEST_DEBUG(), &dbg) };
+        let ret = unsafe { ioctl_with_ref(self, KVM_SET_GUEST_DEBUG, &dbg) };
         if ret == 0 {
             Ok(())
         } else {
             errno_result()
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KvmSnapshot {
+    firmware_regs: BTreeMap<u16, u64>,
 }
 
 // This function translates an IrqSrouceChip to the kvm u32 equivalent. It has a different

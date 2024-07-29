@@ -116,8 +116,6 @@ use devices::virtio::vhost::user::snd::sys::windows::run_snd_device_worker;
 use devices::virtio::vhost::user::snd::sys::windows::SndSplitConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonFeatures;
-#[cfg(feature = "balloon")]
-use devices::virtio::BalloonMode;
 use devices::virtio::Console;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuParameters;
@@ -218,10 +216,6 @@ use win_util::ProcessType;
 use x86_64::cpuid::adjust_cpuid;
 #[cfg(feature = "whpx")]
 use x86_64::cpuid::CpuIdContext;
-#[cfg(all(target_arch = "x86_64", feature = "haxm"))]
-use x86_64::get_cpu_manufacturer;
-#[cfg(all(target_arch = "x86_64", feature = "haxm"))]
-use x86_64::CpuManufacturer;
 #[cfg(target_arch = "x86_64")]
 use x86_64::X8664arch as Arch;
 
@@ -462,11 +456,6 @@ fn create_balloon_device(
         VmMemoryClient::new(dynamic_mapping_device_tube),
         inflate_tube,
         init_balloon_size,
-        if cfg.strict_balloon {
-            BalloonMode::Strict
-        } else {
-            BalloonMode::Relaxed
-        },
         balloon_features,
         #[cfg(feature = "registered_events")]
         None,
@@ -888,8 +877,9 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     wait_ctx: &WaitContext<Token>,
     force_s2idle: bool,
     vcpu_control_channels: &[mpsc::Sender<VcpuControl>],
+    suspended_pvclock_state: &mut Option<hypervisor::ClockState>,
 ) -> Result<Option<ExitState>> {
-    let execute_vm_request = |request: VmRequest, guest_os: &mut RunnableLinuxVm<V, Vcpu>| {
+    let mut execute_vm_request = |request: VmRequest, guest_os: &mut RunnableLinuxVm<V, Vcpu>| {
         let mut run_mode_opt = None;
         let vcpu_size = vcpu_boxes.lock().len();
         let resp = request.execute(
@@ -921,6 +911,7 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             vcpu_size,
             irq_handler_control,
             || guest_os.irq_chip.as_ref().snapshot(vcpu_size),
+            suspended_pvclock_state,
         );
         (resp, run_mode_opt)
     };
@@ -1448,11 +1439,13 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         force_calibrated_tsc_leaf,
     )?;
 
+    // See comment on `VmRequest::execute`.
+    let mut suspended_pvclock_state: Option<hypervisor::ClockState> = None;
+
     // Restore VM (if applicable).
     if let Some(path) = restore_path {
         vm_control::do_restore(
             &path,
-            &guest_os.vm,
             |msg| {
                 kick_all_vcpus(
                     run_mode_arc.as_ref(),
@@ -1484,6 +1477,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     .restore(image, guest_os.vcpu_count)
             },
             /* require_encrypted= */ false,
+            &mut suspended_pvclock_state,
         )?;
         // Allow the vCPUs to start for real.
         kick_all_vcpus(
@@ -1546,6 +1540,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 &wait_ctx,
                 force_s2idle,
                 &vcpu_control_channels,
+                &mut suspended_pvclock_state,
             )?;
             if let Some(state) = state {
                 exit_state = state;
@@ -1983,13 +1978,10 @@ pub fn get_default_hypervisor() -> Option<HypervisorKind> {
     };
 
     #[cfg(feature = "haxm")]
-    if get_cpu_manufacturer() == CpuManufacturer::Intel {
-        // Make sure Haxm device can be opened before selecting it.
-        match Haxm::new() {
-            Ok(_) => return Some(HypervisorKind::Ghaxm),
-            Err(e) => warn!("Cannot initialize HAXM: {}", e),
-        };
-    }
+    match Haxm::new() {
+        Ok(_) => return Some(HypervisorKind::Ghaxm),
+        Err(e) => warn!("Cannot initialize HAXM: {}", e),
+    };
 
     #[cfg(feature = "gvm")]
     // Make sure Gvm device can be opened before selecting it.
@@ -2635,6 +2627,7 @@ where
 
     let mut vcpu_ids = Vec::new();
 
+    let (vwmdt_host_tube, vmwdt_device_tube) = Tube::pair().context("failed to create tube")?;
     let windows = Arch::build_vm::<V, Vcpu>(
         components,
         &vm_evt_wrtube,
@@ -2651,6 +2644,7 @@ where
         /* debugcon_jail= */ None,
         None,
         None,
+        /* guest_suspended_cvar= */ None,
         dt_overlays,
     )
     .exit_context(Exit::BuildVm, "the architecture failed to build the vm")?;

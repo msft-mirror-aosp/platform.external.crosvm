@@ -16,6 +16,7 @@ use vm_memory::MemoryRegionPurpose;
 
 use super::GunyahVcpu;
 use super::GunyahVm;
+use crate::AArch64SysRegId;
 use crate::Hypervisor;
 use crate::PsciVersion;
 use crate::VcpuAArch64;
@@ -235,5 +236,25 @@ impl VcpuAArch64 for GunyahVcpu {
 
     fn get_max_hw_bps(&self) -> Result<usize> {
         Err(Error::new(ENOTSUP))
+    }
+
+    fn get_system_regs(&self) -> Result<BTreeMap<AArch64SysRegId, u64>> {
+        Err(Error::new(ENOTSUP))
+    }
+
+    fn get_cache_info(&self) -> Result<BTreeMap<u8, u64>> {
+        Err(Error::new(ENOTSUP))
+    }
+
+    fn set_cache_info(&self, _cache_info: BTreeMap<u8, u64>) -> Result<()> {
+        Err(Error::new(ENOTSUP))
+    }
+
+    fn hypervisor_specific_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        unimplemented!()
+    }
+
+    fn hypervisor_specific_restore(&self, _data: serde_json::Value) -> anyhow::Result<()> {
+        unimplemented!()
     }
 }

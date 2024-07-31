@@ -73,7 +73,6 @@ use resources::AddressRange;
 use resources::MmioType;
 use resources::SystemAllocator;
 use resources::SystemAllocatorConfig;
-#[cfg(any(target_os = "android", target_os = "linux"))]
 use sync::Condvar;
 use sync::Mutex;
 use thiserror::Error;
@@ -108,7 +107,6 @@ const AARCH64_PLATFORM_MMIO_SIZE: u64 = 0x800000;
 const AARCH64_FDT_OFFSET_IN_BIOS_MODE: u64 = 0x0;
 // Therefore, the BIOS is placed after the FDT in memory.
 const AARCH64_BIOS_OFFSET: u64 = AARCH64_FDT_MAX_SIZE;
-const AARCH64_BIOS_MAX_LEN: u64 = 1 << 20;
 
 const AARCH64_PROTECTED_VM_FW_MAX_SIZE: u64 = 0x400000;
 const AARCH64_PROTECTED_VM_FW_START: u64 =
@@ -173,10 +171,13 @@ fn get_bios_addr() -> GuestAddress {
 // Otherwise, returns None.
 fn get_swiotlb_addr(
     memory_size: u64,
+    swiotlb_size: u64,
     hypervisor: &(impl Hypervisor + ?Sized),
 ) -> Option<GuestAddress> {
     if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
-        Some(GuestAddress(AARCH64_PHYS_MEM_START + memory_size))
+        Some(GuestAddress(
+            AARCH64_PHYS_MEM_START + memory_size - swiotlb_size,
+        ))
     } else {
         None
     }
@@ -265,6 +266,8 @@ pub enum Error {
     CreateTube(base::TubeError),
     #[error("failed to create VCPU: {0}")]
     CreateVcpu(base::Error),
+    #[error("unable to create vm watchdog timer device: {0}")]
+    CreateVmwdtDevice(anyhow::Error),
     #[error("custom pVM firmware could not be loaded: {0}")]
     CustomPvmFwLoadFailure(arch::LoadImageError),
     #[error("vm created wrong kind of vcpu")]
@@ -401,9 +404,18 @@ impl arch::LinuxArch for AArch64 {
         components: &VmComponents,
         hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
+        // Static swiotlb is allocated from the end of RAM as a separate memory region, so, if
+        // enabled, make the RAM memory region smaller to leave room for it.
+        let mut main_memory_size = components.memory_size;
+        if let Some(size) = components.swiotlb {
+            if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
+                main_memory_size -= size;
+            }
+        }
+
         let mut memory_regions = vec![(
             GuestAddress(AARCH64_PHYS_MEM_START),
-            components.memory_size,
+            main_memory_size,
             MemoryRegionOptions::new().align(get_block_size()),
         )];
 
@@ -417,7 +429,7 @@ impl arch::LinuxArch for AArch64 {
         }
 
         if let Some(size) = components.swiotlb {
-            if let Some(addr) = get_swiotlb_addr(components.memory_size, hypervisor) {
+            if let Some(addr) = get_swiotlb_addr(components.memory_size, size, hypervisor) {
                 memory_regions.push((
                     addr,
                     size,
@@ -451,9 +463,7 @@ impl arch::LinuxArch for AArch64 {
         dump_device_tree_blob: Option<PathBuf>,
         _debugcon_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
-        #[cfg(any(target_os = "android", target_os = "linux"))] _guest_suspended_cvar: Option<
-            Arc<(Mutex<bool>, Condvar)>,
-        >,
+        _guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         device_tree_overlays: Vec<DtbOverlay>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
@@ -468,9 +478,8 @@ impl arch::LinuxArch for AArch64 {
         let mut initrd = None;
         let payload = match components.vm_image {
             VmImage::Bios(ref mut bios) => {
-                let image_size =
-                    arch::load_image(&mem, bios, get_bios_addr(), AARCH64_BIOS_MAX_LEN)
-                        .map_err(Error::BiosLoadFailure)?;
+                let image_size = arch::load_image(&mem, bios, get_bios_addr(), u64::MAX)
+                    .map_err(Error::BiosLoadFailure)?;
                 PayloadType::Bios {
                     entry: get_bios_addr(),
                     image_size: image_size as u64,
@@ -644,11 +653,13 @@ impl arch::LinuxArch for AArch64 {
             .map_err(Error::CreatePlatformBus)?;
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
 
+        let (vmwdt_host_tube, vmwdt_control_tube) = Tube::pair().map_err(Error::CreateTube)?;
         Self::add_arch_devs(
             irq_chip.as_irq_chip_mut(),
             &mmio_bus,
             vcpu_count,
             _vm_evt_wrtube,
+            vmwdt_control_tube,
         )?;
 
         let com_evt_1_3 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
@@ -683,10 +694,6 @@ impl arch::LinuxArch for AArch64 {
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
         if !components.cpu_frequencies.is_empty() {
-            // TODO: Revisit and optimization after benchmarking
-            let socket = components
-                .virt_cpufreq_socket
-                .map(|s| Arc::new(Mutex::new(s)));
             for vcpu in 0..vcpu_count {
                 let vcpu_affinity = match components.vcpu_affinity.clone() {
                     Some(VcpuAffinity::Global(v)) => v,
@@ -696,7 +703,14 @@ impl arch::LinuxArch for AArch64 {
 
                 let virt_cpufreq = Arc::new(Mutex::new(VirtCpufreq::new(
                     vcpu_affinity[0].try_into().unwrap(),
-                    socket.clone(),
+                    *components.normalized_cpu_capacities.get(&vcpu).unwrap(),
+                    *components
+                        .cpu_frequencies
+                        .get(&vcpu)
+                        .unwrap()
+                        .iter()
+                        .max()
+                        .unwrap(),
                 )));
 
                 if vcpu as u64 * AARCH64_VIRTFREQ_SIZE + AARCH64_VIRTFREQ_SIZE
@@ -806,7 +820,7 @@ impl arch::LinuxArch for AArch64 {
             psci_version,
             components.swiotlb.map(|size| {
                 (
-                    get_swiotlb_addr(components.memory_size, vm.get_hypervisor()),
+                    get_swiotlb_addr(components.memory_size, size, vm.get_hypervisor()),
                     size,
                 )
             }),
@@ -826,6 +840,8 @@ impl arch::LinuxArch for AArch64 {
             AARCH64_FDT_MAX_SIZE.try_into().unwrap(),
         )
         .map_err(Error::InitVmError)?;
+
+        let vm_request_tubes = vec![vmwdt_host_tube];
 
         Ok(RunnableLinuxVm {
             vm,
@@ -850,7 +866,7 @@ impl arch::LinuxArch for AArch64 {
             platform_devices,
             hotplug_bus: BTreeMap::new(),
             devices_thread: None,
-            vm_request_tube: None,
+            vm_request_tubes,
         })
     }
 
@@ -880,6 +896,14 @@ impl arch::LinuxArch for AArch64 {
     ) -> std::result::Result<PciAddress, Self::Error> {
         // hotplug function isn't verified on AArch64, so set it unsupported here.
         Err(Error::Unsupported)
+    }
+
+    fn get_host_cpu_max_freq_khz() -> std::result::Result<BTreeMap<usize, u32>, Self::Error> {
+        Ok(Self::collect_for_each_cpu(base::logical_core_max_freq_khz)
+            .map_err(Error::CpuFrequencies)?
+            .into_iter()
+            .enumerate()
+            .collect())
     }
 
     fn get_host_cpu_frequencies_khz() -> std::result::Result<BTreeMap<usize, Vec<u32>>, Self::Error>
@@ -1188,6 +1212,7 @@ impl AArch64 {
         bus: &Bus,
         vcpu_count: usize,
         vm_evt_wrtube: &SendTube,
+        vmwdt_request_tube: Tube,
     ) -> Result<()> {
         let rtc_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         let rtc = devices::pl030::Pl030::new(rtc_evt.try_clone().map_err(Error::CloneEvent)?);
@@ -1207,7 +1232,9 @@ impl AArch64 {
             vcpu_count,
             vm_evt_wrtube.try_clone().unwrap(),
             vmwdt_evt.try_clone().map_err(Error::CloneEvent)?,
-        );
+            vmwdt_request_tube,
+        )
+        .map_err(Error::CreateVmwdtDevice)?;
         irq_chip
             .register_edge_irq_event(
                 AARCH64_VMWDT_IRQ,

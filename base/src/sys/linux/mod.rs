@@ -24,7 +24,6 @@ mod descriptor;
 mod event;
 mod file;
 mod file_traits;
-mod get_filesystem_type;
 mod mmap;
 mod net;
 mod netlink;
@@ -65,7 +64,6 @@ pub(crate) use event::PlatformEvent;
 pub use file::find_next_data;
 pub use file::FileDataIterator;
 pub(crate) use file_traits::lib::*;
-pub use get_filesystem_type::*;
 pub use ioctl::*;
 use libc::c_int;
 use libc::c_long;
@@ -212,13 +210,13 @@ pub fn fallocate<F: AsRawDescriptor>(
     offset: u64,
     len: u64,
 ) -> Result<()> {
-    let offset = if offset > libc::off64_t::max_value() as u64 {
+    let offset = if offset > libc::off64_t::MAX as u64 {
         return Err(Error::new(libc::EINVAL));
     } else {
         offset as libc::off64_t
     };
 
-    let len = if len > libc::off64_t::max_value() as u64 {
+    let len = if len > libc::off64_t::MAX as u64 {
         return Err(Error::new(libc::EINVAL));
     } else {
         len as libc::off64_t
@@ -263,7 +261,7 @@ pub fn discard_block<F: AsRawDescriptor>(file: &F, offset: u64, len: u64) -> Res
     // - ioctl(BLKDISCARD) does not hold the descriptor after the call.
     // - ioctl(BLKDISCARD) does not break the file descriptor.
     // - ioctl(BLKDISCARD) does not modify the given range.
-    syscall!(unsafe { libc::ioctl(file.as_raw_descriptor(), BLKDISCARD(), &range) }).map(|_| ())
+    syscall!(unsafe { libc::ioctl(file.as_raw_descriptor(), BLKDISCARD, &range) }).map(|_| ())
 }
 
 /// A trait used to abstract types that provide a process id that can be operated on.
@@ -502,7 +500,7 @@ pub fn poll_in<F: AsRawDescriptor>(fd: &F) -> bool {
 
 /// Return the maximum Duration that can be used with libc::timespec.
 pub fn max_timeout() -> Duration {
-    Duration::new(libc::time_t::max_value() as u64, 999999999)
+    Duration::new(libc::time_t::MAX as u64, 999999999)
 }
 
 /// If the given path is of the form /proc/self/fd/N for some N, returns `Ok(Some(N))`. Otherwise
@@ -636,7 +634,7 @@ pub fn logical_core_cluster_id(cpu_id: usize) -> Result<u32> {
 }
 
 /// Returns the maximum frequency (in kHz) of a given logical core.
-fn logical_core_max_freq_khz(cpu_id: usize) -> Result<u32> {
+pub fn logical_core_max_freq_khz(cpu_id: usize) -> Result<u32> {
     parse_sysfs_cpu_info(cpu_id, "cpufreq/cpuinfo_max_freq")
 }
 

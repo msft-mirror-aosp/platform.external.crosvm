@@ -98,7 +98,6 @@ use devices::ProxyDevice;
 use devices::Serial;
 use devices::SerialHardware;
 use devices::SerialParameters;
-#[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::VirtualPmc;
 use devices::FW_CFG_BASE_PORT;
 use devices::FW_CFG_MAX_FILE_SLOTS;
@@ -137,7 +136,6 @@ use remain::sorted;
 use resources::AddressRange;
 use resources::SystemAllocator;
 use resources::SystemAllocatorConfig;
-#[cfg(any(target_os = "android", target_os = "linux"))]
 use sync::Condvar;
 use sync::Mutex;
 use thiserror::Error;
@@ -714,9 +712,7 @@ impl arch::LinuxArch for X8664arch {
         pflash_jail: Option<Minijail>,
         fw_cfg_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
-        #[cfg(any(target_os = "android", target_os = "linux"))] guest_suspended_cvar: Option<
-            Arc<(Mutex<bool>, Condvar)>,
-        >,
+        guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         device_tree_overlays: Vec<DtbOverlay>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
@@ -859,7 +855,7 @@ impl arch::LinuxArch for X8664arch {
                 vm_evt_wrtube.try_clone().map_err(Error::CloneTube)?,
             )?;
         }
-        let vm_request_tube = if !components.no_rtc {
+        let mut vm_request_tube = if !components.no_rtc {
             let (host_tube, device_tube) = Tube::pair()
                 .context("create tube")
                 .map_err(Error::SetupCmos)?;
@@ -930,7 +926,6 @@ impl arch::LinuxArch for X8664arch {
             swap_controller,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             components.ac_adapter,
-            #[cfg(any(target_os = "android", target_os = "linux"))]
             guest_suspended_cvar,
             &pci_irqs,
         )?;
@@ -1051,6 +1046,11 @@ impl arch::LinuxArch for X8664arch {
             vcpu.msrs = msrs.clone();
         }
 
+        let mut vm_request_tubes = Vec::new();
+        if let Some(req_tube) = vm_request_tube.take() {
+            vm_request_tubes.push(req_tube);
+        }
+
         Ok(RunnableLinuxVm {
             vm,
             vcpu_count,
@@ -1075,7 +1075,7 @@ impl arch::LinuxArch for X8664arch {
             platform_devices: Vec::new(),
             hotplug_bus: BTreeMap::new(),
             devices_thread: None,
-            vm_request_tube,
+            vm_request_tubes,
         })
     }
 
@@ -1154,6 +1154,10 @@ impl arch::LinuxArch for X8664arch {
     }
 
     fn get_host_cpu_frequencies_khz() -> Result<BTreeMap<usize, Vec<u32>>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn get_host_cpu_max_freq_khz() -> Result<BTreeMap<usize, u32>> {
         Ok(BTreeMap::new())
     }
 
@@ -1916,9 +1920,7 @@ impl X8664arch {
         resume_notify_devices: &mut Vec<Arc<Mutex<dyn BusResumeDevice>>>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
         #[cfg(any(target_os = "android", target_os = "linux"))] ac_adapter: bool,
-        #[cfg(any(target_os = "android", target_os = "linux"))] guest_suspended_cvar: Option<
-            Arc<(Mutex<bool>, Condvar)>,
-        >,
+        guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         pci_irqs: &[(PciAddress, u32, PciInterruptPin)],
     ) -> Result<(acpi::AcpiDevResource, Option<BatControl>)> {
         // The AML data for the acpi devices
@@ -2008,7 +2010,6 @@ impl X8664arch {
         let acdc = None;
 
         //Virtual PMC
-        #[cfg(any(target_os = "android", target_os = "linux"))]
         if let Some(guest_suspended_cvar) = guest_suspended_cvar {
             let alloc = resources.get_anon_alloc();
             let mmio_base = resources

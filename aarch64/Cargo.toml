@@ -9,6 +9,7 @@ gdb = ["gdbstub", "gdbstub_arch", "arch/gdb"]
 swap = ["swap/enable"]
 
 [dependencies]
+anyhow = "1"
 arch = { path = "../arch" }
 cros_fdt = { path = "../cros_fdt" }
 devices = { path = "../devices" }
@@ -19,7 +20,6 @@ jail = { path = "../jail" }
 kernel_cmdline = { path = "../kernel_cmdline" }
 kernel_loader = { path = "../kernel_loader" }
 libc = "0.2"
-memoffset = "0.6"
 rand = "0.8"
 remain = "0.2"
 resources = { path = "../resources" }

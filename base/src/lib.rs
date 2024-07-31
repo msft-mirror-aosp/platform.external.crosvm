@@ -111,6 +111,7 @@ cfg_if::cfg_if! {
         pub use linux::logical_core_capacity;
         pub use linux::logical_core_cluster_id;
         pub use linux::logical_core_frequencies_khz;
+        pub use linux::logical_core_max_freq_khz;
         pub use linux::sched_attr;
         pub use linux::sched_setattr;
         pub use linux::UnlinkUnixListener;
@@ -180,7 +181,6 @@ pub use log::trace;
 pub use log::warn;
 pub use mmap::Protection;
 pub use platform::get_cpu_affinity;
-pub use platform::get_filesystem_type;
 pub use platform::getpid;
 pub use platform::open_file_or_duplicate;
 pub use platform::platform_timer_resolution::enable_high_res_timers;

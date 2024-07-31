@@ -7,6 +7,7 @@ cfg_if::cfg_if! {
         use base::RawDescriptor;
         use devices::virtio::vhost::user::device::parse_wayland_sock;
 
+        use crate::crosvm::sys::config::parse_pmem_ext2_option;
         use crate::crosvm::sys::config::VfioOption;
         use crate::crosvm::sys::config::SharedDir;
         use crate::crosvm::sys::config::PmemExt2Option;
@@ -78,6 +79,11 @@ use crate::crosvm::config::from_key_values;
 use crate::crosvm::config::parse_bus_id_addr;
 use crate::crosvm::config::parse_cpu_affinity;
 use crate::crosvm::config::parse_cpu_capacity;
+#[cfg(all(
+    any(target_arch = "arm", target_arch = "aarch64"),
+    any(target_os = "android", target_os = "linux")
+))]
+use crate::crosvm::config::parse_cpu_frequencies;
 use crate::crosvm::config::parse_dynamic_power_coefficient;
 #[cfg(target_arch = "x86_64")]
 use crate::crosvm::config::parse_memory_region;
@@ -229,7 +235,7 @@ pub struct CreateCompositeCommand {
     #[argh(positional, arg_name = "PATH")]
     /// image path
     pub path: String,
-    #[argh(positional, arg_name = "LABEL:PARTITION<:writable>")]
+    #[argh(positional, arg_name = "LABEL:PARTITION[:writable][:<GUID>]")]
     /// partitions
     pub partitions: Vec<String>,
 }
@@ -1132,6 +1138,20 @@ pub struct RunCommand {
     /// group the given CPUs into a cluster (default: no clusters)
     pub cpu_cluster: Vec<CpuSet>,
 
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        any(target_os = "android", target_os = "linux")
+    ))]
+    #[argh(
+        option,
+        arg_name = "CPU=FREQS[,CPU=FREQS[,...]]",
+        from_str_fn(parse_cpu_frequencies)
+    )]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// set the list of frequencies in KHz for the given CPU (default: no frequencies)
+    pub cpu_frequencies_khz: Option<BTreeMap<usize, Vec<u32>>>, // CPU index -> frequencies
+
     #[argh(option, short = 'c')]
     #[merge(strategy = overwrite_option)]
     /// cpu parameters.
@@ -1491,6 +1511,7 @@ pub struct RunCommand {
     ///     single-touch[path=PATH,width=W,height=H,name=N]
     ///     switches[path=PATH]
     ///     trackpad[path=PATH,width=W,height=H,name=N]
+    ///     multi-touch-trackpad[path=PATH,width=W,height=H,name=N]
     /// See <https://crosvm.dev/book/devices/input.html> for more
     /// information.
     pub input: Vec<InputDeviceOption>,
@@ -1839,10 +1860,29 @@ pub struct RunCommand {
     pmem_device: Vec<DiskOption>,
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    #[argh(option, arg_name = "PATH")]
+    #[argh(
+        option,
+        arg_name = "PATH[,key=value[,key=value[,...]]]",
+        from_str_fn(parse_pmem_ext2_option)
+    )]
     #[serde(default)]
     #[merge(strategy = append)]
-    /// (EXPERIMENTAL): construct an ext2 file system on a pmem device from the given directory
+    /// (EXPERIMENTAL): construct an ext2 file system on a pmem
+    /// device from the given directory. The argument is the form of
+    /// "PATH[,key=value[,key=value[,...]]]".
+    /// Valid keys:
+    ///     blocks_per_group=NUM - Number of blocks in a block
+    ///       group. (default: 4096)
+    ///     inodes_per_group=NUM - Number of inodes in a block
+    ///       group. (default: 1024)
+    ///     size=BYTES - Size of the memory region allocated by this
+    ///       device. A file system will be built on the region. If
+    ///       the filesystem doesn't fit within this size, crosvm
+    ///       will fail to start with an error.
+    ///       The number of block groups in the file system is
+    ///       calculated from this value and other given parameters.
+    ///       The value of `size` must be larger than (4096 *
+    ///        blocks_per_group.) (default: 16777216)
     pub pmem_ext2: Vec<PmemExt2Option>,
 
     #[cfg(feature = "process-invariants")]
@@ -2211,13 +2251,6 @@ pub struct RunCommand {
     /// (EXPERIMENTAL) enable split-irqchip support
     pub split_irqchip: Option<bool>,
 
-    #[cfg(feature = "balloon")]
-    #[argh(switch)]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite_option)]
-    /// don't allow guest to use pages from the balloon
-    pub strict_balloon: Option<bool>,
-
     #[argh(
         option,
         arg_name = "DOMAIN:BUS:DEVICE.FUNCTION[,vendor=NUM][,device=NUM][,class=NUM][,subsystem_vendor=NUM][,subsystem_device=NUM][,revision=NUM]"
@@ -2504,16 +2537,6 @@ pub struct RunCommand {
     /// enable a virtual cpu freq device
     pub virt_cpufreq: Option<bool>,
 
-    #[cfg(all(
-        any(target_arch = "arm", target_arch = "aarch64"),
-        any(target_os = "android", target_os = "linux")
-    ))]
-    #[argh(option, arg_name = "SOCKET_PATH")]
-    #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// (EXPERIMENTAL) use UDS for a virtual cpu freq device
-    pub virt_cpufreq_socket: Option<PathBuf>,
-
     #[cfg(feature = "audio")]
     #[argh(
         option,
@@ -2710,7 +2733,9 @@ impl TryFrom<RunCommand> for super::config::Config {
         ))]
         {
             cfg.virt_cpufreq = cmd.virt_cpufreq.unwrap_or_default();
-            cfg.virt_cpufreq_socket = cmd.virt_cpufreq_socket;
+            if let Some(frequencies) = cmd.cpu_frequencies_khz {
+                cfg.cpu_frequencies_khz = frequencies;
+            }
         }
 
         cfg.vcpu_cgroup_path = cmd.vcpu_cgroup_path;
@@ -3220,7 +3245,6 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.balloon_page_reporting = cmd.balloon_page_reporting.unwrap_or_default();
             cfg.balloon_ws_num_bins = cmd.balloon_ws_num_bins.unwrap_or(4);
             cfg.balloon_ws_reporting = cmd.balloon_ws_reporting.unwrap_or_default();
-            cfg.strict_balloon = cmd.strict_balloon.unwrap_or_default();
             cfg.init_memory = cmd.init_mem;
         }
 

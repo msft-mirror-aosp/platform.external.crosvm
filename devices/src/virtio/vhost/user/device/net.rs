@@ -5,7 +5,6 @@
 pub mod sys;
 
 use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use base::error;
 use base::AsRawDescriptors;
@@ -40,7 +39,7 @@ use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 
 thread_local! {
-    pub(crate) static NET_EXECUTOR: OnceCell<Executor> = OnceCell::new();
+    pub(crate) static NET_EXECUTOR: OnceCell<Executor> = const { OnceCell::new() };
 }
 
 // TODO(b/188947559): Come up with better way to include these constants. Compiler errors happen
@@ -112,7 +111,6 @@ pub struct NetBackend<T: TapT + IntoAsync> {
     tap: T,
     avail_features: u64,
     acked_features: u64,
-    acked_protocol_features: VhostUserProtocolFeatures,
     mtu: u16,
     #[cfg(all(windows, feature = "slirp"))]
     slirp_kill_event: base::Event,
@@ -155,11 +153,6 @@ where
     }
 
     fn ack_features(&mut self, value: u64) -> anyhow::Result<()> {
-        let unrequested_features = value & !self.avail_features;
-        if unrequested_features != 0 {
-            bail!("invalid features are given: {:#x}", unrequested_features);
-        }
-
         self.acked_features |= value;
 
         self.tap
@@ -169,24 +162,8 @@ where
         Ok(())
     }
 
-    fn acked_features(&self) -> u64 {
-        self.acked_features
-    }
-
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        VhostUserProtocolFeatures::CONFIG
-    }
-
-    fn ack_protocol_features(&mut self, features: u64) -> anyhow::Result<()> {
-        let features = VhostUserProtocolFeatures::from_bits(features)
-            .ok_or_else(|| anyhow!("invalid protocol features are given: {:#x}", features))?;
-        let supported = self.protocol_features();
-        self.acked_protocol_features = features & supported;
-        Ok(())
-    }
-
-    fn acked_protocol_features(&self) -> u64 {
-        self.acked_protocol_features.bits()
+        VhostUserProtocolFeatures::CONFIG | VhostUserProtocolFeatures::DEVICE_STATE
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -226,16 +203,21 @@ where
         }
     }
 
-    fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
-        serde_json::to_vec(&NetBackendSnapshot {
+    fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
+        // No non-queue workers.
+        Ok(true)
+    }
+
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        serde_json::to_value(NetBackendSnapshot {
             acked_feature: self.acked_features,
         })
         .context("Failed to serialize NetBackendSnapshot")
     }
 
-    fn restore(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
         let net_backend_snapshot: NetBackendSnapshot =
-            serde_json::from_slice(&data).context("Failed to deserialize NetBackendSnapshot")?;
+            serde_json::from_value(data).context("Failed to deserialize NetBackendSnapshot")?;
         self.acked_features = net_backend_snapshot.acked_feature;
         Ok(())
     }

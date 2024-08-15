@@ -246,30 +246,60 @@ impl BackendClient {
         self.wait_for_ack(&hdr)
     }
 
-    /// Put the device to sleep.
-    pub fn sleep(&self) -> Result<()> {
-        let hdr = self.send_request_header(FrontendReq::SLEEP, None)?;
-        let reply = self.recv_reply::<VhostUserSuccess>(&hdr)?;
-        if !reply.success() {
-            Err(VhostUserError::SleepError(anyhow!(
-                "Device process responded with a failure on SLEEP."
-            )))
-        } else {
-            Ok(())
+    /// Front-end and back-end negotiate a channel over which to transfer the back-end’s internal
+    /// state during migration.
+    ///
+    /// Requires VHOST_USER_PROTOCOL_F_DEVICE_STATE to be negotiated.
+    pub fn set_device_state_fd(
+        &self,
+        transfer_direction: VhostUserTransferDirection,
+        migration_phase: VhostUserMigrationPhase,
+        fd: &impl AsRawDescriptor,
+    ) -> Result<Option<File>> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::DEVICE_STATE.bits() == 0 {
+            return Err(VhostUserError::InvalidOperation);
+        }
+        // Send request.
+        let req = DeviceStateTransferParameters {
+            transfer_direction: match transfer_direction {
+                VhostUserTransferDirection::Save => 0,
+                VhostUserTransferDirection::Load => 1,
+            },
+            migration_phase: match migration_phase {
+                VhostUserMigrationPhase::Stopped => 0,
+            },
+        };
+        let hdr = self.send_request_with_body(
+            FrontendReq::SET_DEVICE_STATE_FD,
+            &req,
+            Some(&[fd.as_raw_descriptor()]),
+        )?;
+        // Receive reply.
+        let (reply, files) = self.recv_reply_with_files::<VhostUserU64>(&hdr)?;
+        let has_err = reply.value & 0xff != 0;
+        let invalid_fd = reply.value & 0x100 != 0;
+        if has_err {
+            return Err(VhostUserError::BackendInternalError);
+        }
+        match (invalid_fd, files.len()) {
+            (true, 0) => Ok(None),
+            (false, 1) => Ok(files.into_iter().next()),
+            _ => Err(VhostUserError::IncorrectFds),
         }
     }
 
-    /// Wake the device up.
-    pub fn wake(&self) -> Result<()> {
-        let hdr = self.send_request_header(FrontendReq::WAKE, None)?;
-        let reply = self.recv_reply::<VhostUserSuccess>(&hdr)?;
-        if !reply.success() {
-            Err(VhostUserError::WakeError(anyhow!(
-                "Device process responded with a failure on WAKE."
-            )))
-        } else {
-            Ok(())
+    /// After transferring the back-end’s internal state during migration, check whether the
+    /// back-end was able to successfully fully process the state.
+    pub fn check_device_state(&self) -> Result<()> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::DEVICE_STATE.bits() == 0 {
+            return Err(VhostUserError::InvalidOperation);
         }
+        let hdr = self.send_request_header(FrontendReq::CHECK_DEVICE_STATE, None)?;
+        let reply = self.recv_reply::<VhostUserU64>(&hdr)?;
+        if reply.value != 0 {
+            return Err(VhostUserError::BackendInternalError);
+        }
+        Ok(())
     }
 
     /// Snapshot the device and receive serialized state of the device.
@@ -286,22 +316,10 @@ impl BackendClient {
     }
 
     /// Restore the device.
-    pub fn restore(&mut self, data_bytes: &[u8], queue_evts: Option<Vec<Event>>) -> Result<()> {
+    pub fn restore(&mut self, data_bytes: &[u8]) -> Result<()> {
         let body = VhostUserEmptyMsg;
 
-        let queue_evt_fds: Option<Vec<RawDescriptor>> = queue_evts.as_ref().map(|queue_evts| {
-            queue_evts
-                .iter()
-                .map(|queue_evt| queue_evt.as_raw_descriptor())
-                .collect()
-        });
-
-        let hdr = self.send_request_with_payload(
-            FrontendReq::RESTORE,
-            &body,
-            data_bytes,
-            queue_evt_fds.as_deref(),
-        )?;
+        let hdr = self.send_request_with_payload(FrontendReq::RESTORE, &body, data_bytes, None)?;
         let reply = self.recv_reply::<VhostUserSuccess>(&hdr)?;
         if !reply.success() {
             Err(VhostUserError::RestoreError(anyhow!(
@@ -319,12 +337,7 @@ impl BackendClient {
         }
         let hdr = self.send_request_header(FrontendReq::GET_PROTOCOL_FEATURES, None)?;
         let val = self.recv_reply::<VhostUserU64>(&hdr)?;
-        // Should we support forward compatibility?
-        // If so just mask out unrecognized flags instead of return errors.
-        match VhostUserProtocolFeatures::from_bits(val.value) {
-            Some(val) => Ok(val),
-            None => Err(VhostUserError::InvalidMessage),
-        }
+        Ok(VhostUserProtocolFeatures::from_bits_truncate(val.value))
     }
 
     /// Enable protocol features in the underlying vhost implementation.
@@ -642,7 +655,7 @@ impl BackendClient {
         }
 
         let (reply, body, files) = self.connection.recv_message::<T>()?;
-        if !reply.is_reply_for(hdr) || files.is_empty() || !body.is_valid() {
+        if !reply.is_reply_for(hdr) || !body.is_valid() {
             return Err(VhostUserError::InvalidMessage);
         }
         Ok((body, files))
@@ -727,6 +740,7 @@ mod tests {
     use crate::tests::create_pair;
 
     const BUFFER_SIZE: usize = 0x1001;
+    const INVALID_PROTOCOL_FEATURE: u64 = 1 << 63;
 
     #[test]
     fn create_backend_client() {
@@ -815,7 +829,8 @@ mod tests {
 
         let pfeatures = VhostUserProtocolFeatures::all();
         let hdr = VhostUserMsgHeader::new(FrontendReq::GET_PROTOCOL_FEATURES, 0x4, 8);
-        let msg = VhostUserU64::new(pfeatures.bits());
+        // Unknown feature bits should be ignored.
+        let msg = VhostUserU64::new(pfeatures.bits() | INVALID_PROTOCOL_FEATURE);
         peer.send_message(&hdr, &msg, None).unwrap();
         let features = backend_client.get_protocol_features().unwrap();
         assert_eq!(features, pfeatures);

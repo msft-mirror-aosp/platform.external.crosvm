@@ -86,12 +86,20 @@ struct GpuBackend {
     ex: Executor,
     gpu: Rc<RefCell<Gpu>>,
     resource_bridges: Arc<Mutex<Vec<Tube>>>,
-    acked_protocol_features: u64,
     state: Option<Rc<RefCell<gpu::Frontend>>>,
     fence_state: Arc<Mutex<gpu::FenceState>>,
     queue_workers: [Option<WorkerState<Arc<Mutex<Queue>>, ()>>; MAX_QUEUE_NUM],
     platform_workers: Rc<RefCell<Vec<TaskHandle<()>>>>,
     shmem_mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
+}
+
+impl GpuBackend {
+    fn stop_non_queue_workers(&mut self) -> anyhow::Result<()> {
+        for handle in self.platform_workers.borrow_mut().drain(..) {
+            let _ = self.ex.run_until(handle.cancel());
+        }
+        Ok(())
+    }
 }
 
 impl VhostUserDevice for GpuBackend {
@@ -108,29 +116,12 @@ impl VhostUserDevice for GpuBackend {
         Ok(())
     }
 
-    fn acked_features(&self) -> u64 {
-        self.features()
-    }
-
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         VhostUserProtocolFeatures::CONFIG
             | VhostUserProtocolFeatures::BACKEND_REQ
             | VhostUserProtocolFeatures::MQ
             | VhostUserProtocolFeatures::SHARED_MEMORY_REGIONS
-    }
-
-    fn ack_protocol_features(&mut self, features: u64) -> anyhow::Result<()> {
-        let unrequested_features = features & !self.protocol_features().bits();
-        if unrequested_features != 0 {
-            bail!("Unexpected protocol features: {:#x}", unrequested_features);
-        }
-
-        self.acked_protocol_features |= features;
-        Ok(())
-    }
-
-    fn acked_protocol_features(&self) -> u64 {
-        self.acked_protocol_features
+            | VhostUserProtocolFeatures::DEVICE_STATE
     }
 
     fn read_config(&self, offset: u64, dst: &mut [u8]) {
@@ -250,11 +241,9 @@ impl VhostUserDevice for GpuBackend {
         }
     }
 
-    fn stop_non_queue_workers(&mut self) -> anyhow::Result<()> {
-        for handle in self.platform_workers.borrow_mut().drain(..) {
-            let _ = self.ex.run_until(handle.cancel());
-        }
-        Ok(())
+    fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
+        self.stop_non_queue_workers()?;
+        Ok(true)
     }
 
     fn reset(&mut self) {
@@ -287,16 +276,13 @@ impl VhostUserDevice for GpuBackend {
         }
     }
 
-    fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         // TODO(b/289431114): Snapshot more fields if needed. Right now we just need a bare bones
         // snapshot of the GPU to create a POC.
-        serde_json::to_vec(&serde_json::Value::Null)
-            .context("Failed to serialize Null in the GPU device")
+        Ok(serde_json::Value::Null)
     }
 
-    fn restore(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
-        let data: serde_json::Value = serde_json::from_slice(data.as_slice())
-            .context("Failed to deserialize NULL in the GPU device")?;
+    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
         anyhow::ensure!(
             data.is_null(),
             "unexpected snapshot data: should be null, got {}",

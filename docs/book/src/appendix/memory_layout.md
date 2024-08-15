@@ -69,28 +69,37 @@ These apply for all boot modes.
 | [`AARCH64_AXI_BASE`]              | `4000_0000`     |                 |                | Seemingly unused? Is this hard-coded somewhere in the kernel? |
 | [`AARCH64_PROTECTED_VM_FW_START`] | `7fc0_0000`     | `8000_0000`     | 4 MiB          | pVM firmware (if running a protected VM)                      |
 | [`AARCH64_PHYS_MEM_START`]        | `8000_0000`     |                 | --mem size     | RAM (starts at IPA = 2 GiB)                                   |
-| [`get_swiotlb_addr`]              | after RAM       |                 | --swiotlb size | Only present for hypervisors requiring static swiotlb alloc   |
-| [`plat_mmio_base`]                | after swiotlb   | +0x800000       | 8 MiB          | Platform device MMIO region                                   |
+| [`plat_mmio_base`]                | after RAM       | +0x800000       | 8 MiB          | Platform device MMIO region                                   |
 | [`high_mmio_base`]                | after plat_mmio | max phys addr   |                | High MMIO allocation area                                     |
 
-### Layout when booting a kernel
+### RAM Layout
 
-These apply when no bootloader is passed, so crosvm boots a kernel directly.
+The RAM layout depends on the `--fdt-position` setting, which defaults to
+`start` when load using `--bios` and to `end` when using `--kernel`.
 
-| Name/source link          | Address           | End (exclusive) | Size  | Notes                        |
-| ------------------------- | ----------------- | --------------- | ----- | ---------------------------- |
-| [`AARCH64_KERNEL_OFFSET`] | `8000_0000`       |                 |       | Kernel load location in RAM  |
-| [`initrd_addr`]           | after kernel      |                 |       | Linux initrd location in RAM |
-| [`fdt_address`]           | before end of RAM |                 | 2 MiB | Flattened device tree in RAM |
+In `--kernel` mode, the initrd is always loaded immediately after the kernel,
+with a 16 MiB alignment.
 
-### Layout when booting a bootloader
+#### --fdt-position=start
 
-These apply when a bootloader is passed with `--bios`.
+| Name/source link          | Address           | End (exclusive) | Size  | Notes                            |
+| ------------------------- | ----------------- | --------------- | ----- | -------------------------------- |
+| [`fdt_address`]           | `8000_0000`       | `8020_0000`     | 2 MiB | Flattened device tree in RAM     |
+| [`payload_address`]       | `8020_0000`       |                 |       | Kernel/BIOS load location in RAM |
 
-| Name/source link                    | Address     | End (exclusive) | Size  | Notes                        |
-| ----------------------------------- | ----------- | --------------- | ----- | ---------------------------- |
-| [`AARCH64_FDT_OFFSET_IN_BIOS_MODE`] | `8000_0000` | `8020_0000`     | 2 MiB | Flattened device tree in RAM |
-| [`AARCH64_BIOS_OFFSET`]             | `8020_0000` |                 |       | Bootloader image in RAM      |
+#### --fdt-position=after-payload
+
+| Name/source link          | Address                             | End (exclusive) | Size  | Notes                            |
+| ------------------------- | ----------------------------------- | --------------- | ----- | -------------------------------- |
+| [`payload_address`]       | `8000_0000`                         |                 |       | Kernel/BIOS load location in RAM |
+| [`fdt_address`]           | after payload (2 MiB alignment)     |                 | 2 MiB | Flattened device tree in RAM     |
+
+#### --fdt-position=end
+
+| Name/source link          | Address                             | End (exclusive) | Size  | Notes                            |
+| ------------------------- | ----------------------------------- | --------------- | ----- | -------------------------------- |
+| [`payload_address`]       | `8000_0000`                         |                 |       | Kernel/BIOS load location in RAM |
+| [`fdt_address`]           | before end of RAM (2 MiB alignment) |                 | 2 MiB | Flattened device tree in RAM     |
 
 [serial_addr]: https://crsrc.org/o/src/platform/crosvm/arch/src/serial.rs;l=78?q=SERIAL_ADDR
 [`aarch64_rtc_addr`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=177?q=AARCH64_RTC_ADDR
@@ -104,11 +113,7 @@ These apply when a bootloader is passed with `--bios`.
 [`aarch64_pvtime_ipa_start`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=100?q=AARCH64_PVTIME_IPA_START
 [`aarch64_protected_vm_fw_start`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=96?q=AARCH64_PROTECTED_VM_FW_START
 [`aarch64_phys_mem_start`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=85?q=AARCH64_PHYS_MEM_START
-[`get_swiotlb_addr`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs?q=get_swiotlb_addr
 [`plat_mmio_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=835?q=plat_mmio_base
 [`high_mmio_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=838?q=high_mmio_base
-[`aarch64_kernel_offset`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=76?q=AARCH64_KERNEL_OFFSET
-[`initrd_addr`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=409?q=initrd_addr
 [`fdt_address`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=301?q=fdt_address
-[`aarch64_fdt_offset_in_bios_mode`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=90?q=AARCH64_FDT_OFFSET_IN_BIOS_MODE
-[`aarch64_bios_offset`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=92?q=AARCH64_BIOS_OFFSET
+[`payload_address`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=301?q=payload_address

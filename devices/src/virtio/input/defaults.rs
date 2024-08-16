@@ -11,12 +11,6 @@ use super::virtio_input_bitmap;
 use super::virtio_input_device_ids;
 use super::VirtioInputConfig;
 
-fn name_with_index(device_name: &[u8], idx: u32) -> Vec<u8> {
-    let mut ret = device_name.to_vec();
-    ret.extend_from_slice(idx.to_string().as_bytes());
-    ret
-}
-
 /// Instantiates a VirtioInputConfig object with the default configuration for a trackpad. It
 /// supports touch, left button and right button events, as well as X and Y axis.
 pub fn new_trackpad_config(
@@ -26,15 +20,34 @@ pub fn new_trackpad_config(
     name: Option<&str>,
 ) -> VirtioInputConfig {
     let name = name
-        .map(|name| name.as_bytes().to_vec())
-        .unwrap_or(name_with_index(b"Crosvm Virtio Trackpad ", idx));
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Trackpad {idx}"));
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
         name,
-        name_with_index(b"virtio-trackpad-", idx),
+        format!("virtio-trackpad-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_trackpad_events(),
         default_trackpad_absinfo(width, height),
+    )
+}
+
+pub fn new_multitouch_trackpad_config(
+    idx: u32,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Multi-touch Trackpad {idx}"));
+    VirtioInputConfig::new(
+        virtio_input_device_ids::new(0, 0, 0, 0),
+        name,
+        format!("virtio-multi-touch-trackpad-{idx}"),
+        virtio_input_bitmap::from_bits(&[INPUT_PROP_POINTER, INPUT_PROP_BUTTONPAD]),
+        default_multitouchpad_events(),
+        default_multitouchpad_absinfo(width, height, 10, 65536),
     )
 }
 
@@ -43,8 +56,8 @@ pub fn new_trackpad_config(
 pub fn new_mouse_config(idx: u32) -> VirtioInputConfig {
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
-        name_with_index(b"Crosvm Virtio Mouse ", idx),
-        name_with_index(b"virtio-mouse-", idx),
+        format!("Crosvm Virtio Mouse {idx}"),
+        format!("virtio-mouse-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_mouse_events(),
         BTreeMap::new(),
@@ -56,8 +69,8 @@ pub fn new_mouse_config(idx: u32) -> VirtioInputConfig {
 pub fn new_keyboard_config(idx: u32) -> VirtioInputConfig {
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
-        name_with_index(b"Crosvm Virtio Keyboard ", idx),
-        name_with_index(b"virtio-keyboard-", idx),
+        format!("Crosvm Virtio Keyboard {idx}"),
+        format!("virtio-keyboard-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_keyboard_events(),
         BTreeMap::new(),
@@ -69,8 +82,8 @@ pub fn new_keyboard_config(idx: u32) -> VirtioInputConfig {
 pub fn new_switches_config(idx: u32) -> VirtioInputConfig {
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
-        name_with_index(b"Crosvm Virtio Switches ", idx),
-        name_with_index(b"virtio-switches-", idx),
+        format!("Crosvm Virtio Switches {idx}"),
+        format!("virtio-switches-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_switch_events(),
         BTreeMap::new(),
@@ -82,8 +95,8 @@ pub fn new_switches_config(idx: u32) -> VirtioInputConfig {
 pub fn new_rotary_config(idx: u32) -> VirtioInputConfig {
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
-        name_with_index(b"Crosvm Virtio Rotary ", idx),
-        name_with_index(b"virtio-rotary-", idx),
+        format!("Crosvm Virtio Rotary {idx}"),
+        format!("virtio-rotary-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_rotary_events(),
         BTreeMap::new(),
@@ -99,12 +112,12 @@ pub fn new_single_touch_config(
     name: Option<&str>,
 ) -> VirtioInputConfig {
     let name = name
-        .map(|name| name.as_bytes().to_vec())
-        .unwrap_or(name_with_index(b"Crosvm Virtio Touchscreen ", idx));
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Touchscreen {idx}"));
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
         name,
-        name_with_index(b"virtio-touchscreen-", idx),
+        format!("virtio-touchscreen-{idx}"),
         virtio_input_bitmap::from_bits(&[INPUT_PROP_DIRECT]),
         default_touchscreen_events(),
         default_touchscreen_absinfo(width, height),
@@ -120,15 +133,12 @@ pub fn new_multi_touch_config(
     name: Option<&str>,
 ) -> VirtioInputConfig {
     let name = name
-        .map(|name| name.as_bytes().to_vec())
-        .unwrap_or(name_with_index(
-            b"Crosvm Virtio Multitouch Touchscreen ",
-            idx,
-        ));
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Multitouch Touchscreen {idx}"));
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
         name,
-        name_with_index(b"virtio-touchscreen-", idx),
+        format!("virtio-touchscreen-{idx}"),
         virtio_input_bitmap::from_bits(&[INPUT_PROP_DIRECT]),
         default_multitouchscreen_events(),
         default_multitouchscreen_absinfo(width, height, 10, 10),
@@ -158,6 +168,8 @@ fn default_multitouchscreen_absinfo(
     let mut absinfo: BTreeMap<u16, virtio_input_absinfo> = BTreeMap::new();
     absinfo.insert(ABS_MT_SLOT, virtio_input_absinfo::new(0, slot, 0, 0));
     absinfo.insert(ABS_MT_TRACKING_ID, virtio_input_absinfo::new(0, id, 0, 0));
+    absinfo.insert(ABS_X, virtio_input_absinfo::new(0, width, 0, 0));
+    absinfo.insert(ABS_Y, virtio_input_absinfo::new(0, height, 0, 0));
     absinfo.insert(ABS_MT_POSITION_X, virtio_input_absinfo::new(0, width, 0, 0));
     absinfo.insert(
         ABS_MT_POSITION_Y,
@@ -176,6 +188,66 @@ fn default_multitouchscreen_events() -> BTreeMap<u16, virtio_input_bitmap> {
             ABS_MT_TRACKING_ID,
             ABS_MT_POSITION_X,
             ABS_MT_POSITION_Y,
+            ABS_X,
+            ABS_Y,
+        ]),
+    );
+    supported_events
+}
+
+fn default_multitouchpad_absinfo(
+    width: u32,
+    height: u32,
+    slot: u32,
+    id: u32,
+) -> BTreeMap<u16, virtio_input_absinfo> {
+    let mut absinfo: BTreeMap<u16, virtio_input_absinfo> = BTreeMap::new();
+    absinfo.insert(ABS_MT_SLOT, virtio_input_absinfo::new(0, slot, 0, 0));
+    absinfo.insert(ABS_MT_TRACKING_ID, virtio_input_absinfo::new(0, id, 0, 0));
+    // TODO(b/347253952): make them configurable if necessary
+    absinfo.insert(ABS_MT_PRESSURE, virtio_input_absinfo::new(0, 255, 0, 0));
+    absinfo.insert(ABS_PRESSURE, virtio_input_absinfo::new(0, 255, 0, 0));
+    absinfo.insert(ABS_MT_TOUCH_MAJOR, virtio_input_absinfo::new(0, 4095, 0, 0));
+    absinfo.insert(ABS_MT_TOUCH_MINOR, virtio_input_absinfo::new(0, 4095, 0, 0));
+    absinfo.insert(ABS_X, virtio_input_absinfo::new(0, width, 0, 0));
+    absinfo.insert(ABS_Y, virtio_input_absinfo::new(0, height, 0, 0));
+    absinfo.insert(ABS_MT_POSITION_X, virtio_input_absinfo::new(0, width, 0, 0));
+    absinfo.insert(ABS_MT_TOOL_TYPE, virtio_input_absinfo::new(0, 2, 0, 0));
+    absinfo.insert(
+        ABS_MT_POSITION_Y,
+        virtio_input_absinfo::new(0, height, 0, 0),
+    );
+    absinfo
+}
+
+fn default_multitouchpad_events() -> BTreeMap<u16, virtio_input_bitmap> {
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(
+        EV_KEY,
+        virtio_input_bitmap::from_bits(&[
+            BTN_TOUCH,
+            BTN_TOOL_FINGER,
+            BTN_TOOL_DOUBLETAP,
+            BTN_TOOL_TRIPLETAP,
+            BTN_TOOL_QUADTAP,
+            BTN_LEFT,
+        ]),
+    );
+    supported_events.insert(
+        EV_ABS,
+        virtio_input_bitmap::from_bits(&[
+            ABS_MT_SLOT,
+            ABS_MT_TRACKING_ID,
+            ABS_MT_POSITION_X,
+            ABS_MT_POSITION_Y,
+            ABS_MT_TOOL_TYPE,
+            ABS_MT_PRESSURE,
+            ABS_X,
+            ABS_Y,
+            ABS_PRESSURE,
+            ABS_MT_TOUCH_MAJOR,
+            ABS_MT_TOUCH_MINOR,
+            ABS_PRESSURE,
         ]),
     );
     supported_events
@@ -378,7 +450,7 @@ mod tests {
     #[test]
     fn test_new_switches_config() {
         let config = new_switches_config(0);
-        assert_eq!(config.serial_name, b"virtio-switches-0".to_vec());
+        assert_eq!(config.serial_name, "virtio-switches-0");
 
         let events = config.supported_events;
         assert_eq!(events.len(), 1);

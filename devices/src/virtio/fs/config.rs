@@ -46,6 +46,10 @@ const fn config_default_posix_acl() -> bool {
     true
 }
 
+const fn config_default_security_ctx() -> bool {
+    true
+}
+
 fn deserialize_timeout<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     let secs = u64::deserialize(deserializer)?;
 
@@ -168,6 +172,38 @@ pub struct Config {
     /// The default value for this option is `true`.
     #[serde(default = "config_default_posix_acl")]
     pub posix_acl: bool,
+
+    // Maximum number of dynamic permission paths.
+    //
+    // The dynamic permission paths are used to set specific paths certain uid/gid after virtiofs
+    // device is created. It is for arcvm special usage, normal device should not support
+    // this feature.
+    //
+    // The default value for this option is 0.
+    #[serde(default)]
+    pub max_dynamic_perm: usize,
+
+    // Maximum number of dynamic xattr paths.
+    //
+    // The dynamic xattr paths are used to set specific paths certain xattr after virtiofs
+    // device is created. It is for arcvm special usage, normal device should not support
+    // this feature.
+    //
+    // The default value for this option is 0.
+    #[serde(default)]
+    pub max_dynamic_xattr: usize,
+
+    // Controls whether fuse_security_context feature is enabled
+    //
+    // The FUSE_SECURITY_CONTEXT feature needs write data into /proc/thread-self/attr/fscreate.
+    // For the hosts that prohibit the write operation, the option should be set to false to
+    // disable the FUSE_SECURITY_CONTEXT feature. When FUSE_SECURITY_CONTEXT is disabled, the
+    // security context won't be passed with fuse request, which makes guest created files/dir
+    // having unlabeled security context or empty security context.
+    //
+    // The default value for this option is true
+    #[serde(default = "config_default_security_ctx")]
+    pub security_ctx: bool,
 }
 
 impl Default for Config {
@@ -183,6 +219,9 @@ impl Default for Config {
             privileged_quota_uids: Default::default(),
             use_dax: false,
             posix_acl: config_default_posix_acl(),
+            max_dynamic_perm: 0,
+            max_dynamic_xattr: 0,
+            security_ctx: config_default_security_ctx(),
         }
     }
 }

@@ -6,12 +6,15 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::ops::RangeInclusive;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -48,8 +51,6 @@ use devices::virtio::vhost::user::NetBackend;
 use devices::virtio::vhost::user::VhostUserDeviceBuilder;
 use devices::virtio::vhost::user::VhostUserVsockDevice;
 use devices::virtio::vsock::VsockConfig;
-#[cfg(feature = "balloon")]
-use devices::virtio::BalloonMode;
 use devices::virtio::Console;
 #[cfg(feature = "net")]
 use devices::virtio::NetError;
@@ -57,6 +58,7 @@ use devices::virtio::NetError;
 use devices::virtio::NetParameters;
 #[cfg(feature = "net")]
 use devices::virtio::NetParametersMode;
+use devices::virtio::PmemConfig;
 use devices::virtio::VhostUserFrontend;
 use devices::virtio::VirtioDevice;
 use devices::virtio::VirtioDeviceType;
@@ -327,23 +329,55 @@ impl<'a> VirtioDeviceBuilder for &'a ScsiConfig<'a> {
     }
 }
 
-fn vhost_user_connection(path: &Path) -> Result<UnixStream> {
-    UnixStream::connect(path).with_context(|| {
-        format!(
-            "failed to connect to vhost-user socket path {}",
-            path.display()
-        )
-    })
+fn vhost_user_connection(path: &Path, connect_timeout_ms: Option<u64>) -> Result<UnixStream> {
+    let deadline = connect_timeout_ms.map(|t| Instant::now() + Duration::from_millis(t));
+    let mut first = true;
+    loop {
+        match UnixStream::connect(path) {
+            Ok(x) => return Ok(x),
+            Err(e) => {
+                // ConnectionRefused => Might be a stale file the backend hasn't deleted yet.
+                // NotFound => Might be the backend hasn't bound the socket yet.
+                if e.kind() == ErrorKind::ConnectionRefused || e.kind() == ErrorKind::NotFound {
+                    if let Some(deadline) = deadline {
+                        if first {
+                            first = false;
+                            warn!(
+                                "vhost-user socket path {} not available. retrying up to {} ms",
+                                path.display(),
+                                connect_timeout_ms.unwrap()
+                            );
+                        }
+                        if Instant::now() > deadline {
+                            anyhow::bail!(
+                                "timeout waiting for vhost-user socket path {}: final error: {e:#}",
+                                path.display()
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                }
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to connect to vhost-user socket path {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 pub fn create_vhost_user_frontend(
     protection_type: ProtectionType,
     opt: &VhostUserFrontendOption,
+    connect_timeout_ms: Option<u64>,
 ) -> DeviceResult {
     let dev = VhostUserFrontend::new(
         opt.type_,
         virtio::base_features(protection_type),
-        vhost_user_connection(&opt.socket)?,
+        vhost_user_connection(&opt.socket, connect_timeout_ms)?,
         opt.max_queue_size,
         opt.pci_address,
     )
@@ -362,7 +396,7 @@ pub fn create_vhost_user_fs_device(
 ) -> DeviceResult {
     let dev = VhostUserFrontend::new_fs(
         virtio::base_features(protection_type),
-        vhost_user_connection(&option.socket)?,
+        vhost_user_connection(&option.socket, None)?,
         option.max_queue_size,
         option.tag.as_deref(),
     )
@@ -409,7 +443,7 @@ pub fn create_virtio_snd_device(
         Backend::Sys(virtio::snd::sys::StreamSourceBackend::AAUDIO) => "snd_aaudio_device",
         #[cfg(feature = "audio_cras")]
         Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) => "snd_cras_device",
-        #[cfg(not(feature = "audio_cras"))]
+        #[cfg(not(any(feature = "audio_cras", feature = "audio_aaudio")))]
         _ => unreachable!(),
     };
 
@@ -552,6 +586,35 @@ pub fn create_trackpad_device<T: IntoUnixStream>(
     })
 }
 
+pub fn create_multitouch_trackpad_device<T: IntoUnixStream>(
+    protection_type: ProtectionType,
+    jail_config: &Option<JailConfig>,
+    trackpad_socket: T,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+    idx: u32,
+) -> DeviceResult {
+    let socket = trackpad_socket
+        .into_unix_stream()
+        .context("failed configuring virtio trackpad")?;
+
+    let dev = virtio::input::new_multitouch_trackpad(
+        idx,
+        socket,
+        width,
+        height,
+        name,
+        virtio::base_features(protection_type),
+    )
+    .context("failed to set up input device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
 pub fn create_mouse_device<T: IntoUnixStream>(
     protection_type: ProtectionType,
     jail_config: &Option<JailConfig>,
@@ -652,7 +715,6 @@ pub fn create_vinput_device(
 pub fn create_balloon_device(
     protection_type: ProtectionType,
     jail_config: &Option<JailConfig>,
-    mode: BalloonMode,
     tube: Tube,
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
@@ -667,7 +729,6 @@ pub fn create_balloon_device(
         VmMemoryClient::new(dynamic_mapping_device_tube),
         inflate_tube,
         init_balloon_size,
-        mode,
         enabled_features,
         #[cfg(feature = "registered_events")]
         registered_evt_q,
@@ -1146,23 +1207,25 @@ pub fn create_pmem_device(
         arena
     };
 
-    let mapping_address = resources
-        .allocate_mmio(
-            arena_size,
-            Alloc::PmemDevice(index),
-            format!("pmem_disk_image_{}", index),
-            AllocOptions::new()
+    let mapping_address = GuestAddress(
+        resources
+            .allocate_mmio(
+                arena_size,
+                Alloc::PmemDevice(index),
+                format!("pmem_disk_image_{}", index),
+                AllocOptions::new()
                 .top_down(true)
                 .prefetchable(true)
                 // Linux kernel requires pmem namespaces to be 128 MiB aligned.
                 // cf. https://github.com/pmem/ndctl/issues/76
                 .align(128 * 1024 * 1024), /* 128 MiB */
-        )
-        .context("failed to allocate memory for pmem device")?;
+            )
+            .context("failed to allocate memory for pmem device")?,
+    );
 
-    let slot = vm
+    let mapping_arena_slot = vm
         .add_memory_region(
-            GuestAddress(mapping_address),
+            mapping_address,
             Box::new(arena),
             /* read_only = */ pmem.ro,
             /* log_dirty_pages = */ false,
@@ -1172,13 +1235,15 @@ pub fn create_pmem_device(
 
     let dev = virtio::Pmem::new(
         virtio::base_features(protection_type),
-        Some(fd),
-        GuestAddress(mapping_address),
-        slot,
-        arena_size,
-        pmem_device_tube,
-        pmem.swap_interval,
-        !pmem.ro,
+        PmemConfig {
+            disk_image: Some(fd),
+            mapping_address,
+            mapping_arena_slot,
+            mapping_size: arena_size,
+            pmem_device_tube,
+            swap_interval: pmem.swap_interval,
+            mapping_writable: !pmem.ro,
+        },
     )
     .context("failed to create pmem device")?;
 
@@ -1198,29 +1263,32 @@ pub fn create_pmem_ext2_device(
     pmem_device_tube: Tube,
 ) -> DeviceResult {
     let cfg = ext2::Config {
-        inodes_per_group: 4096,
-        blocks_per_group: 1024,
+        inodes_per_group: opts.inodes_per_group,
+        blocks_per_group: opts.blocks_per_group,
+        size: opts.size,
     };
     let arena = ext2::create_ext2_region(&cfg, Some(opts.path.as_path()))?;
-    let arena_size = arena.size() as u64;
+    let mapping_size = arena.size() as u64;
 
-    let mapping_address = resources
-        .allocate_mmio(
-            arena_size,
-            Alloc::PmemDevice(index),
-            format!("pmem_ext2_image_{}", index),
-            AllocOptions::new()
+    let mapping_address = GuestAddress(
+        resources
+            .allocate_mmio(
+                mapping_size,
+                Alloc::PmemDevice(index),
+                format!("pmem_ext2_image_{}", index),
+                AllocOptions::new()
                 .top_down(true)
                 .prefetchable(true)
                 // 2MB alignment for DAX
                 // cf. https://docs.pmem.io/persistent-memory/getting-started-guide/creating-development-environments/linux-environments/advanced-topics/i-o-alignment-considerations#verifying-io-alignment
                 .align(2 * 1024 * 1024),
-        )
-        .context("failed to allocate memory for pmem device")?;
+            )
+            .context("failed to allocate memory for pmem device")?,
+    );
 
-    let slot = vm
+    let mapping_arena_slot = vm
         .add_memory_region(
-            GuestAddress(mapping_address),
+            mapping_address,
             Box::new(arena),
             /* read_only= */ true,
             /* log_dirty_pages= */ false,
@@ -1230,13 +1298,15 @@ pub fn create_pmem_ext2_device(
 
     let dev = virtio::Pmem::new(
         virtio::base_features(protection_type),
-        None,
-        GuestAddress(mapping_address),
-        slot,
-        arena_size,
-        pmem_device_tube,
-        /* swap_interval= */ None,
-        /* mapping_writable= */ false,
+        PmemConfig {
+            disk_image: None,
+            mapping_address,
+            mapping_arena_slot,
+            mapping_size,
+            pmem_device_tube,
+            swap_interval: None,
+            mapping_writable: false,
+        },
     )
     .context("failed to create pmem device")?;
 

@@ -61,11 +61,10 @@ use base::clear_fd_flags;
 use base::error;
 use base::warn;
 use base::Event;
-use base::FromRawDescriptor;
-use base::IntoRawDescriptor;
 use base::Protection;
 use base::SafeDescriptor;
 use base::SharedMemory;
+use base::WorkerThread;
 use cros_async::TaskHandle;
 use hypervisor::MemCacheType;
 use serde::Deserialize;
@@ -82,11 +81,13 @@ use vmm_vhost::message::VhostUserExternalMapMsg;
 use vmm_vhost::message::VhostUserGpuMapMsg;
 use vmm_vhost::message::VhostUserInflight;
 use vmm_vhost::message::VhostUserMemoryRegion;
+use vmm_vhost::message::VhostUserMigrationPhase;
 use vmm_vhost::message::VhostUserProtocolFeatures;
 use vmm_vhost::message::VhostUserShmemMapMsg;
 use vmm_vhost::message::VhostUserShmemMapMsgFlags;
 use vmm_vhost::message::VhostUserShmemUnmapMsg;
 use vmm_vhost::message::VhostUserSingleMemoryRegion;
+use vmm_vhost::message::VhostUserTransferDirection;
 use vmm_vhost::message::VhostUserVringAddrFlags;
 use vmm_vhost::message::VhostUserVringState;
 use vmm_vhost::BackendReq;
@@ -186,25 +187,41 @@ pub trait VhostUserDevice {
     /// negotiated.
     fn set_backend_req_connection(&mut self, _conn: Arc<VhostBackendReqConnection>) {}
 
-    /// Used to stop non queue workers that `VhostUserDevice::stop_queue` can't stop. May or may
-    /// not also stop all queue workers.
-    fn stop_non_queue_workers(&mut self) -> anyhow::Result<()> {
-        error!("sleep not implemented for vhost user device");
-        // TODO(rizhang): Return error once basic devices support this.
-        Ok(())
+    /// Enter the "suspended device state" described in the vhost-user spec. See the spec for
+    /// requirements.
+    ///
+    /// One reasonably foolproof way to satisfy the requirements is to stop all worker threads.
+    ///
+    /// Called after a `stop_queue` call if there are no running queues left. Also called soon
+    /// after device creation to detect support (if supported, it is assumed the device is acting
+    /// suspended immediately on construction).
+    ///
+    /// The next `start_queue` call implicitly exits the "suspend device state".
+    ///
+    /// `Ok(false)` is returned to signal that this state isn't supported. In that case, the
+    /// framework will block some features, e.g. snapshot/restore and
+    /// `VHOST_USER_SET_DEVICE_STATE_FD`.
+    ///
+    /// * Ok(true)  => device successfully suspended
+    /// * Ok(false) => "suspended device state" not supported
+    /// * Err(_)    => unrecoverable error
+    fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// Snapshot device and return serialized bytes.
-    fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
-        error!("snapshot not implemented for vhost user device");
-        // TODO(rizhang): Return error once basic devices support this.
-        Ok(Vec::new())
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!(
+            "snapshot not implemented for vhost user device {}",
+            std::any::type_name::<Self>()
+        );
     }
 
-    fn restore(&mut self, _data: Vec<u8>) -> anyhow::Result<()> {
-        error!("restore not implemented for vhost user device");
-        // TODO(rizhang): Return error once basic devices support this.
-        Ok(())
+    fn restore(&mut self, _data: serde_json::Value) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "snapshot not implemented for vhost user device {}",
+            std::any::type_name::<Self>()
+        );
     }
 }
 
@@ -214,17 +231,6 @@ struct Vring {
     queue: QueueConfig,
     doorbell: Option<Interrupt>,
     enabled: bool,
-    // Active queue that is only `Some` when the device is sleeping.
-    paused_queue: Option<Queue>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct VringSnapshot {
-    // Snapshot of queue config.
-    queue: serde_json::Value,
-    // Snapshot of the activated queue state.
-    paused_queue: Option<serde_json::Value>,
-    enabled: bool,
 }
 
 impl Vring {
@@ -233,7 +239,6 @@ impl Vring {
             queue: QueueConfig::new(max_size, features),
             doorbell: None,
             enabled: false,
-            paused_queue: None,
         }
     }
 
@@ -241,41 +246,6 @@ impl Vring {
         self.queue.reset();
         self.doorbell = None;
         self.enabled = false;
-        self.paused_queue = None;
-    }
-
-    fn snapshot(&self) -> anyhow::Result<VringSnapshot> {
-        Ok(VringSnapshot {
-            queue: self.queue.snapshot()?,
-            enabled: self.enabled,
-            paused_queue: self
-                .paused_queue
-                .as_ref()
-                .map(Queue::snapshot)
-                .transpose()?,
-        })
-    }
-
-    fn restore(
-        &mut self,
-        vring_snapshot: VringSnapshot,
-        mem: &GuestMemory,
-        event: Option<Event>,
-    ) -> anyhow::Result<()> {
-        self.queue.restore(vring_snapshot.queue)?;
-        self.enabled = vring_snapshot.enabled;
-        self.paused_queue = vring_snapshot
-            .paused_queue
-            .map(|value| {
-                Queue::restore(
-                    &self.queue,
-                    value,
-                    mem,
-                    event.context("missing queue event")?,
-                )
-            })
-            .transpose()?;
-        Ok(())
     }
 }
 
@@ -357,33 +327,46 @@ impl VhostUserRegularOps {
 pub struct DeviceRequestHandler<T: VhostUserDevice> {
     vrings: Vec<Vring>,
     owned: bool,
+    // true iff all queues are stopped and `enter_suspended_state` succeeded.
+    suspended: bool,
     vmm_maps: Option<Vec<MappingInfo>>,
     mem: Option<GuestMemory>,
     acked_features: u64,
     acked_protocol_features: VhostUserProtocolFeatures,
     backend: T,
     backend_req_connection: Arc<Mutex<VhostBackendReqConnectionState>>,
+    // Thread processing active device state FD.
+    device_state_thread: Option<DeviceStateThread>,
+}
+
+enum DeviceStateThread {
+    Save(WorkerThread<serde_json::Result<()>>),
+    Load(WorkerThread<serde_json::Result<DeviceRequestHandlerSnapshot>>),
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct DeviceRequestHandlerSnapshot {
     acked_features: u64,
     acked_protocol_features: u64,
-    vrings: Vec<VringSnapshot>,
-    backend: Vec<u8>,
+    backend: serde_json::Value,
 }
 
 impl<T: VhostUserDevice> DeviceRequestHandler<T> {
     /// Creates a vhost-user handler instance for `backend`.
-    pub(crate) fn new(backend: T) -> Self {
+    pub(crate) fn new(mut backend: T) -> Self {
         let mut vrings = Vec::with_capacity(backend.max_queue_num());
         for _ in 0..backend.max_queue_num() {
             vrings.push(Vring::new(Queue::MAX_SIZE, backend.features()));
         }
 
+        let suspended = backend
+            .enter_suspended_state()
+            .expect("enter_suspended_state failed on device init");
+
         DeviceRequestHandler {
             vrings,
             owned: false,
+            suspended,
             vmm_maps: None,
             mem: None,
             acked_features: 0,
@@ -392,6 +375,7 @@ impl<T: VhostUserDevice> DeviceRequestHandler<T> {
             backend_req_connection: Arc::new(Mutex::new(
                 VhostBackendReqConnectionState::NoConnection,
             )),
+            device_state_thread: None,
         }
     }
 }
@@ -554,18 +538,30 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         // "The back-end must [...] stop ring upon receiving VHOST_USER_GET_VRING_BASE."
         // We only call `queue.set_ready()` when starting the queue, so if the queue is ready, that
         // means it is started and should be stopped.
-        if vring.queue.ready() {
-            if let Err(e) = self.backend.stop_queue(index as usize) {
-                error!("Failed to stop queue in get_vring_base: {:#}", e);
-            }
+        let vring_base = if vring.queue.ready() {
+            let queue = match self.backend.stop_queue(index as usize) {
+                Ok(q) => q,
+                Err(e) => {
+                    error!("Failed to stop queue in get_vring_base: {:#}", e);
+                    return Err(VhostError::BackendInternalError);
+                }
+            };
 
             vring.reset();
+
+            queue.next_avail_to_process()
+        } else {
+            0
+        };
+
+        if self.vrings.iter().all(|vring| !vring.queue.ready()) {
+            self.suspended = self
+                .backend
+                .enter_suspended_state()
+                .map_err(VhostError::EnterSuspendedState)?;
         }
 
-        Ok(VhostUserVringState::new(
-            index,
-            vring.queue.next_avail().0 as u32,
-        ))
+        Ok(VhostUserVringState::new(index, vring_base.into()))
     }
 
     fn set_vring_kick(&mut self, index: u8, file: Option<File>) -> VhostResult<()> {
@@ -608,6 +604,8 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
             error!("Failed to start queue {}: {}", index, e);
             return Err(VhostError::BackendInternalError);
         }
+
+        self.suspended = false;
 
         Ok(())
     }
@@ -726,6 +724,89 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         Ok(())
     }
 
+    fn set_device_state_fd(
+        &mut self,
+        transfer_direction: VhostUserTransferDirection,
+        migration_phase: VhostUserMigrationPhase,
+        mut fd: File,
+    ) -> VhostResult<Option<File>> {
+        if migration_phase != VhostUserMigrationPhase::Stopped {
+            return Err(VhostError::InvalidOperation);
+        }
+        if !self.suspended {
+            return Err(VhostError::InvalidOperation);
+        }
+        if self.device_state_thread.is_some() {
+            error!("must call check_device_state before starting new state transfer");
+            return Err(VhostError::InvalidOperation);
+        }
+        // `set_device_state_fd` is designed to allow snapshot/restore concurrently with other
+        // methods, but, for simplicitly, we do those operations inline and only spawn a thread to
+        // handle the serialization and data transfer (the latter which seems necessary to
+        // implement the API correctly without, e.g., deadlocking because a pipe is full).
+        match transfer_direction {
+            VhostUserTransferDirection::Save => {
+                // Snapshot the state.
+                let snapshot = DeviceRequestHandlerSnapshot {
+                    acked_features: self.acked_features,
+                    acked_protocol_features: self.acked_protocol_features.bits(),
+                    backend: self.backend.snapshot().map_err(VhostError::SnapshotError)?,
+                };
+                // Spawn thread to write the serialized bytes.
+                self.device_state_thread = Some(DeviceStateThread::Save(WorkerThread::start(
+                    "device_state_save",
+                    move |_kill_event| serde_json::to_writer(&mut fd, &snapshot),
+                )));
+                Ok(None)
+            }
+            VhostUserTransferDirection::Load => {
+                // Spawn a thread to read the bytes and deserialize. Restore will happen in
+                // `check_device_state`.
+                self.device_state_thread = Some(DeviceStateThread::Load(WorkerThread::start(
+                    "device_state_load",
+                    move |_kill_event| serde_json::from_reader(&mut fd),
+                )));
+                Ok(None)
+            }
+        }
+    }
+
+    fn check_device_state(&mut self) -> VhostResult<()> {
+        let Some(thread) = self.device_state_thread.take() else {
+            error!("check_device_state: no active state transfer");
+            return Err(VhostError::InvalidOperation);
+        };
+        match thread {
+            DeviceStateThread::Save(worker) => {
+                worker.stop().map_err(|e| {
+                    error!("device state save thread failed: {:#}", e);
+                    VhostError::BackendInternalError
+                })?;
+                Ok(())
+            }
+            DeviceStateThread::Load(worker) => {
+                let snapshot = worker.stop().map_err(|e| {
+                    error!("device state load thread failed: {:#}", e);
+                    VhostError::BackendInternalError
+                })?;
+                self.acked_features = snapshot.acked_features;
+                self.acked_protocol_features =
+                    VhostUserProtocolFeatures::from_bits(snapshot.acked_protocol_features)
+                        .with_context(|| {
+                            format!(
+                                "unsupported bits in acked_protocol_features: {:#x}",
+                                snapshot.acked_protocol_features
+                            )
+                        })
+                        .map_err(VhostError::RestoreError)?;
+                self.backend
+                    .restore(snapshot.backend)
+                    .map_err(VhostError::RestoreError)?;
+                Ok(())
+            }
+        }
+    }
+
     fn get_shared_memory_regions(&mut self) -> VhostResult<Vec<VhostSharedMemoryRegion>> {
         Ok(if let Some(r) = self.backend.get_shared_memory_region() {
             vec![VhostSharedMemoryRegion::new(r.id, r.length)]
@@ -734,51 +815,15 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         })
     }
 
-    fn sleep(&mut self) -> VhostResult<()> {
-        for (index, vring) in self
-            .vrings
-            .iter_mut()
-            .enumerate()
-            .filter(|(_index, vring)| vring.queue.ready())
-        {
-            match self.backend.stop_queue(index) {
-                Ok(queue) => vring.paused_queue = Some(queue),
-                Err(e) => {
-                    error!("failed to stop queue index {}: {:#}", index, e);
-                    return Err(VhostError::StopQueueError(e));
-                }
-            }
-        }
-        self.backend
-            .stop_non_queue_workers()
-            .map_err(VhostError::SleepError)
-    }
-
-    fn wake(&mut self) -> VhostResult<()> {
-        for (index, vring) in self.vrings.iter_mut().enumerate() {
-            if let Some(queue) = vring.paused_queue.take() {
-                let mem = self.mem.clone().ok_or(VhostError::BackendInternalError)?;
-                let doorbell = vring.doorbell.clone().expect("Failed to clone doorbell");
-
-                if let Err(e) = self.backend.start_queue(index, queue, mem, doorbell) {
-                    error!("Failed to start queue {}: {}", index, e);
-                    return Err(VhostError::BackendInternalError);
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn snapshot(&mut self) -> VhostResult<Vec<u8>> {
+        if !self.suspended {
+            return Err(VhostError::InvalidOperation);
+        }
         match serde_json::to_vec(&DeviceRequestHandlerSnapshot {
             acked_features: self.acked_features,
             acked_protocol_features: self.acked_protocol_features.bits(),
-            vrings: self
-                .vrings
-                .iter()
-                .map(|vring| vring.snapshot())
-                .collect::<anyhow::Result<Vec<VringSnapshot>>>()
-                .map_err(VhostError::SnapshotError)?,
+            // TODO: The backend's snapshot is getting double serialized. Consider serializing just
+            // the other fields and then passing along the backend's snapshot as is.
             backend: self.backend.snapshot().map_err(VhostError::SnapshotError)?,
         }) {
             Ok(serialized_json) => Ok(serialized_json),
@@ -789,7 +834,10 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         }
     }
 
-    fn restore(&mut self, data_bytes: &[u8], queue_evts: Vec<File>) -> VhostResult<()> {
+    fn restore(&mut self, data_bytes: &[u8]) -> VhostResult<()> {
+        if !self.suspended {
+            return Err(VhostError::InvalidOperation);
+        }
         let device_request_handler_snapshot: DeviceRequestHandlerSnapshot =
             serde_json::from_slice(data_bytes).map_err(|e| {
                 error!("Failed to deserialize DeviceRequestHandlerSnapshot: {}", e);
@@ -807,43 +855,6 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
             )
         })
         .map_err(VhostError::RestoreError)?;
-
-        let mem = self.mem.as_ref().ok_or(VhostError::InvalidOperation)?;
-
-        let snapshotted_vrings = device_request_handler_snapshot.vrings;
-        assert_eq!(snapshotted_vrings.len(), self.vrings.len());
-
-        let mut queue_evts_iter = if queue_evts.is_empty() {
-            None
-        } else {
-            Some(queue_evts.into_iter())
-        };
-
-        for (index, (vring, snapshotted_vring)) in self
-            .vrings
-            .iter_mut()
-            .zip(snapshotted_vrings.into_iter())
-            .enumerate()
-        {
-            let queue_evt = if let Some(queue_evts_iter) = &mut queue_evts_iter {
-                // TODO(b/288596005): It is assumed that the index of `queue_evts` should map to the
-                // index of `self.vrings`. However, this assumption may break in the future, so a
-                // Map of indexes to queue_evt should be used to support sparse activated queues.
-                let queue_evt_file = queue_evts_iter
-                    .next()
-                    .ok_or(VhostError::VringIndexNotFound(index))?;
-                Some(VhostUserRegularOps::set_vring_kick(
-                    index as u8,
-                    Some(queue_evt_file),
-                )?)
-            } else {
-                None
-            };
-
-            vring
-                .restore(snapshotted_vring, mem, queue_evt)
-                .map_err(VhostError::RestoreError)?;
-        }
 
         self.backend
             .restore(device_request_handler_snapshot.backend)
@@ -965,12 +976,7 @@ impl SharedMemoryMapper for VhostShmemMapper {
                     } => (descriptor, offset, size),
                     VmMemorySource::SharedMemory(shmem) => {
                         let size = shmem.size();
-                        let descriptor =
-                            // SAFETY:
-                            // Safe because we own shmem.
-                            unsafe {
-                                SafeDescriptor::from_raw_descriptor(shmem.into_raw_descriptor())
-                            };
+                        let descriptor = SafeDescriptor::from(shmem);
                         (descriptor, 0, size)
                     }
                     _ => bail!("unsupported source"),
@@ -1055,7 +1061,13 @@ mod tests {
         acked_features: u64,
         active_queues: Vec<Option<Queue>>,
         allow_backend_req: bool,
+        supports_device_state: bool,
         backend_conn: Option<Arc<VhostBackendReqConnection>>,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    struct FakeBackendSnapshot {
+        data: Vec<u8>,
     }
 
     impl FakeBackend {
@@ -1069,6 +1081,7 @@ mod tests {
                 acked_features: 0,
                 active_queues,
                 allow_backend_req: false,
+                supports_device_state: false,
                 backend_conn: None,
             }
         }
@@ -1100,6 +1113,9 @@ mod tests {
             if self.allow_backend_req {
                 features |= VhostUserProtocolFeatures::BACKEND_REQ;
             }
+            if self.supports_device_state {
+                features |= VhostUserProtocolFeatures::DEVICE_STATE;
+            }
             features
         }
 
@@ -1129,20 +1145,52 @@ mod tests {
         fn set_backend_req_connection(&mut self, conn: Arc<VhostBackendReqConnection>) {
             self.backend_conn = Some(conn);
         }
+
+        fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+            serde_json::to_value(FakeBackendSnapshot {
+                data: vec![1, 2, 3],
+            })
+            .context("failed to serialize snapshot")
+        }
+
+        fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+            let snapshot: FakeBackendSnapshot =
+                serde_json::from_value(data).context("failed to deserialize snapshot")?;
+            assert_eq!(snapshot.data, vec![1, 2, 3], "bad snapshot data");
+            Ok(())
+        }
     }
 
     #[test]
-    fn test_vhost_user_activate() {
-        test_vhost_user_activate_parameterized(false);
+    fn test_vhost_user_lifecycle() {
+        test_vhost_user_lifecycle_parameterized(false, true);
+    }
+
+    #[test]
+    fn test_vhost_user_lifecycle_legacy_snapshot() {
+        test_vhost_user_lifecycle_parameterized(false, false);
     }
 
     #[test]
     #[cfg(not(windows))] // Windows requries more complex connection setup.
-    fn test_vhost_user_activate_with_backend_req() {
-        test_vhost_user_activate_parameterized(true);
+    fn test_vhost_user_lifecycle_with_backend_req() {
+        test_vhost_user_lifecycle_parameterized(true, true);
     }
 
-    fn test_vhost_user_activate_parameterized(allow_backend_req: bool) {
+    #[test]
+    #[cfg(not(windows))] // Windows requries more complex connection setup.
+    fn test_vhost_user_lifecycle_with_backend_req_legacy_snapshot() {
+        test_vhost_user_lifecycle_parameterized(true, false);
+    }
+
+    fn test_vhost_user_lifecycle_parameterized(
+        allow_backend_req: bool,
+        supports_device_state: bool,
+    ) {
         const QUEUES_NUM: usize = 2;
 
         let (dev, vmm) = test_helpers::setup();
@@ -1202,10 +1250,26 @@ mod tests {
             activate(&mut vmm_device);
 
             println!("virtio_sleep");
-            vmm_device.virtio_sleep().unwrap();
+            let queues = vmm_device
+                .virtio_sleep()
+                .unwrap()
+                .expect("virtio_sleep unexpectedly returned None");
+
+            println!("virtio_snapshot");
+            let snapshot = vmm_device
+                .virtio_snapshot()
+                .expect("virtio_snapshot failed");
+            println!("virtio_restore");
+            vmm_device
+                .virtio_restore(snapshot)
+                .expect("virtio_restore failed");
 
             println!("virtio_wake");
-            vmm_device.virtio_wake(None).unwrap();
+            let mem = GuestMemory::new(&[(GuestAddress(0x0), 0x10000)]).unwrap();
+            let interrupt = Interrupt::new_for_test_with_msix();
+            vmm_device
+                .virtio_wake(Some((mem, interrupt, queues)))
+                .unwrap();
 
             println!("wait for shutdown signal");
             shutdown_rx.recv().unwrap();
@@ -1220,6 +1284,7 @@ mod tests {
         // Device side
         let mut handler = DeviceRequestHandler::new(FakeBackend::new());
         handler.as_mut().allow_backend_req = allow_backend_req;
+        handler.as_mut().supports_device_state = supports_device_state;
 
         // Notify listener is ready.
         ready_tx.send(()).unwrap();
@@ -1280,10 +1345,35 @@ mod tests {
         }
 
         // VhostUserFrontend::virtio_sleep()
-        handle_request(&mut req_handler, FrontendReq::SLEEP).unwrap();
+        for _ in 0..QUEUES_NUM {
+            handle_request(&mut req_handler, FrontendReq::SET_VRING_ENABLE).unwrap();
+            handle_request(&mut req_handler, FrontendReq::GET_VRING_BASE).unwrap();
+        }
+
+        if supports_device_state {
+            // VhostUserFrontend::virtio_snapshot()
+            handle_request(&mut req_handler, FrontendReq::SET_DEVICE_STATE_FD).unwrap();
+            handle_request(&mut req_handler, FrontendReq::CHECK_DEVICE_STATE).unwrap();
+            // VhostUserFrontend::virtio_restore()
+            handle_request(&mut req_handler, FrontendReq::SET_DEVICE_STATE_FD).unwrap();
+            handle_request(&mut req_handler, FrontendReq::CHECK_DEVICE_STATE).unwrap();
+        } else {
+            // VhostUserFrontend::virtio_snapshot()
+            handle_request(&mut req_handler, FrontendReq::SNAPSHOT).unwrap();
+            // VhostUserFrontend::virtio_restore()
+            handle_request(&mut req_handler, FrontendReq::RESTORE).unwrap();
+        }
 
         // VhostUserFrontend::virtio_wake()
-        handle_request(&mut req_handler, FrontendReq::WAKE).unwrap();
+        handle_request(&mut req_handler, FrontendReq::SET_MEM_TABLE).unwrap();
+        for _ in 0..QUEUES_NUM {
+            handle_request(&mut req_handler, FrontendReq::SET_VRING_NUM).unwrap();
+            handle_request(&mut req_handler, FrontendReq::SET_VRING_ADDR).unwrap();
+            handle_request(&mut req_handler, FrontendReq::SET_VRING_BASE).unwrap();
+            handle_request(&mut req_handler, FrontendReq::SET_VRING_CALL).unwrap();
+            handle_request(&mut req_handler, FrontendReq::SET_VRING_KICK).unwrap();
+            handle_request(&mut req_handler, FrontendReq::SET_VRING_ENABLE).unwrap();
+        }
 
         if allow_backend_req {
             // Make sure the connection still works even after sleep/wake.

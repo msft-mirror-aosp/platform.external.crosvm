@@ -81,7 +81,6 @@ pub use serial::get_serial_cmdline;
 pub use serial::set_default_serial_parameters;
 pub use serial::GetSerialCmdlineError;
 pub use serial::SERIAL_ADDR;
-#[cfg(any(target_os = "android", target_os = "linux"))]
 use sync::Condvar;
 use sync::Mutex;
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -137,6 +136,17 @@ pub enum VmImage {
 pub struct Pstore {
     pub path: PathBuf,
     pub size: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub enum FdtPosition {
+    /// At the start of RAM.
+    Start,
+    /// Near the end of RAM.
+    End,
+    /// After the payload, with some padding for alignment.
+    AfterPayload,
 }
 
 /// Set of CPU cores.
@@ -360,6 +370,11 @@ pub struct VmComponents {
     pub no_i8042: bool,
     pub no_rtc: bool,
     pub no_smt: bool,
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        any(target_os = "android", target_os = "linux")
+    ))]
+    pub normalized_cpu_capacities: BTreeMap<usize, u32>,
     #[cfg(target_arch = "x86_64")]
     pub pci_low_start: Option<u64>,
     #[cfg(target_arch = "x86_64")]
@@ -376,11 +391,6 @@ pub struct VmComponents {
     pub swiotlb: Option<u64>,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub vcpu_count: usize,
-    #[cfg(all(
-        any(target_arch = "arm", target_arch = "aarch64"),
-        any(target_os = "android", target_os = "linux")
-    ))]
-    pub virt_cpufreq_socket: Option<std::os::unix::net::UnixStream>,
     pub vm_image: VmImage,
 }
 
@@ -413,7 +423,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     /// If it's Some, then `build_vm` already created the vcpus.
     pub vcpus: Option<Vec<Vcpu>>,
     pub vm: V,
-    pub vm_request_tube: Option<Tube>,
+    pub vm_request_tubes: Vec<Tube>,
 }
 
 /// The device and optional jail.
@@ -486,10 +496,9 @@ pub trait LinuxArch {
         #[cfg(target_arch = "x86_64")] pflash_jail: Option<Minijail>,
         #[cfg(target_arch = "x86_64")] fw_cfg_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
-        #[cfg(any(target_os = "android", target_os = "linux"))] guest_suspended_cvar: Option<
-            Arc<(Mutex<bool>, Condvar)>,
-        >,
+        guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         device_tree_overlays: Vec<DtbOverlay>,
+        fdt_position: Option<FdtPosition>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmArch,
@@ -530,6 +539,9 @@ pub trait LinuxArch {
 
     /// Returns frequency map for each of the host's logical cores.
     fn get_host_cpu_frequencies_khz() -> Result<BTreeMap<usize, Vec<u32>>, Self::Error>;
+
+    /// Returns max-freq map of the host's logical cores.
+    fn get_host_cpu_max_freq_khz() -> Result<BTreeMap<usize, u32>, Self::Error>;
 
     /// Returns capacity map of the host's logical cores.
     fn get_host_cpu_capacity() -> Result<BTreeMap<usize, u32>, Self::Error>;
@@ -1271,7 +1283,7 @@ where
 {
     let size = image.get_len().map_err(LoadImageError::GetLen)?;
 
-    if size > usize::max_value() as u64 || size > max_size {
+    if size > usize::MAX as u64 || size > max_size {
         return Err(LoadImageError::ImageSizeTooLarge(size));
     }
 
@@ -1321,7 +1333,7 @@ where
         return Err(LoadImageError::ZeroSizedImage);
     }
 
-    if size > usize::max_value() as u64 || size > max_size {
+    if size > usize::MAX as u64 || size > max_size {
         return Err(LoadImageError::ImageSizeTooLarge(size));
     }
 

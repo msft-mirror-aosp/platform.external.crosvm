@@ -82,7 +82,9 @@ pub trait VcpuX86_64: Vcpu {
     /// Injects interrupt vector `irq` into the VCPU.
     ///
     /// This function should only be called when [`Self::ready_for_interrupt`] returns true.
-    /// Otherwise the interrupt injetion may fail or the next VCPU run may fail.
+    /// Otherwise the interrupt injection may fail or the next VCPU run may fail. However, if
+    /// [`Self::interrupt`] returns [`Ok`], the implementation must guarantee that the interrupt
+    /// isn't injected in an uninterruptible window (e.g. right after the mov ss instruction).
     ///
     /// The caller should avoid calling this function more than 1 time for one VMEXIT, because the
     /// hypervisor may behave differently: some hypervisors(e.g. WHPX, KVM) will only try to inject
@@ -809,7 +811,8 @@ impl Default for Regs {
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize)]
 pub struct Segment {
     pub base: u64,
-    pub limit: u32,
+    /// Limit of the segment - always in bytes, regardless of granularity (`g`) field.
+    pub limit_bytes: u32,
     pub selector: u16,
     pub type_: u8,
     pub present: u8,
@@ -869,7 +872,7 @@ impl Default for Sregs {
         // 16-bit real-mode code segment (reset vector).
         let code_seg = Segment {
             base: 0xffff0000,
-            limit: 0xffff,
+            limit_bytes: 0xffff,
             selector: 0xf000,
             type_: SEG_TYPE_CODE | SEG_TYPE_CODE_READABLE | SEG_TYPE_ACCESSED, // 11
             present: 1,
@@ -880,7 +883,7 @@ impl Default for Sregs {
         // 16-bit real-mode data segment.
         let data_seg = Segment {
             base: 0,
-            limit: 0xffff,
+            limit_bytes: 0xffff,
             selector: 0,
             type_: SEG_TYPE_DATA | SEG_TYPE_DATA_WRITABLE | SEG_TYPE_ACCESSED, // 3
             present: 1,
@@ -891,7 +894,7 @@ impl Default for Sregs {
         // 16-bit TSS segment.
         let task_seg = Segment {
             base: 0,
-            limit: 0xffff,
+            limit_bytes: 0xffff,
             selector: 0,
             type_: SEG_TYPE_CODE | SEG_TYPE_CODE_READABLE | SEG_TYPE_ACCESSED, // 11
             present: 1,
@@ -902,7 +905,7 @@ impl Default for Sregs {
         // Local descriptor table.
         let ldt = Segment {
             base: 0,
-            limit: 0xffff,
+            limit_bytes: 0xffff,
             selector: 0,
             type_: SEG_TYPE_DATA | SEG_TYPE_DATA_WRITABLE, // 2
             present: 1,

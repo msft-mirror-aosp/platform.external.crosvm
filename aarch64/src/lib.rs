@@ -16,6 +16,7 @@ use std::sync::Arc;
 use arch::get_serial_cmdline;
 use arch::CpuSet;
 use arch::DtbOverlay;
+use arch::FdtPosition;
 use arch::GetSerialCmdlineError;
 use arch::RunnableLinuxVm;
 use arch::VcpuAffinity;
@@ -73,7 +74,6 @@ use resources::AddressRange;
 use resources::MmioType;
 use resources::SystemAllocator;
 use resources::SystemAllocatorConfig;
-#[cfg(any(target_os = "android", target_os = "linux"))]
 use sync::Condvar;
 use sync::Mutex;
 use thiserror::Error;
@@ -87,9 +87,8 @@ use vm_memory::MemoryRegionPurpose;
 
 mod fdt;
 
-// We place the kernel at the very beginning of physical memory.
-const AARCH64_KERNEL_OFFSET: u64 = 0;
 const AARCH64_FDT_MAX_SIZE: u64 = 0x200000;
+const AARCH64_FDT_ALIGN: u64 = 0x200000;
 const AARCH64_INITRD_ALIGN: u64 = 0x1000000;
 
 // Maximum Linux arm64 kernel command line size (arch/arm64/include/uapi/asm/setup.h).
@@ -103,12 +102,6 @@ const AARCH64_GIC_CPUI_SIZE: u64 = 0x20000;
 const AARCH64_PHYS_MEM_START: u64 = 0x80000000;
 const AARCH64_AXI_BASE: u64 = 0x40000000;
 const AARCH64_PLATFORM_MMIO_SIZE: u64 = 0x800000;
-
-// FDT is placed at the front of RAM when booting in BIOS mode.
-const AARCH64_FDT_OFFSET_IN_BIOS_MODE: u64 = 0x0;
-// Therefore, the BIOS is placed after the FDT in memory.
-const AARCH64_BIOS_OFFSET: u64 = AARCH64_FDT_MAX_SIZE;
-const AARCH64_BIOS_MAX_LEN: u64 = 1 << 20;
 
 const AARCH64_PROTECTED_VM_FW_MAX_SIZE: u64 = 0x400000;
 const AARCH64_PROTECTED_VM_FW_START: u64 =
@@ -161,22 +154,17 @@ impl PayloadType {
     }
 }
 
-fn get_kernel_addr() -> GuestAddress {
-    GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_KERNEL_OFFSET)
-}
-
-fn get_bios_addr() -> GuestAddress {
-    GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_BIOS_OFFSET)
-}
-
 // When static swiotlb allocation is required, returns the address it should be allocated at.
 // Otherwise, returns None.
 fn get_swiotlb_addr(
     memory_size: u64,
+    swiotlb_size: u64,
     hypervisor: &(impl Hypervisor + ?Sized),
 ) -> Option<GuestAddress> {
     if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
-        Some(GuestAddress(AARCH64_PHYS_MEM_START + memory_size))
+        Some(GuestAddress(
+            AARCH64_PHYS_MEM_START + memory_size - swiotlb_size,
+        ))
     } else {
         None
     }
@@ -265,6 +253,8 @@ pub enum Error {
     CreateTube(base::TubeError),
     #[error("failed to create VCPU: {0}")]
     CreateVcpu(base::Error),
+    #[error("unable to create vm watchdog timer device: {0}")]
+    CreateVmwdtDevice(anyhow::Error),
     #[error("custom pVM firmware could not be loaded: {0}")]
     CustomPvmFwLoadFailure(arch::LoadImageError),
     #[error("vm created wrong kind of vcpu")]
@@ -331,25 +321,6 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Returns the address in guest memory at which the FDT should be located.
-fn fdt_address(memory_end: GuestAddress, has_bios: bool) -> GuestAddress {
-    // TODO(rammuthiah) make kernel and BIOS startup use FDT from the same location. ARCVM startup
-    // currently expects the kernel at 0x80080000 and the FDT at the end of RAM for unknown reasons.
-    // Root cause and figure out how to fold these code paths together.
-    if has_bios {
-        GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_FDT_OFFSET_IN_BIOS_MODE)
-    } else {
-        // Put fdt up near the top of memory
-        // TODO(sonnyrao): will have to handle this differently if there's
-        // > 4GB memory
-        memory_end
-            .checked_sub(AARCH64_FDT_MAX_SIZE)
-            .expect("Not enough memory for FDT")
-            .checked_sub(0x10000)
-            .expect("Not enough memory for FDT")
-    }
-}
-
 fn load_kernel(
     guest_mem: &GuestMemory,
     kernel_start: GuestAddress,
@@ -401,9 +372,18 @@ impl arch::LinuxArch for AArch64 {
         components: &VmComponents,
         hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
+        // Static swiotlb is allocated from the end of RAM as a separate memory region, so, if
+        // enabled, make the RAM memory region smaller to leave room for it.
+        let mut main_memory_size = components.memory_size;
+        if let Some(size) = components.swiotlb {
+            if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
+                main_memory_size -= size;
+            }
+        }
+
         let mut memory_regions = vec![(
             GuestAddress(AARCH64_PHYS_MEM_START),
-            components.memory_size,
+            main_memory_size,
             MemoryRegionOptions::new().align(get_block_size()),
         )];
 
@@ -417,7 +397,7 @@ impl arch::LinuxArch for AArch64 {
         }
 
         if let Some(size) = components.swiotlb {
-            if let Some(addr) = get_swiotlb_addr(components.memory_size, hypervisor) {
+            if let Some(addr) = get_swiotlb_addr(components.memory_size, size, hypervisor) {
                 memory_regions.push((
                     addr,
                     size,
@@ -451,10 +431,9 @@ impl arch::LinuxArch for AArch64 {
         dump_device_tree_blob: Option<PathBuf>,
         _debugcon_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
-        #[cfg(any(target_os = "android", target_os = "linux"))] _guest_suspended_cvar: Option<
-            Arc<(Mutex<bool>, Condvar)>,
-        >,
+        _guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         device_tree_overlays: Vec<DtbOverlay>,
+        fdt_position: Option<FdtPosition>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmAArch64,
@@ -463,22 +442,39 @@ impl arch::LinuxArch for AArch64 {
         let has_bios = matches!(components.vm_image, VmImage::Bios(_));
         let mem = vm.get_memory().clone();
 
+        let fdt_position = fdt_position.unwrap_or(if has_bios {
+            FdtPosition::Start
+        } else {
+            FdtPosition::End
+        });
+        let payload_address = match fdt_position {
+            // If FDT is at the start RAM, the payload needs to go somewhere after it.
+            FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_FDT_MAX_SIZE),
+            // Otherwise, put the payload at the start of RAM.
+            FdtPosition::End | FdtPosition::AfterPayload => GuestAddress(AARCH64_PHYS_MEM_START),
+        };
+
         // separate out image loading from other setup to get a specific error for
         // image loading
         let mut initrd = None;
-        let payload = match components.vm_image {
+        let (payload, payload_end_address) = match components.vm_image {
             VmImage::Bios(ref mut bios) => {
-                let image_size =
-                    arch::load_image(&mem, bios, get_bios_addr(), AARCH64_BIOS_MAX_LEN)
-                        .map_err(Error::BiosLoadFailure)?;
-                PayloadType::Bios {
-                    entry: get_bios_addr(),
-                    image_size: image_size as u64,
-                }
+                let image_size = arch::load_image(&mem, bios, payload_address, u64::MAX)
+                    .map_err(Error::BiosLoadFailure)?;
+                (
+                    PayloadType::Bios {
+                        entry: payload_address,
+                        image_size: image_size as u64,
+                    },
+                    payload_address
+                        .checked_add(image_size.try_into().unwrap())
+                        .unwrap(),
+                )
             }
             VmImage::Kernel(ref mut kernel_image) => {
-                let loaded_kernel = load_kernel(&mem, get_kernel_addr(), kernel_image)?;
+                let loaded_kernel = load_kernel(&mem, payload_address, kernel_image)?;
                 let kernel_end = loaded_kernel.address_range.end;
+                let mut payload_end = GuestAddress(kernel_end);
                 initrd = match components.initrd_image {
                     Some(initrd_file) => {
                         let mut initrd_file = initrd_file;
@@ -490,16 +486,33 @@ impl arch::LinuxArch for AArch64 {
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
                                 .map_err(Error::InitrdLoadFailure)?;
+                        payload_end = initrd_addr
+                            .checked_add(initrd_size.try_into().unwrap())
+                            .unwrap();
                         Some((initrd_addr, initrd_size))
                     }
                     None => None,
                 };
-                PayloadType::Kernel(loaded_kernel)
+                (PayloadType::Kernel(loaded_kernel), payload_end)
             }
         };
 
         let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + components.memory_size);
-        let fdt_offset = fdt_address(memory_end, has_bios);
+
+        let fdt_address = match fdt_position {
+            FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START),
+            FdtPosition::End => {
+                let addr = memory_end
+                    .checked_sub(AARCH64_FDT_MAX_SIZE)
+                    .expect("Not enough memory for FDT")
+                    .align_down(AARCH64_FDT_ALIGN);
+                assert!(addr >= payload_end_address, "Not enough memory for FDT");
+                addr
+            }
+            FdtPosition::AfterPayload => payload_end_address
+                .align(AARCH64_FDT_ALIGN)
+                .expect("Not enough memory for FDT"),
+        };
 
         let mut use_pmu = vm
             .get_hypervisor()
@@ -524,7 +537,7 @@ impl arch::LinuxArch for AArch64 {
                 Self::vcpu_init(
                     vcpu_id,
                     &payload,
-                    fdt_offset,
+                    fdt_address,
                     components.hv_cfg.protection_type,
                     components.boot_cpu,
                 )
@@ -644,11 +657,13 @@ impl arch::LinuxArch for AArch64 {
             .map_err(Error::CreatePlatformBus)?;
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
 
+        let (vmwdt_host_tube, vmwdt_control_tube) = Tube::pair().map_err(Error::CreateTube)?;
         Self::add_arch_devs(
             irq_chip.as_irq_chip_mut(),
             &mmio_bus,
             vcpu_count,
             _vm_evt_wrtube,
+            vmwdt_control_tube,
         )?;
 
         let com_evt_1_3 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
@@ -683,10 +698,6 @@ impl arch::LinuxArch for AArch64 {
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
         if !components.cpu_frequencies.is_empty() {
-            // TODO: Revisit and optimization after benchmarking
-            let socket = components
-                .virt_cpufreq_socket
-                .map(|s| Arc::new(Mutex::new(s)));
             for vcpu in 0..vcpu_count {
                 let vcpu_affinity = match components.vcpu_affinity.clone() {
                     Some(VcpuAffinity::Global(v)) => v,
@@ -696,7 +707,14 @@ impl arch::LinuxArch for AArch64 {
 
                 let virt_cpufreq = Arc::new(Mutex::new(VirtCpufreq::new(
                     vcpu_affinity[0].try_into().unwrap(),
-                    socket.clone(),
+                    *components.normalized_cpu_capacities.get(&vcpu).unwrap(),
+                    *components
+                        .cpu_frequencies
+                        .get(&vcpu)
+                        .unwrap()
+                        .iter()
+                        .max()
+                        .unwrap(),
                 )));
 
                 if vcpu as u64 * AARCH64_VIRTFREQ_SIZE + AARCH64_VIRTFREQ_SIZE
@@ -796,7 +814,7 @@ impl arch::LinuxArch for AArch64 {
             components.cpu_clusters,
             components.cpu_capacity,
             components.cpu_frequencies,
-            fdt_offset,
+            fdt_address,
             cmdline.as_str(),
             (payload.entry(), payload.size() as usize),
             initrd,
@@ -806,7 +824,7 @@ impl arch::LinuxArch for AArch64 {
             psci_version,
             components.swiotlb.map(|size| {
                 (
-                    get_swiotlb_addr(components.memory_size, vm.get_hypervisor()),
+                    get_swiotlb_addr(components.memory_size, size, vm.get_hypervisor()),
                     size,
                 )
             }),
@@ -822,10 +840,12 @@ impl arch::LinuxArch for AArch64 {
 
         vm.init_arch(
             payload.entry(),
-            fdt_offset,
+            fdt_address,
             AARCH64_FDT_MAX_SIZE.try_into().unwrap(),
         )
         .map_err(Error::InitVmError)?;
+
+        let vm_request_tubes = vec![vmwdt_host_tube];
 
         Ok(RunnableLinuxVm {
             vm,
@@ -850,7 +870,7 @@ impl arch::LinuxArch for AArch64 {
             platform_devices,
             hotplug_bus: BTreeMap::new(),
             devices_thread: None,
-            vm_request_tube: None,
+            vm_request_tubes,
         })
     }
 
@@ -880,6 +900,14 @@ impl arch::LinuxArch for AArch64 {
     ) -> std::result::Result<PciAddress, Self::Error> {
         // hotplug function isn't verified on AArch64, so set it unsupported here.
         Err(Error::Unsupported)
+    }
+
+    fn get_host_cpu_max_freq_khz() -> std::result::Result<BTreeMap<usize, u32>, Self::Error> {
+        Ok(Self::collect_for_each_cpu(base::logical_core_max_freq_khz)
+            .map_err(Error::CpuFrequencies)?
+            .into_iter()
+            .enumerate()
+            .collect())
     }
 
     fn get_host_cpu_frequencies_khz() -> std::result::Result<BTreeMap<usize, Vec<u32>>, Self::Error>
@@ -1188,6 +1216,7 @@ impl AArch64 {
         bus: &Bus,
         vcpu_count: usize,
         vm_evt_wrtube: &SendTube,
+        vmwdt_request_tube: Tube,
     ) -> Result<()> {
         let rtc_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         let rtc = devices::pl030::Pl030::new(rtc_evt.try_clone().map_err(Error::CloneEvent)?);
@@ -1207,7 +1236,9 @@ impl AArch64 {
             vcpu_count,
             vm_evt_wrtube.try_clone().unwrap(),
             vmwdt_evt.try_clone().map_err(Error::CloneEvent)?,
-        );
+            vmwdt_request_tube,
+        )
+        .map_err(Error::CreateVmwdtDevice)?;
         irq_chip
             .register_edge_irq_event(
                 AARCH64_VMWDT_IRQ,

@@ -12,7 +12,8 @@ mod worker;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::io::Read;
+use std::io::Write;
 
 use anyhow::Context;
 use base::error;
@@ -22,16 +23,16 @@ use base::Event;
 use base::RawDescriptor;
 use base::WorkerThread;
 use serde_json::Value;
-use sync::Mutex;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::VhostUserConfigFlags;
+use vmm_vhost::message::VhostUserMigrationPhase;
 use vmm_vhost::message::VhostUserProtocolFeatures;
+use vmm_vhost::message::VhostUserTransferDirection;
 use vmm_vhost::BackendClient;
 use vmm_vhost::VhostUserMemoryRegionInfo;
 use vmm_vhost::VringConfigData;
 use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 
-use crate::pci::MsixConfig;
 use crate::virtio::copy_config;
 use crate::virtio::device_constants::VIRTIO_DEVICE_TYPE_SPECIFIC_FEATURES_MASK;
 use crate::virtio::vhost_user_frontend::error::Error;
@@ -43,7 +44,6 @@ use crate::virtio::vhost_user_frontend::worker::Worker;
 use crate::virtio::DeviceType;
 use crate::virtio::Interrupt;
 use crate::virtio::Queue;
-use crate::virtio::QueueConfig;
 use crate::virtio::SharedMemoryMapper;
 use crate::virtio::SharedMemoryRegion;
 use crate::virtio::VirtioDevice;
@@ -68,6 +68,11 @@ pub struct VhostUserFrontend {
     cfg: Option<Vec<u8>>,
     expose_shmem_descriptors_with_viommu: bool,
     pci_address: Option<PciAddress>,
+
+    // Queues that have been sent to the backend. Always `Some` when active and not asleep. Saved
+    // for use in `virtio_sleep`. Since the backend is managing them, the local state of the queue
+    // is likely stale.
+    sent_queues: Option<BTreeMap<usize, Queue>>,
 }
 
 // Returns the largest power of two that is less than or equal to `val`.
@@ -153,7 +158,8 @@ impl VhostUserFrontend {
 
         let mut allow_protocol_features = VhostUserProtocolFeatures::CONFIG
             | VhostUserProtocolFeatures::MQ
-            | VhostUserProtocolFeatures::BACKEND_REQ;
+            | VhostUserProtocolFeatures::BACKEND_REQ
+            | VhostUserProtocolFeatures::DEVICE_STATE;
 
         // HACK: the crosvm vhost-user GPU backend supports the non-standard
         // VHOST_USER_PROTOCOL_FEATURE_SHARED_MEMORY_REGIONS. This should either be standardized
@@ -241,6 +247,7 @@ impl VhostUserFrontend {
             cfg: cfg.map(|cfg| cfg.to_vec()),
             expose_shmem_descriptors_with_viommu,
             pci_address,
+            sent_queues: None,
         })
     }
 
@@ -294,7 +301,7 @@ impl VhostUserFrontend {
             .map_err(Error::SetVringAddr)?;
 
         self.backend_client
-            .set_vring_base(queue_index, 0)
+            .set_vring_base(queue_index, queue.next_avail_to_process())
             .map_err(Error::SetVringBase)?;
 
         self.backend_client
@@ -351,6 +358,11 @@ impl VhostUserFrontend {
 }
 
 impl VirtioDevice for VhostUserFrontend {
+    // Override the default debug label to differentiate vhost-user devices from virtio.
+    fn debug_label(&self) -> String {
+        format!("vu-{}", self.device_type())
+    }
+
     fn keep_rds(&self) -> Vec<RawDescriptor> {
         Vec::new()
     }
@@ -448,6 +460,8 @@ impl VirtioDevice for VhostUserFrontend {
             self.activate_vring(&mem, queue_index, queue, irqfd)?;
         }
 
+        self.sent_queues = Some(queues);
+
         drop(msix_config);
 
         self.start_worker(interrupt, non_msix_evt);
@@ -455,16 +469,18 @@ impl VirtioDevice for VhostUserFrontend {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        for queue_index in 0..self.queue_sizes.len() {
-            if self.acked_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES != 0 {
-                self.backend_client
-                    .set_vring_enable(queue_index, false)
-                    .context("set_vring_enable failed during reset")?;
+        if let Some(sent_queues) = self.sent_queues.take() {
+            for queue_index in sent_queues.into_keys() {
+                if self.acked_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES != 0 {
+                    self.backend_client
+                        .set_vring_enable(queue_index, false)
+                        .context("set_vring_enable failed during reset")?;
+                }
+                let _vring_base = self
+                    .backend_client
+                    .get_vring_base(queue_index)
+                    .context("get_vring_base failed during reset")?;
             }
-            let _vring_base = self
-                .backend_client
-                .get_vring_base(queue_index)
-                .context("get_vring_base failed during reset")?;
         }
 
         if let Some(w) = self.worker_thread.take() {
@@ -548,84 +564,139 @@ impl VirtioDevice for VhostUserFrontend {
     }
 
     fn virtio_sleep(&mut self) -> anyhow::Result<Option<BTreeMap<usize, Queue>>> {
-        self.backend_client.sleep().map_err(Error::Sleep)?;
+        let Some(mut queues) = self.sent_queues.take() else {
+            return Ok(None);
+        };
 
-        // Vhost user devices won't return queues on sleep, so return an empty Vec so that
-        // VirtioPciDevice can set the sleep state properly.
-        Ok(Some(BTreeMap::new()))
+        for (&queue_index, queue) in queues.iter_mut() {
+            if self.acked_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES != 0 {
+                self.backend_client
+                    .set_vring_enable(queue_index, false)
+                    .context("set_vring_enable failed during sleep")?;
+            }
+            let vring_base: u16 = self
+                .backend_client
+                .get_vring_base(queue_index)
+                .context("get_vring_base failed during sleep")?
+                .try_into()
+                .context("vring base from vhost-user backend is too big")?;
+            queue.vhost_user_reclaim(vring_base);
+        }
+
+        if let Some(w) = self.worker_thread.take() {
+            self.backend_req_handler = w.stop();
+        }
+
+        Ok(Some(queues))
     }
 
     fn virtio_wake(
         &mut self,
         // Vhost user doesn't need to pass queue_states back to the device process, since it will
         // already have it.
-        _queues_state: Option<(GuestMemory, Interrupt, BTreeMap<usize, Queue>)>,
+        queues_state: Option<(GuestMemory, Interrupt, BTreeMap<usize, Queue>)>,
     ) -> anyhow::Result<()> {
-        self.backend_client.wake().map_err(Error::Wake)?;
+        if let Some((mem, interrupt, queues)) = queues_state {
+            self.activate(mem, interrupt, queues)?;
+        }
         Ok(())
     }
 
     fn virtio_snapshot(&mut self) -> anyhow::Result<Value> {
-        let snapshot_bytes = self.backend_client.snapshot().map_err(Error::Snapshot)?;
+        let snapshot_bytes = if self
+            .protocol_features
+            .contains(VhostUserProtocolFeatures::DEVICE_STATE)
+        {
+            // Send the backend an FD to write the device state to. If it gives us an FD back, then
+            // we need to read from that instead.
+            let (mut r, w) = new_pipe_pair()?;
+            let backend_r = self
+                .backend_client
+                .set_device_state_fd(
+                    VhostUserTransferDirection::Save,
+                    VhostUserMigrationPhase::Stopped,
+                    &w,
+                )
+                .context("failed to negotiate device state fd")?;
+            // EOF signals end of the device state bytes, so it is important to close our copy of
+            // the write FD before we start reading.
+            std::mem::drop(w);
+            // Read the device state.
+            let mut buf = Vec::new();
+            if let Some(mut backend_r) = backend_r {
+                backend_r.read_to_end(&mut buf)
+            } else {
+                r.read_to_end(&mut buf)
+            }
+            .context("failed to read device state")?;
+            // Call `check_device_state` to ensure the data transfer was successful.
+            self.backend_client
+                .check_device_state()
+                .context("failed to transfer device state")?;
+            buf
+        } else {
+            // TODO: Delete fallback to old style snapshot once non-crosvm users are migrated off.
+            self.backend_client.snapshot().map_err(Error::Snapshot)?
+        };
         Ok(serde_json::to_value(snapshot_bytes).map_err(Error::SliceToSerdeValue)?)
     }
 
-    fn virtio_restore(&mut self, _data: Value) -> anyhow::Result<()> {
-        panic!("virtio_restore should not be called for vhost-user devices.")
-    }
-
-    fn is_vhost_user(&self) -> bool {
-        true
-    }
-
-    fn vhost_user_restore(
-        &mut self,
-        data: Value,
-        queue_configs: &[QueueConfig],
-        queue_evts: Option<Vec<Event>>,
-        interrupt: Option<Interrupt>,
-        mem: GuestMemory,
-        msix_config: &Arc<Mutex<MsixConfig>>,
-        device_activated: bool,
-    ) -> anyhow::Result<()> {
-        // Other aspects of the restore operation will depend on the mem table
-        // being set.
-        self.set_mem_table(&mem)?;
-
-        if device_activated {
-            let non_msix_evt = Event::new().context("Failed to create event")?;
-            queue_configs
-                .iter()
-                .enumerate()
-                .filter(|(_, q)| q.ready())
-                .try_for_each(|(queue_index, queue)| {
-                    let msix_lock = msix_config.lock();
-                    let irqfd = msix_lock
-                        .get_irqfd(queue.vector() as usize)
-                        .unwrap_or(&non_msix_evt);
-
-                    self.backend_client
-                        .set_vring_call(queue_index, irqfd)
-                        .map_err(Error::SetVringCall)
-                        .context("Failed to restore irqfd")?;
-
-                    Ok::<(), anyhow::Error>(())
-                })?;
-
-            self.start_worker(
-                interrupt.expect(
-                    "Interrupt doesn't exist. This shouldn't \
-                        happen since the device is activated.",
-                ),
-                non_msix_evt,
-            );
-        }
-
+    fn virtio_restore(&mut self, data: Value) -> anyhow::Result<()> {
         let data_bytes: Vec<u8> = serde_json::from_value(data).map_err(Error::SerdeValueToSlice)?;
-        self.backend_client
-            .restore(data_bytes.as_slice(), queue_evts)
-            .map_err(Error::Restore)?;
-
+        if self
+            .protocol_features
+            .contains(VhostUserProtocolFeatures::DEVICE_STATE)
+        {
+            // Send the backend an FD to read the device state from. If it gives us an FD back,
+            // then we need to write to that instead.
+            let (r, w) = new_pipe_pair()?;
+            let backend_w = self
+                .backend_client
+                .set_device_state_fd(
+                    VhostUserTransferDirection::Load,
+                    VhostUserMigrationPhase::Stopped,
+                    &r,
+                )
+                .context("failed to negotiate device state fd")?;
+            // Write the device state.
+            {
+                // EOF signals the end of the device state bytes, so we need to ensure the write
+                // objects are dropped before the `check_device_state` call. Done here by moving
+                // them into this scope.
+                let backend_w = backend_w;
+                let mut w = w;
+                if let Some(mut backend_w) = backend_w {
+                    backend_w.write_all(data_bytes.as_slice())
+                } else {
+                    w.write_all(data_bytes.as_slice())
+                }
+                .context("failed to write device state")?;
+            }
+            // Call `check_device_state` to ensure the data transfer was successful.
+            self.backend_client
+                .check_device_state()
+                .context("failed to transfer device state")?;
+        } else {
+            // TODO: Delete fallback to old style restore once non-crosvm users are migrated off.
+            self.backend_client
+                .restore(data_bytes.as_slice())
+                .map_err(Error::Restore)?;
+        }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn new_pipe_pair() -> anyhow::Result<(impl AsRawDescriptor + Read, impl AsRawDescriptor + Write)> {
+    base::pipe().context("failed to create pipe")
+}
+
+#[cfg(windows)]
+fn new_pipe_pair() -> anyhow::Result<(impl AsRawDescriptor + Read, impl AsRawDescriptor + Write)> {
+    base::named_pipes::pair(
+        &base::named_pipes::FramingMode::Byte,
+        &base::named_pipes::BlockingMode::Wait,
+        /* timeout= */ 0,
+    )
+    .context("failed to create named pipes")
 }

@@ -203,9 +203,9 @@ where
         }
     }
 
-    fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
+    fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
         // No non-queue workers.
-        Ok(())
+        Ok(true)
     }
 
     fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {

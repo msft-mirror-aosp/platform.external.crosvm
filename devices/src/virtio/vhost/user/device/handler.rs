@@ -59,7 +59,6 @@ use anyhow::Context;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use base::clear_fd_flags;
 use base::error;
-use base::trace;
 use base::warn;
 use base::Event;
 use base::Protection;
@@ -194,19 +193,36 @@ pub trait VhostUserDevice {
     /// One reasonably foolproof way to satisfy the requirements is to stop all worker threads.
     ///
     /// Called after a `stop_queue` call if there are no running queues left. Also called soon
-    /// after device creation to ensure the device is acting suspended immediately on construction.
+    /// after device creation to detect support (if supported, it is assumed the device is acting
+    /// suspended immediately on construction).
     ///
     /// The next `start_queue` call implicitly exits the "suspend device state".
     ///
-    /// * Ok(())    => device successfully suspended
+    /// `Ok(false)` is returned to signal that this state isn't supported. In that case, the
+    /// framework will block some features, e.g. snapshot/restore and
+    /// `VHOST_USER_SET_DEVICE_STATE_FD`.
+    ///
+    /// * Ok(true)  => device successfully suspended
+    /// * Ok(false) => "suspended device state" not supported
     /// * Err(_)    => unrecoverable error
-    fn enter_suspended_state(&mut self) -> anyhow::Result<()>;
+    fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 
-    /// Snapshot device and return serialized state.
-    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value>;
+    /// Snapshot device and return serialized bytes.
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!(
+            "snapshot not implemented for vhost user device {}",
+            std::any::type_name::<Self>()
+        );
+    }
 
-    /// Restore device state from a snapshot.
-    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()>;
+    fn restore(&mut self, _data: serde_json::Value) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "snapshot not implemented for vhost user device {}",
+            std::any::type_name::<Self>()
+        );
+    }
 }
 
 /// A virtio ring entry.
@@ -311,6 +327,8 @@ impl VhostUserRegularOps {
 pub struct DeviceRequestHandler<T: VhostUserDevice> {
     vrings: Vec<Vring>,
     owned: bool,
+    // true iff all queues are stopped and `enter_suspended_state` succeeded.
+    suspended: bool,
     vmm_maps: Option<Vec<MappingInfo>>,
     mem: Option<GuestMemory>,
     acked_features: u64,
@@ -341,15 +359,14 @@ impl<T: VhostUserDevice> DeviceRequestHandler<T> {
             vrings.push(Vring::new(Queue::MAX_SIZE, backend.features()));
         }
 
-        // VhostUserDevice implementations must support `enter_suspended_state()`.
-        // Call it on startup to ensure it works and to initialize the device in a suspended state.
-        backend
+        let suspended = backend
             .enter_suspended_state()
             .expect("enter_suspended_state failed on device init");
 
         DeviceRequestHandler {
             vrings,
             owned: false,
+            suspended,
             vmm_maps: None,
             mem: None,
             acked_features: 0,
@@ -360,13 +377,6 @@ impl<T: VhostUserDevice> DeviceRequestHandler<T> {
             )),
             device_state_thread: None,
         }
-    }
-
-    /// Check if all queues are stopped.
-    ///
-    /// The device can be suspended with `enter_suspended_state()` only when all queues are stopped.
-    fn all_queues_stopped(&self) -> bool {
-        self.vrings.iter().all(|vring| !vring.queue.ready())
     }
 }
 
@@ -537,21 +547,19 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
                 }
             };
 
-            trace!("stopped queue {index}");
-
             vring.reset();
-
-            if self.all_queues_stopped() {
-                trace!("all queues stopped; entering suspended state");
-                self.backend
-                    .enter_suspended_state()
-                    .map_err(VhostError::EnterSuspendedState)?;
-            }
 
             queue.next_avail_to_process()
         } else {
             0
         };
+
+        if self.vrings.iter().all(|vring| !vring.queue.ready()) {
+            self.suspended = self
+                .backend
+                .enter_suspended_state()
+                .map_err(VhostError::EnterSuspendedState)?;
+        }
 
         Ok(VhostUserVringState::new(index, vring_base.into()))
     }
@@ -597,7 +605,7 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
             return Err(VhostError::BackendInternalError);
         }
 
-        trace!("started queue {index}");
+        self.suspended = false;
 
         Ok(())
     }
@@ -725,7 +733,7 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         if migration_phase != VhostUserMigrationPhase::Stopped {
             return Err(VhostError::InvalidOperation);
         }
-        if !self.all_queues_stopped() {
+        if !self.suspended {
             return Err(VhostError::InvalidOperation);
         }
         if self.device_state_thread.is_some() {
@@ -808,7 +816,7 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
     }
 
     fn snapshot(&mut self) -> VhostResult<Vec<u8>> {
-        if !self.all_queues_stopped() {
+        if !self.suspended {
             return Err(VhostError::InvalidOperation);
         }
         match serde_json::to_vec(&DeviceRequestHandlerSnapshot {
@@ -827,7 +835,7 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
     }
 
     fn restore(&mut self, data_bytes: &[u8]) -> VhostResult<()> {
-        if !self.all_queues_stopped() {
+        if !self.suspended {
             return Err(VhostError::InvalidOperation);
         }
         let device_request_handler_snapshot: DeviceRequestHandlerSnapshot =
@@ -1138,8 +1146,8 @@ mod tests {
             self.backend_conn = Some(conn);
         }
 
-        fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
-            Ok(())
+        fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
+            Ok(true)
         }
 
         fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {

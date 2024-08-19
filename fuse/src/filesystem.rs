@@ -119,6 +119,7 @@ pub struct DirEntry<'a> {
 }
 
 /// A reply to a `getxattr` method call.
+#[derive(Debug)]
 pub enum GetxattrReply {
     /// The value of the requested extended attribute. This can be arbitrary textual or binary data
     /// and does not need to be nul-terminated.
@@ -147,6 +148,7 @@ pub enum ListxattrReply {
 }
 
 /// A reply to an `ioctl` method call.
+#[derive(Debug)]
 pub enum IoctlReply {
     /// Indicates that the ioctl should be retried. This is only a valid reply when the `flags`
     /// field of the ioctl request contains `IoctlFlags::UNRESTRICTED`. The kernel will read in
@@ -231,7 +233,7 @@ pub trait ZeroCopyReader {
     fn copy_to_end(&mut self, f: &mut File, mut off: u64) -> io::Result<usize> {
         let mut out = 0;
         loop {
-            match self.read_to(f, ::std::usize::MAX, off) {
+            match self.read_to(f, usize::MAX, off) {
                 Ok(0) => return Ok(out),
                 Ok(n) => {
                     off = off.saturating_add(n as u64);
@@ -324,7 +326,7 @@ pub trait ZeroCopyWriter {
     fn copy_to_end(&mut self, f: &mut File, mut off: u64) -> io::Result<usize> {
         let mut out = 0;
         loop {
-            match self.write_from(f, ::std::usize::MAX, off) {
+            match self.write_from(f, usize::MAX, off) {
                 Ok(0) => return Ok(out),
                 Ok(n) => {
                     off = off.saturating_add(n as u64);

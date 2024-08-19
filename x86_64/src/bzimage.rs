@@ -6,11 +6,11 @@
 //! <https://www.kernel.org/doc/Documentation/x86/boot.txt>
 
 use std::io;
+use std::mem::offset_of;
 
 use base::debug;
 use base::FileReadWriteAtVolatile;
 use base::VolatileSlice;
-use memoffset::offset_of;
 use remain::sorted;
 use thiserror::Error;
 use vm_memory::GuestAddress;
@@ -19,12 +19,18 @@ use vm_memory::GuestMemoryError;
 use zerocopy::AsBytes;
 
 use crate::bootparam::boot_params;
+use crate::bootparam::XLF_KERNEL_64;
+use crate::CpuMode;
+use crate::KERNEL_32BIT_ENTRY_OFFSET;
+use crate::KERNEL_64BIT_ENTRY_OFFSET;
 
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("bad kernel header signature")]
     BadSignature,
+    #[error("entry point out of range")]
+    EntryPointOutOfRange,
     #[error("guest memory error {0}")]
     GuestMemoryError(GuestMemoryError),
     #[error("invalid setup_header_end value {0}")]
@@ -54,7 +60,7 @@ pub fn load_bzimage<F>(
     guest_mem: &GuestMemory,
     kernel_start: GuestAddress,
     kernel_image: &mut F,
-) -> Result<(boot_params, u64)>
+) -> Result<(boot_params, u64, GuestAddress, CpuMode)>
 where
     F: FileReadWriteAtVolatile,
 {
@@ -122,5 +128,20 @@ where
         .read_exact_at_volatile(guest_slice, kernel_offset)
         .map_err(Error::ReadKernelImage)?;
 
-    Ok((params, kernel_start.offset() + kernel_size as u64))
+    let (entry_offset, cpu_mode) = if params.hdr.xloadflags & XLF_KERNEL_64 != 0 {
+        (KERNEL_64BIT_ENTRY_OFFSET, CpuMode::LongMode)
+    } else {
+        (KERNEL_32BIT_ENTRY_OFFSET, CpuMode::FlatProtectedMode)
+    };
+
+    let bzimage_entry = guest_mem
+        .checked_offset(kernel_start, entry_offset)
+        .ok_or(Error::EntryPointOutOfRange)?;
+
+    Ok((
+        params,
+        kernel_start.offset() + kernel_size as u64,
+        bzimage_entry,
+        cpu_mode,
+    ))
 }

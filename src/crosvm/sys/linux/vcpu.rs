@@ -404,9 +404,7 @@ where
                     }
                 }
                 Ok(VcpuExit::Mmio) => {
-                    if let Err(e) =
-                        vcpu.handle_mmio(&mut |io_params| Ok(bus_io_handler(&mmio_bus)(io_params)))
-                    {
+                    if let Err(e) = vcpu.handle_mmio(&mut bus_io_handler(&mmio_bus)) {
                         error!("failed to handle mmio: {}", e);
                     }
                 }

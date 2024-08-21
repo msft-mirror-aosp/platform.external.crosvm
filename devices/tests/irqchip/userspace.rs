@@ -674,10 +674,7 @@ impl Vcpu for FakeVcpu {
         unimplemented!()
     }
 
-    fn handle_mmio(
-        &self,
-        _handle_fn: &mut dyn FnMut(IoParams) -> Result<Option<[u8; 8]>>,
-    ) -> Result<()> {
+    fn handle_mmio(&self, _handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()> {
         unimplemented!()
     }
     fn handle_io(&self, _handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()> {

@@ -398,8 +398,8 @@ impl VhostUserDevice for SndBackend {
         Ok(())
     }
 
-    fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
+    fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
         // This device has no non-queue workers to stop.
-        Ok(())
+        Ok(true)
     }
 }

@@ -2024,7 +2024,7 @@ impl FileSystem for PassthroughFs {
         // Device using dynamic xattr feature will have different security context in
         // host and guests. The SECURITY_CONTEXT feature should not be enabled in the
         // device.
-        if self.cfg.max_dynamic_xattr == 0 {
+        if self.cfg.max_dynamic_xattr == 0 && self.cfg.security_ctx {
             opts |= FsOptions::SECURITY_CONTEXT;
         }
 
@@ -2382,7 +2382,7 @@ impl FileSystem for PassthroughFs {
                 data,
                 name,
                 entry.inode,
-                (flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY)) as u32,
+                flags as u32 & !((libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY) as u32),
             )
             .map_err(|e| {
                 // Don't leak the entry.

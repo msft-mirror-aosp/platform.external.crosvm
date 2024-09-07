@@ -112,8 +112,6 @@ impl PeriodicLogger {
                                 break 'outer;
                             }
                             Token::PeriodicLog => {
-                                timer.mark_waited().unwrap();
-
                                 let counter_map = cloned_counter.read().map_err(|e| {
                                     PeriodicLoggerError::ReadLockError(e.to_string())
                                 })?;

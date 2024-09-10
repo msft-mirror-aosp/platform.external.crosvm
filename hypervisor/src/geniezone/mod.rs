@@ -432,6 +432,35 @@ impl VcpuAArch64 for GeniezoneVcpu {
         Err(Error::new(EINVAL))
     }
 
+    fn get_system_regs(&self) -> Result<BTreeMap<AArch64SysRegId, u64>> {
+        error!("Geniezone: not support get_system_regs");
+        Err(Error::new(EINVAL))
+    }
+
+    fn get_cache_info(&self) -> Result<BTreeMap<u8, u64>> {
+        error!("Geniezone: not support get_cache_info");
+        Err(Error::new(EINVAL))
+    }
+
+    fn set_cache_info(&self, _cache_info: BTreeMap<u8, u64>) -> Result<()> {
+        error!("Geniezone: not support set_cache_info");
+        Err(Error::new(EINVAL))
+    }
+
+    fn hypervisor_specific_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        // TODO: Geniezone not support gdb currently
+        Err(anyhow::anyhow!(
+            "Geniezone: not support hypervisor_specific_snapshot"
+        ))
+    }
+
+    fn hypervisor_specific_restore(&self, _data: serde_json::Value) -> anyhow::Result<()> {
+        // TODO: Geniezone not support gdb currently
+        Err(anyhow::anyhow!(
+            "Geniezone: not support hypervisor_specific_restore"
+        ))
+    }
+
     fn set_guest_debug(&self, _addrs: &[GuestAddress], _enable_singlestep: bool) -> Result<()> {
         // TODO: Geniezone not support gdb currently
         error!("Geniezone: not support set_guest_debug");
@@ -1180,7 +1209,10 @@ impl Vcpu for GeniezoneVcpu {
         }
     }
 
-    fn handle_mmio(&self, handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()> {
+    fn handle_mmio(
+        &self,
+        handle_fn: &mut dyn FnMut(IoParams) -> Result<Option<[u8; 8]>>,
+    ) -> Result<()> {
         // SAFETY:
         // Safe because we know we mapped enough memory to hold the gzvm_vcpu_run struct because the
         // kernel told us how large it was. The pointer is page aligned so casting to a different
@@ -1202,13 +1234,13 @@ impl Vcpu for GeniezoneVcpu {
                 address,
                 size,
                 operation: IoOperation::Write { data: mmio.data },
-            });
+            })?;
             Ok(())
         } else if let Some(data) = handle_fn(IoParams {
             address,
             size,
             operation: IoOperation::Read,
-        }) {
+        })? {
             mmio.data[..size].copy_from_slice(&data[..size]);
             Ok(())
         } else {

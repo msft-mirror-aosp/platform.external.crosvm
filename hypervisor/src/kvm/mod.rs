@@ -27,7 +27,6 @@ use std::os::raw::c_ulong;
 use std::os::raw::c_void;
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
-use std::path::PathBuf;
 use std::ptr::copy_nonoverlapping;
 use std::sync::Arc;
 
@@ -143,6 +142,7 @@ pub fn dirty_log_bitmap_size(size: usize) -> usize {
 
 pub struct Kvm {
     kvm: SafeDescriptor,
+    vcpu_mmap_size: usize,
 }
 
 impl Kvm {
@@ -175,24 +175,23 @@ impl Kvm {
             return Err(Error::new(ENOSYS));
         }
 
-        Ok(Kvm { kvm })
-    }
-
-    /// Opens `/dev/kvm/` and returns a Kvm object on success.
-    pub fn new() -> Result<Kvm> {
-        Kvm::new_with_path(&PathBuf::from("/dev/kvm"))
-    }
-
-    /// Gets the size of the mmap required to use vcpu's `kvm_run` structure.
-    pub fn get_vcpu_mmap_size(&self) -> Result<usize> {
         // SAFETY:
         // Safe because we know that our file is a KVM fd and we verify the return result.
-        let res = unsafe { ioctl(self, KVM_GET_VCPU_MMAP_SIZE) };
-        if res > 0 {
-            Ok(res as usize)
-        } else {
-            errno_result()
+        let res = unsafe { ioctl(&kvm, KVM_GET_VCPU_MMAP_SIZE) };
+        if res <= 0 {
+            return errno_result();
         }
+        let vcpu_mmap_size = res as usize;
+
+        Ok(Kvm {
+            kvm,
+            vcpu_mmap_size,
+        })
+    }
+
+    /// Opens `/dev/kvm` and returns a Kvm object on success.
+    pub fn new() -> Result<Kvm> {
+        Kvm::new_with_path(Path::new("/dev/kvm"))
     }
 }
 
@@ -206,6 +205,7 @@ impl Hypervisor for Kvm {
     fn try_clone(&self) -> Result<Self> {
         Ok(Kvm {
             kvm: self.kvm.try_clone()?,
+            vcpu_mmap_size: self.vcpu_mmap_size,
         })
     }
 
@@ -230,6 +230,7 @@ pub struct KvmVm {
     mem_regions: Arc<Mutex<BTreeMap<MemSlot, Box<dyn MappedRegion>>>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
     mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
+    cap_kvmclock_ctrl: bool,
 }
 
 impl KvmVm {
@@ -268,20 +269,20 @@ impl KvmVm {
             }?;
         }
 
-        let vm = KvmVm {
+        let mut vm = KvmVm {
             kvm: kvm.try_clone()?,
             vm: vm_descriptor,
             guest_mem,
             mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
             mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
+            cap_kvmclock_ctrl: false,
         };
+        vm.cap_kvmclock_ctrl = vm.check_raw_capability(KvmCap::KvmclockCtrl);
         vm.init_arch(&cfg)?;
         Ok(vm)
     }
 
     pub fn create_kvm_vcpu(&self, id: usize) -> Result<KvmVcpu> {
-        let run_mmap_size = self.kvm.get_vcpu_mmap_size()?;
-
         // SAFETY:
         // Safe because we know that our file is a VM fd and we verify the return result.
         let fd = unsafe { ioctl_with_val(self, KVM_CREATE_VCPU, c_ulong::try_from(id).unwrap()) };
@@ -298,19 +299,17 @@ impl KvmVm {
         // `signal_handle()` for use in `KvmVcpuSignalHandle`. The mapping will not be destroyed
         // until all references are dropped, so it is safe to reference `kvm_run` fields via the
         // `as_ptr()` function during either type's lifetime.
-        let run_mmap = MemoryMappingBuilder::new(run_mmap_size)
+        let run_mmap = MemoryMappingBuilder::new(self.kvm.vcpu_mmap_size)
             .from_file(&vcpu)
             .build()
             .map_err(|_| Error::new(ENOSPC))?;
-
-        let cap_kvmclock_ctrl = self.check_raw_capability(KvmCap::KvmclockCtrl);
 
         Ok(KvmVcpu {
             kvm: self.kvm.try_clone()?,
             vm: self.vm.try_clone()?,
             vcpu,
             id,
-            cap_kvmclock_ctrl,
+            cap_kvmclock_ctrl: self.cap_kvmclock_ctrl,
             run_mmap: Arc::new(run_mmap),
         })
     }
@@ -554,6 +553,7 @@ impl Vm for KvmVm {
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
+            cap_kvmclock_ctrl: self.cap_kvmclock_ctrl,
         })
     }
 
@@ -734,7 +734,7 @@ impl Vm for KvmVm {
     }
 
     fn create_device(&self, kind: DeviceKind) -> Result<SafeDescriptor> {
-        let device = if let Some(dev) = self.get_device_params_arch(kind) {
+        let mut device = if let Some(dev) = self.get_device_params_arch(kind) {
             dev
         } else {
             match kind {
@@ -753,7 +753,7 @@ impl Vm for KvmVm {
         // SAFETY:
         // Safe because we know that our file is a VM fd, we know the kernel will only write correct
         // amount of memory to our pointer, and we verify the return result.
-        let ret = unsafe { base::ioctl_with_ref(self, KVM_CREATE_DEVICE, &device) };
+        let ret = unsafe { base::ioctl_with_mut_ref(self, KVM_CREATE_DEVICE, &mut device) };
         if ret == 0 {
             Ok(
                 // SAFETY:
@@ -1039,7 +1039,10 @@ impl Vcpu for KvmVcpu {
         }
     }
 
-    fn handle_mmio(&self, handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()> {
+    fn handle_mmio(
+        &self,
+        handle_fn: &mut dyn FnMut(IoParams) -> Result<Option<[u8; 8]>>,
+    ) -> Result<()> {
         // SAFETY:
         // Safe because we know we mapped enough memory to hold the kvm_run struct because the
         // kernel told us how large it was. The pointer is page aligned so casting to a different
@@ -1058,13 +1061,13 @@ impl Vcpu for KvmVcpu {
                 address,
                 size,
                 operation: IoOperation::Write { data: mmio.data },
-            });
+            })?;
             Ok(())
         } else if let Some(data) = handle_fn(IoParams {
             address,
             size,
             operation: IoOperation::Read,
-        }) {
+        })? {
             mmio.data[..size].copy_from_slice(&data[..size]);
             Ok(())
         } else {

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use arch::set_default_serial_parameters;
 use arch::CpuSet;
+use arch::FdtPosition;
 use arch::Pstore;
 #[cfg(target_arch = "x86_64")]
 use arch::SmbiosOptions;
@@ -226,7 +227,10 @@ pub struct VhostUserFrontendOption {
 #[derive(Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VhostUserFsOption {
-    pub socket: PathBuf,
+    #[serde(alias = "socket")]
+    pub socket_path: Option<PathBuf>,
+    /// File descriptor of connected socket
+    pub socket_fd: Option<u32>,
     pub tag: Option<String>,
 
     /// Maximum number of entries per queue (default: 32768)
@@ -261,9 +265,10 @@ pub fn parse_vhost_user_fs_option(param: &str) -> Result<VhostUserFsOption, Stri
         );
 
         Ok(VhostUserFsOption {
-            socket,
+            socket_path: Some(socket),
             tag: Some(tag),
             max_queue_size: None,
+            socket_fd: None,
         })
     } else {
         from_key_values::<VhostUserFsOption>(param)
@@ -362,6 +367,12 @@ pub enum InputDeviceOption {
         path: PathBuf,
     },
     Trackpad {
+        path: PathBuf,
+        width: Option<u32>,
+        height: Option<u32>,
+        name: Option<String>,
+    },
+    MultiTouchTrackpad {
         path: PathBuf,
         width: Option<u32>,
         height: Option<u32>,
@@ -591,6 +602,37 @@ pub fn parse_dynamic_power_coefficient(s: &str) -> Result<BTreeMap<usize, u32>, 
     Ok(dyn_power_coefficient)
 }
 
+#[cfg(all(
+    any(target_arch = "arm", target_arch = "aarch64"),
+    any(target_os = "android", target_os = "linux")
+))]
+pub fn parse_cpu_frequencies(s: &str) -> Result<BTreeMap<usize, Vec<u32>>, String> {
+    let mut cpu_frequencies: BTreeMap<usize, Vec<u32>> = BTreeMap::default();
+    for cpufreq_assigns in s.split(';') {
+        let assignment: Vec<&str> = cpufreq_assigns.split('=').collect();
+        if assignment.len() != 2 {
+            return Err(invalid_value_err(
+                cpufreq_assigns,
+                "invalid CPU freq syntax",
+            ));
+        }
+        let cpu = assignment[0].parse().map_err(|_| {
+            invalid_value_err(assignment[0], "CPU index must be a non-negative integer")
+        })?;
+        let freqs = assignment[1]
+            .split(',')
+            .map(|x| x.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        if cpu_frequencies.insert(cpu, freqs).is_some() {
+            return Err(invalid_value_err(
+                cpufreq_assigns,
+                "CPU index must be unique",
+            ));
+        }
+    }
+    Ok(cpu_frequencies)
+}
+
 pub fn from_key_values<'a, T: Deserialize<'a>>(value: &'a str) -> Result<T, String> {
     serde_keyvalue::from_key_values(value).map_err(|e| e.to_string())
 }
@@ -711,6 +753,11 @@ pub struct Config {
     pub core_scheduling: bool,
     pub cpu_capacity: BTreeMap<usize, u32>, // CPU index -> capacity
     pub cpu_clusters: Vec<CpuSet>,
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        any(target_os = "android", target_os = "linux")
+    ))]
+    pub cpu_frequencies_khz: BTreeMap<usize, Vec<u32>>, // CPU index -> frequencies
     #[cfg(feature = "crash-report")]
     pub crash_pipe_name: Option<String>,
     #[cfg(feature = "crash-report")]
@@ -730,6 +777,7 @@ pub struct Config {
     pub executable_path: Option<Executable>,
     #[cfg(windows)]
     pub exit_stats: bool,
+    pub fdt_position: Option<FdtPosition>,
     pub file_backed_mappings: Vec<FileBackedMappingParameters>,
     pub force_calibrated_tsc_leaf: bool,
     pub force_s2idle: bool,
@@ -834,8 +882,6 @@ pub struct Config {
     pub socket_path: Option<PathBuf>,
     #[cfg(feature = "audio")]
     pub sound: Option<PathBuf>,
-    #[cfg(feature = "balloon")]
-    pub strict_balloon: bool,
     pub stub_pci_devices: Vec<StubPciParameters>,
     pub suspended: bool,
     pub swap_dir: Option<PathBuf>,
@@ -861,6 +907,7 @@ pub struct Config {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     pub vhost_scmi_device: PathBuf,
     pub vhost_user: Vec<VhostUserFrontendOption>,
+    pub vhost_user_connect_timeout_ms: Option<u64>,
     pub vhost_user_fs: Vec<VhostUserFsOption>,
     #[cfg(feature = "video-decoder")]
     pub video_dec: Vec<VideoDeviceConfig>,
@@ -871,7 +918,6 @@ pub struct Config {
         any(target_os = "android", target_os = "linux")
     ))]
     pub virt_cpufreq: bool,
-    pub virt_cpufreq_socket: Option<PathBuf>,
     pub virtio_input: Vec<InputDeviceOption>,
     #[cfg(feature = "audio")]
     #[serde(skip)]
@@ -928,6 +974,11 @@ impl Default for Config {
             crash_report_uuid: None,
             cpu_capacity: BTreeMap::new(),
             cpu_clusters: Vec::new(),
+            #[cfg(all(
+                any(target_arch = "arm", target_arch = "aarch64"),
+                any(target_os = "android", target_os = "linux")
+            ))]
+            cpu_frequencies_khz: BTreeMap::new(),
             delay_rt: false,
             device_tree_overlay: Vec::new(),
             disks: Vec::new(),
@@ -943,6 +994,7 @@ impl Default for Config {
             executable_path: None,
             #[cfg(windows)]
             exit_stats: false,
+            fdt_position: None,
             file_backed_mappings: Vec::new(),
             force_calibrated_tsc_leaf: false,
             force_s2idle: false,
@@ -1050,8 +1102,6 @@ impl Default for Config {
             socket_path: None,
             #[cfg(feature = "audio")]
             sound: None,
-            #[cfg(feature = "balloon")]
-            strict_balloon: false,
             stub_pci_devices: Vec::new(),
             suspended: false,
             swap_dir: None,
@@ -1077,6 +1127,7 @@ impl Default for Config {
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             vhost_scmi_device: PathBuf::from(VHOST_SCMI_PATH),
             vhost_user: Vec::new(),
+            vhost_user_connect_timeout_ms: None,
             vhost_user_fs: Vec::new(),
             vsock: None,
             #[cfg(feature = "video-decoder")]
@@ -1088,7 +1139,6 @@ impl Default for Config {
                 any(target_os = "android", target_os = "linux")
             ))]
             virt_cpufreq: false,
-            virt_cpufreq_socket: None,
             virtio_input: Vec::new(),
             #[cfg(feature = "audio")]
             virtio_snds: Vec::new(),
@@ -1177,6 +1227,23 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
     if cfg.boot_cpu >= cfg.vcpu_count.unwrap_or(1) {
         log::warn!("boot_cpu selection cannot be higher than vCPUs available, defaulting to 0");
         cfg.boot_cpu = 0;
+    }
+
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        any(target_os = "android", target_os = "linux")
+    ))]
+    if !cfg.cpu_frequencies_khz.is_empty() {
+        if !cfg.virt_cpufreq {
+            return Err("`cpu-frequencies` requires `virt-cpufreq`".to_string());
+        }
+
+        if cfg.host_cpu_topology {
+            return Err(
+                "`host-cpu-topology` cannot be used with 'cpu-frequencies` at the same time"
+                    .to_string(),
+            );
+        }
     }
 
     #[cfg(all(
@@ -2008,9 +2075,11 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, Some("my_tag".to_string()));
         assert_eq!(fs.max_queue_size, None);
+        assert_eq!(fs.socket_fd, None);
     }
 
     #[test]
@@ -2026,7 +2095,31 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
+        assert_eq!(fs.tag, Some("my_tag".to_string()));
+        assert_eq!(fs.max_queue_size, None);
+    }
+
+    #[test]
+    fn parse_vhost_user_fs_explict_socket() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &[
+                    "--vhost-user-fs",
+                    "socket=my_socket,tag=my_tag",
+                    "/dev/null",
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.vhost_user_fs.len(), 1);
+        let fs = &cfg.vhost_user_fs[0];
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, Some("my_tag".to_string()));
         assert_eq!(fs.max_queue_size, None);
     }
@@ -2048,7 +2141,8 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, Some("my_tag".to_string()));
         assert_eq!(fs.max_queue_size, Some(256));
     }
@@ -2066,9 +2160,33 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, None);
         assert_eq!(fs.max_queue_size, None);
+    }
+
+    #[test]
+    fn parse_vhost_user_fs_socket_fd() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &[
+                    "--vhost-user-fs",
+                    "tag=my_tag,max-queue-size=256,socket-fd=1234",
+                    "/dev/null",
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.vhost_user_fs.len(), 1);
+        let fs = &cfg.vhost_user_fs[0];
+        assert!(fs.socket_path.is_none());
+        assert_eq!(fs.tag, Some("my_tag".to_string()));
+        assert_eq!(fs.max_queue_size, Some(256));
+        assert_eq!(fs.socket_fd.unwrap(), 1234_u32);
     }
 
     #[cfg(target_arch = "x86_64")]

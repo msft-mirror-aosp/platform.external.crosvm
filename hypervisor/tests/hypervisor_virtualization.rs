@@ -6,17 +6,16 @@
 #![cfg(any(feature = "whpx", feature = "gvm", feature = "haxm", unix))]
 
 use core::mem;
-#[cfg(any(feature = "whpx", feature = "haxm"))]
 use std::arch::asm;
 use std::cell::RefCell;
-#[cfg(any(feature = "whpx", feature = "haxm"))]
-use std::is_x86_feature_detected;
+use std::ffi::c_void;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+use base::set_cpu_affinity;
+use base::MappedRegion;
 use base::MemoryMappingBuilder;
-#[cfg(any(target_os = "android", target_os = "linux"))]
 use base::SharedMemory;
 #[cfg(feature = "gvm")]
 use hypervisor::gvm::*;
@@ -30,8 +29,13 @@ use hypervisor::whpx::*;
 use hypervisor::MemCacheType::CacheCoherent;
 use hypervisor::*;
 use hypervisor_test_macro::global_asm_data;
+use sync::Mutex;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+#[cfg(windows)]
+use windows::Win32::System::Memory::VirtualLock;
+#[cfg(windows)]
+use windows::Win32::System::Memory::VirtualUnlock;
 use zerocopy::AsBytes;
 
 const FLAGS_IF_BIT: u64 = 0x200;
@@ -42,6 +46,43 @@ pub enum HypervisorType {
     Whpx,
     Haxm,
     Gvm,
+}
+
+#[repr(C, packed)]
+#[derive(AsBytes)]
+/// Define IDTR value used in real mode or 32bit protected mode.
+struct Idtr32 {
+    // The lower 2 bytes are limit.
+    limit: u16,
+    // The higher 4 bytes are base address.
+    base_address: u32,
+}
+
+#[repr(C, packed)]
+#[derive(AsBytes, Debug, Copy, Clone)]
+/// IDT entries for long mode.
+struct IdtEntry64 {
+    address_low: u16,
+    selector: u16,
+    ist: u8,
+    flags: u8,
+    address_mid: u16,
+    address_high: u32,
+    reserved: u32,
+}
+
+impl IdtEntry64 {
+    pub fn new(handler_addr: u64) -> Self {
+        IdtEntry64 {
+            address_low: (handler_addr & 0xFFFF) as u16,
+            selector: 0x10, // Our long mode CS is the third entry (0x0, 0x8, 0x10).
+            ist: 0,
+            flags: 0x8E, // Present, interrupt gate, DPL 0
+            address_mid: ((handler_addr >> 16) & 0xFFFF) as u16,
+            address_high: (handler_addr >> 32) as u32,
+            reserved: 0,
+        }
+    }
 }
 
 impl std::fmt::Display for HypervisorType {
@@ -135,7 +176,7 @@ impl Default for TestSetup {
         TestSetup {
             assembly: Vec::new(),
             load_addr: GuestAddress(0),
-            mem_size: 0x2000,
+            mem_size: 0xF000, // Big enough default for long mode setup
             initial_regs: Regs::default(),
             extra_vm_setup: None,
             memory_initializations: Vec::new(),
@@ -159,7 +200,7 @@ pub fn run_configurable_test<H: HypervisorTestSetup>(
     hypervisor_type: HypervisorType,
     setup: &TestSetup,
     regs_matcher: impl Fn(HypervisorType, &Regs, &Sregs),
-    mut exit_matcher: impl FnMut(HypervisorType, &VcpuExit, &mut dyn VcpuX86_64) -> bool,
+    mut exit_matcher: impl FnMut(HypervisorType, &VcpuExit, &mut dyn VcpuX86_64, &mut dyn Vm) -> bool,
 ) {
     println!("Running test on hypervisor: {}", hypervisor_type);
 
@@ -190,6 +231,14 @@ pub fn run_configurable_test<H: HypervisorTestSetup>(
         setup_fn(&mut *vcpu, &mut vm);
     }
 
+    if !vm.check_capability(VmCap::EarlyInitCpuid) {
+        let cpuid = vm
+            .get_hypervisor()
+            .get_supported_cpuid()
+            .expect("get_supported_cpuid() failed");
+        vcpu.set_cpuid(&cpuid).expect("set_cpuid() failed");
+    }
+
     loop {
         match vcpu.run() {
             Ok(exit) => match exit {
@@ -199,7 +248,7 @@ pub fn run_configurable_test<H: HypervisorTestSetup>(
                     if !setup.expect_run_success {
                         panic!("Expected vcpu.run() to fail, but it succeeded");
                     }
-                    if exit_matcher(hypervisor_type, &other_exit, &mut *vcpu) {
+                    if exit_matcher(hypervisor_type, &other_exit, &mut *vcpu, &mut vm) {
                         break;
                     }
                 }
@@ -240,160 +289,324 @@ macro_rules! run_tests {
     };
 }
 
+const GDT_OFFSET: u64 = 0x1500;
+const DEFAULT_IDT_OFFSET: u64 = 0x1528;
+
+// Condensed version of the function in x86_64\src\gdt.rs
+pub fn segment_from_gdt(entry: u64, table_index: u8) -> Segment {
+    let g = ((entry & 0x0080000000000000) >> 55) as u8;
+    let limit = ((((entry) & 0x000F000000000000) >> 32) | ((entry) & 0x000000000000FFFF)) as u32;
+    let limit_bytes = if g == 0 { limit } else { (limit * 4096) + 4095 };
+    Segment {
+        base: (((entry) & 0xFF00000000000000) >> 32)
+            | (((entry) & 0x000000FF00000000) >> 16)
+            | (((entry) & 0x00000000FFFF0000) >> 16),
+        limit_bytes,
+        selector: (table_index * 8) as u16,
+        type_: ((entry & 0x00000F0000000000) >> 40) as u8,
+        present: ((entry & 0x0000800000000000) >> 47) as u8,
+        dpl: ((entry & 0x0000600000000000) >> 45) as u8,
+        db: ((entry & 0x0040000000000000) >> 54) as u8,
+        s: ((entry & 0x0000100000000000) >> 44) as u8,
+        l: ((entry & 0x0020000000000000) >> 53) as u8,
+        g,
+        avl: ((entry & 0x0010000000000000) >> 52) as u8,
+    }
+}
+
+pub fn null_descriptor() -> [u8; 8] {
+    [0u8; 8]
+}
+
+const DESC_ACCESS_PRESENT: u8 = 1 << 7;
+const DESC_ACCESS_NOT_SYS: u8 = 1 << 4;
+const DESC_ACCESS_EXEC: u8 = 1 << 3;
+const DESC_ACCESS_RW: u8 = 1 << 1;
+const DESC_ACCESS_ACCESSED: u8 = 1 << 0;
+
+const DESC_FLAG_GRAN_4K: u8 = 1 << 7;
+const DESC_FLAG_DEFAULT_OP_SIZE_32: u8 = 1 << 6;
+const DESC_FLAG_LONG_MODE: u8 = 1 << 5;
+
+pub fn segment_descriptor(base: u32, limit: u32, access: u8, flags: u8) -> [u8; 8] {
+    assert!(limit < (1 << 20)); // limit value must fit in 20 bits
+    assert!(flags & 0x0F == 0x00); // flags must be in the high 4 bits only
+
+    [
+        limit as u8,                 // limit [7:0]
+        (limit >> 8) as u8,          // limit [15:8]
+        base as u8,                  // base [7:0]
+        (base >> 8) as u8,           // base [15:8]
+        (base >> 16) as u8,          // base [23:16]
+        access,                      // type + s + dpl + p
+        (limit >> 16) as u8 | flags, // limit [19:16] + flags
+        (base >> 24) as u8,          // base [31:24]
+    ]
+}
+
+pub fn write_gdt(guest_mem: &GuestMemory, gdt: &[u8]) {
+    let gdt_addr = GuestAddress(GDT_OFFSET);
+    guest_mem
+        .write_at_addr(gdt, gdt_addr)
+        .expect("Failed to write GDT entry to guest memory");
+}
+
+#[derive(Debug, Clone)]
+struct ModeConfig {
+    idt: Vec<u8>,
+    idt_base_addr: u64,
+    long_mode: bool,
+}
+
+impl ModeConfig {
+    const IDT64_SIZE: usize = std::mem::size_of::<IdtEntry64>() * 256;
+    const IDT32_SIZE: usize = 8 * 256;
+
+    /// Set the IDT for long mode.
+    fn set_idt_long_mode(&mut self, idt: impl IntoIterator<Item = IdtEntry64>) -> &mut Self {
+        let entries = idt.into_iter().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 256, "IDT must contain 256 entries");
+        self.idt = entries
+            .into_iter()
+            .flat_map(|entry| entry.as_bytes().to_owned())
+            .collect();
+        self
+    }
+
+    fn set_idt_base_addr(&mut self, idt_base_addr: u64) -> &mut Self {
+        self.idt_base_addr = idt_base_addr;
+        self
+    }
+
+    fn configure_idt_memory(&self, guest_mem: &GuestMemory) {
+        let expected_length = if self.long_mode {
+            Self::IDT64_SIZE
+        } else {
+            Self::IDT32_SIZE
+        };
+
+        let idt_addr = GuestAddress(self.idt_base_addr);
+        assert_eq!(self.idt.len(), expected_length);
+        assert!(
+            guest_mem.range_overlap(
+                idt_addr,
+                idt_addr
+                    .checked_add(
+                        self.idt
+                            .len()
+                            .try_into()
+                            .expect("The IDT length must be within the u64 range.")
+                    )
+                    .expect("The end address of IDT should not overflow")
+            ),
+            "The IDT that starts at {:#x} isn't properly mapped as the guest memory.",
+            self.idt_base_addr
+        );
+        guest_mem
+            .write_at_addr(&self.idt, idt_addr)
+            .expect("failed to write IDT entry to guest memory");
+    }
+
+    fn get_idtr_value(&self) -> DescriptorTable {
+        DescriptorTable {
+            base: self.idt_base_addr,
+            limit: {
+                let expected_length = if self.long_mode {
+                    Self::IDT64_SIZE
+                } else {
+                    Self::IDT32_SIZE
+                };
+                assert_eq!(self.idt.len(), expected_length, "the IDT size should match",);
+                // The IDT limit should be the number of bytes of IDT - 1.
+                (self.idt.len() - 1)
+                    .try_into()
+                    .expect("the IDT limit should be within the range of u16")
+            },
+        }
+    }
+
+    pub fn configure_long_mode_memory(&self, vm: &mut dyn Vm) -> Segment {
+        let guest_mem = vm.get_memory();
+
+        assert!(
+            guest_mem.range_overlap(GuestAddress(0x1500), GuestAddress(0xc000)),
+            "Long-mode setup requires 0x1500-0xc000 to be mapped in the guest."
+        );
+
+        // Setup GDT
+        let mut gdt = Vec::new();
+        // 0x00
+        gdt.extend_from_slice(&null_descriptor());
+        // 0x08
+        gdt.extend_from_slice(&null_descriptor());
+        // 0x10: code segment descriptor
+        gdt.extend_from_slice(&segment_descriptor(
+            0x0,
+            0xFFFFF,
+            DESC_ACCESS_PRESENT
+                | DESC_ACCESS_NOT_SYS
+                | DESC_ACCESS_EXEC
+                | DESC_ACCESS_RW
+                | DESC_ACCESS_ACCESSED,
+            DESC_FLAG_GRAN_4K | DESC_FLAG_LONG_MODE,
+        ));
+
+        write_gdt(guest_mem, &gdt);
+
+        // Convert the GDT entries to a vector of u64
+        let gdt_entries: Vec<u64> = gdt
+            .chunks(8)
+            .map(|chunk| {
+                let mut array = [0u8; 8];
+                array.copy_from_slice(chunk);
+                u64::from_le_bytes(array)
+            })
+            .collect();
+
+        let code_seg = segment_from_gdt(gdt_entries[2], 2);
+
+        self.configure_idt_memory(guest_mem);
+
+        // Setup paging
+        let pml4_addr = GuestAddress(0x9000);
+        let pdpte_addr = GuestAddress(0xa000);
+        let pde_addr = GuestAddress(0xb000);
+
+        // Pointing to PDPTE with present and RW flags
+        guest_mem
+            .write_at_addr(&(pdpte_addr.0 | 3).to_le_bytes(), pml4_addr)
+            .expect("failed to write PML4 entry");
+
+        // Pointing to PD with present and RW flags
+        guest_mem
+            .write_at_addr(&(pde_addr.0 | 3).to_le_bytes(), pdpte_addr)
+            .expect("failed to write PDPTE entry");
+
+        for i in 0..512 {
+            // Each 2MiB page present and RW
+            let pd_entry_bytes = ((i << 21) | 0x83u64).to_le_bytes();
+            guest_mem
+                .write_at_addr(
+                    &pd_entry_bytes,
+                    pde_addr.unchecked_add(i * mem::size_of::<u64>() as u64),
+                )
+                .expect("Failed to write PDE entry");
+        }
+
+        code_seg
+    }
+
+    pub fn enter_long_mode(&self, vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm) {
+        let code_seg = self.configure_long_mode_memory(vm);
+
+        let mut sregs = vcpu.get_sregs().expect("failed to get sregs");
+
+        let pml4_addr = GuestAddress(0x9000);
+
+        sregs.gdt.base = GDT_OFFSET;
+        sregs.gdt.limit = 0xFFFF;
+
+        sregs.idt = self.get_idtr_value();
+
+        sregs.cs = code_seg;
+
+        // Long mode
+        sregs.cr0 |= 0x1 | 0x80000000; // PE & PG
+        sregs.efer |= 0x100 | 0x400; // LME & LMA (Must be auto-enabled with CR0_PG)
+        sregs.cr3 = pml4_addr.offset();
+        sregs.cr4 |= 0x80 | 0x20; // PGE & PAE
+
+        vcpu.set_sregs(&sregs).expect("failed to set sregs");
+    }
+
+    pub fn configure_flat_protected_mode_memory(&self, vm: &mut dyn Vm) -> Segment {
+        let guest_mem = vm.get_memory();
+
+        assert!(
+            guest_mem.range_overlap(GuestAddress(0x1500), GuestAddress(0xc000)),
+            "Protected-mode setup requires 0x1500-0xc000 to be mapped in the guest."
+        );
+
+        // Setup GDT
+        let mut gdt = Vec::new();
+
+        // 0x00
+        gdt.extend_from_slice(&null_descriptor());
+        // 0x08
+        gdt.extend_from_slice(&null_descriptor());
+        // 0x10: code segment descriptor
+        gdt.extend_from_slice(&segment_descriptor(
+            0x0,
+            0xFFFFF,
+            DESC_ACCESS_PRESENT
+                | DESC_ACCESS_NOT_SYS
+                | DESC_ACCESS_EXEC
+                | DESC_ACCESS_RW
+                | DESC_ACCESS_ACCESSED,
+            DESC_FLAG_GRAN_4K | DESC_FLAG_DEFAULT_OP_SIZE_32,
+        ));
+
+        write_gdt(guest_mem, &gdt);
+
+        // Convert the GDT entries to a vector of u64
+        let gdt_entries: Vec<u64> = gdt
+            .chunks(8)
+            .map(|chunk| {
+                let mut array = [0u8; 8];
+                array.copy_from_slice(chunk);
+                u64::from_le_bytes(array)
+            })
+            .collect();
+
+        let code_seg = segment_from_gdt(gdt_entries[2], 2);
+
+        self.configure_idt_memory(guest_mem);
+
+        code_seg
+    }
+
+    pub fn enter_protected_mode(&self, vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm) {
+        let code_seg = self.configure_flat_protected_mode_memory(vm);
+
+        let mut sregs = vcpu.get_sregs().expect("failed to get sregs");
+
+        sregs.cs = code_seg;
+
+        sregs.gdt.base = GDT_OFFSET;
+        sregs.gdt.limit = 0xFFFF;
+
+        sregs.idt = self.get_idtr_value();
+
+        // 32-bit protected mode, paging disabled
+        sregs.cr0 |= 0x1; // PE
+        sregs.cr0 &= !0x80000000; // ~PG
+
+        vcpu.set_sregs(&sregs).expect("failed to set sregs");
+    }
+
+    fn default_long_mode() -> Self {
+        Self {
+            idt_base_addr: DEFAULT_IDT_OFFSET,
+            idt: vec![0; Self::IDT64_SIZE],
+            long_mode: true,
+        }
+    }
+
+    fn default_protected_mode() -> Self {
+        Self {
+            idt_base_addr: DEFAULT_IDT_OFFSET,
+            idt: vec![0; Self::IDT32_SIZE],
+            long_mode: false,
+        }
+    }
+}
+
 global_asm_data!(
     test_minimal_virtualization_code,
     ".code16",
     "add ax, bx",
     "hlt"
 );
-
-const GDT_OFFSET: u64 = 0x1500;
-const IDT_OFFSET: u64 = 0x1528;
-
-pub fn configure_long_mode_memory(vm: &mut dyn Vm) -> Segment {
-    // Condensed version of the function in x86_64\src\gdt.rs
-    pub fn segment_from_gdt(entry: u64, table_index: u8) -> Segment {
-        Segment {
-            base: (((entry) & 0xFF00000000000000) >> 32)
-                | (((entry) & 0x000000FF00000000) >> 16)
-                | (((entry) & 0x00000000FFFF0000) >> 16),
-            limit: ((((entry) & 0x000F000000000000) >> 32) | ((entry) & 0x000000000000FFFF)) as u32,
-            selector: (table_index * 8) as u16,
-            type_: ((entry & 0x00000F0000000000) >> 40) as u8,
-            present: ((entry & 0x0000800000000000) >> 47) as u8,
-            dpl: ((entry & 0x0000600000000000) >> 45) as u8,
-            db: ((entry & 0x0040000000000000) >> 54) as u8,
-            s: ((entry & 0x0000100000000000) >> 44) as u8,
-            l: ((entry & 0x0020000000000000) >> 53) as u8,
-            g: ((entry & 0x0080000000000000) >> 55) as u8,
-            avl: ((entry & 0x0010000000000000) >> 52) as u8,
-        }
-    }
-
-    let guest_mem = vm.get_memory();
-
-    assert!(
-        guest_mem.range_overlap(GuestAddress(0x1500), GuestAddress(0xc000)),
-        "Long-mode setup requires 0x1500-0xc000 to be mapped in the guest."
-    );
-
-    const PRESENT: u8 = 1 << 7;
-    const NOT_SYS: u8 = 1 << 4;
-    const EXEC: u8 = 1 << 3;
-    const RW: u8 = 1 << 1;
-    const ACCESSED: u8 = 1 << 0;
-
-    const GRAN_4K: u8 = 1 << 7;
-    const LONG_MODE: u8 = 1 << 5;
-
-    // Setup GDT
-    let gdt: Vec<u8> = vec![
-        // Null descriptor
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        // Null descriptor
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        // Code segment descriptor
-        0xFF, // Limit & Base (low, bits 0-15)
-        0xFF,
-        0x00,
-        0x00,
-        0x00,                                     // Base (mid, bits 16-23)
-        PRESENT | NOT_SYS | EXEC | RW | ACCESSED, // Access byte
-        GRAN_4K | LONG_MODE | 0x0F,               // Flags & Limit (high)
-        0x00,                                     // Base (high)
-    ];
-
-    let gdt_addr = GuestAddress(GDT_OFFSET);
-    guest_mem
-        .write_at_addr(&gdt, gdt_addr)
-        .expect("Failed to write GDT entry to guest memory");
-
-    // Convert the GDT entries to a vector of u64
-    let gdt_entries: Vec<u64> = gdt
-        .chunks(8)
-        .map(|chunk| {
-            let mut array = [0u8; 8];
-            array.copy_from_slice(chunk);
-            u64::from_le_bytes(array)
-        })
-        .collect();
-
-    let code_seg = segment_from_gdt(gdt_entries[2], 2);
-
-    // Setup IDT
-    let idt_addr = GuestAddress(IDT_OFFSET);
-    let idt_entry: u64 = 0; // Empty IDT
-    let idt_entry_bytes = idt_entry.to_le_bytes();
-    guest_mem
-        .write_at_addr(&idt_entry_bytes, idt_addr)
-        .expect("failed to write IDT entry to guest memory");
-
-    // Setup paging
-    let pml4_addr = GuestAddress(0x9000);
-    let pdpte_addr = GuestAddress(0xa000);
-    let pde_addr = GuestAddress(0xb000);
-
-    // Pointing to PDPTE with present and RW flags
-    guest_mem
-        .write_at_addr(&(pdpte_addr.0 | 3).to_le_bytes(), pml4_addr)
-        .expect("failed to write PML4 entry");
-
-    // Pointing to PD with present and RW flags
-    guest_mem
-        .write_at_addr(&(pde_addr.0 | 3).to_le_bytes(), pdpte_addr)
-        .expect("failed to write PDPTE entry");
-
-    for i in 0..512 {
-        // Each 2MiB page present and RW
-        let pd_entry_bytes = ((i << 21) | 0x83u64).to_le_bytes();
-        guest_mem
-            .write_at_addr(
-                &pd_entry_bytes,
-                pde_addr.unchecked_add(i * mem::size_of::<u64>() as u64),
-            )
-            .expect("Failed to write PDE entry");
-    }
-
-    code_seg
-}
-
-pub fn enter_long_mode(vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm) {
-    let code_seg = configure_long_mode_memory(vm);
-
-    let mut sregs = vcpu.get_sregs().expect("failed to get sregs");
-
-    let pml4_addr = GuestAddress(0x9000);
-
-    sregs.gdt.base = GDT_OFFSET;
-    sregs.gdt.limit = 0xFFFF;
-
-    sregs.idt.base = IDT_OFFSET;
-    sregs.idt.limit = 0xFFFF;
-
-    sregs.cs = code_seg;
-
-    // Long mode
-    sregs.cr0 |= 0x1 | 0x80000000; // PE & PG
-    sregs.efer |= 0x100 | 0x400; // LME & LMA (Must be auto-enabled with CR0_PG)
-    sregs.cr3 = pml4_addr.offset();
-    sregs.cr4 |= 0x80 | 0x20; // PGE & PAE
-
-    vcpu.set_sregs(&sregs).expect("failed to set sregs");
-}
 
 // This runs a minimal program under virtualization.
 // It should require only the ability to execute instructions under virtualization, physical
@@ -422,7 +635,7 @@ fn test_minimal_virtualization() {
             // For VMEXIT caused by HLT, the hypervisor will automatically advance the rIP register.
             assert_eq!(regs.rip, 0x1000 + assembly.len() as u64);
         },
-        |_, exit, _| matches!(exit, VcpuExit::Hlt)
+        |_, exit: &_, _: &mut _, _: &mut _| -> bool { matches!(exit, VcpuExit::Hlt) }
     );
 }
 
@@ -460,40 +673,41 @@ fn test_io_exit_handler() {
     };
 
     let cached_byte = AtomicU8::new(0);
-    let exit_matcher = move |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
-        VcpuExit::Io => {
-            vcpu.handle_io(&mut |IoParams {
-                                     address,
-                                     size,
-                                     operation,
-                                 }| {
-                match operation {
-                    IoOperation::Read => {
-                        let mut data = [0u8; 8];
-                        assert_eq!(address, 0x20);
-                        assert_eq!(size, 1);
-                        // The original number written below will be doubled and
-                        // passed back.
-                        data[0] = cached_byte.load(Ordering::SeqCst) * 2;
-                        Some(data)
+    let exit_matcher =
+        move |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
+            VcpuExit::Io => {
+                vcpu.handle_io(&mut |IoParams {
+                                         address,
+                                         size,
+                                         operation,
+                                     }| {
+                    match operation {
+                        IoOperation::Read => {
+                            let mut data = [0u8; 8];
+                            assert_eq!(address, 0x20);
+                            assert_eq!(size, 1);
+                            // The original number written below will be doubled and
+                            // passed back.
+                            data[0] = cached_byte.load(Ordering::SeqCst) * 2;
+                            Some(data)
+                        }
+                        IoOperation::Write { data } => {
+                            assert_eq!(address, 0x10);
+                            assert_eq!(size, 1);
+                            assert_eq!(data[0], 0x34);
+                            cached_byte.fetch_add(data[0], Ordering::SeqCst);
+                            None
+                        }
                     }
-                    IoOperation::Write { data } => {
-                        assert_eq!(address, 0x10);
-                        assert_eq!(size, 1);
-                        assert_eq!(data[0], 0x34);
-                        cached_byte.fetch_add(data[0], Ordering::SeqCst);
-                        None
-                    }
-                }
-            })
-            .expect("failed to set the data");
-            false // Continue VM runloop
-        }
-        VcpuExit::Hlt => {
-            true // Break VM runloop
-        }
-        r => panic!("unexpected exit reason: {:?}", r),
-    };
+                })
+                .expect("failed to set the data");
+                false // Continue VM runloop
+            }
+            VcpuExit::Hlt => {
+                true // Break VM runloop
+            }
+            r => panic!("unexpected exit reason: {:?}", r),
+        };
     run_tests!(setup, regs_matcher, &exit_matcher);
 }
 
@@ -515,6 +729,7 @@ fn test_mmio_exit_cross_page() {
     let setup = TestSetup {
         assembly: test_mmio_exit_cross_page_code::data().to_vec(),
         load_addr,
+        mem_size: 0x2000,
         initial_regs: Regs {
             rip: load_addr.offset(),
             rax: 0x33,
@@ -530,7 +745,7 @@ fn test_mmio_exit_cross_page() {
         assert_eq!(regs.rax, 0x66, "Should match the MMIO read bytes below");
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Mmio => {
             vcpu.handle_mmio(&mut |IoParams {
                                        address,
@@ -548,11 +763,11 @@ fn test_mmio_exit_cross_page() {
                             (0x1000, 8) => {
                                 // Ensure this instruction is the first read
                                 // in the sequence.
-                                Some([0x88, 0x03, 0x67, 0x8a, 0x01, 0xf4, 0, 0])
+                                Ok(Some([0x88, 0x03, 0x67, 0x8a, 0x01, 0xf4, 0, 0]))
                             }
                             // Second MMIO read is a regular read from an
                             // unmapped memory (pointed to by initial EAX).
-                            (0x3010, 1) => Some([0x66, 0, 0, 0, 0, 0, 0, 0]),
+                            (0x3010, 1) => Ok(Some([0x66, 0, 0, 0, 0, 0, 0, 0])),
                             _ => {
                                 panic!("invalid address({:#x})/size({})", address, size)
                             }
@@ -562,7 +777,7 @@ fn test_mmio_exit_cross_page() {
                         assert_eq!(address, 0x3000);
                         assert_eq!(data[0], 0x33);
                         assert_eq!(size, 1);
-                        None
+                        Ok(None)
                     }
                 }
             })
@@ -595,6 +810,7 @@ fn test_mmio_exit_readonly_memory() {
     let setup = TestSetup {
         assembly: test_mmio_exit_readonly_memory_code::data().to_vec(),
         load_addr: GuestAddress(0x1000),
+        mem_size: 0x2000,
         initial_regs: Regs {
             rip: 0x1000,
             rax: 1,
@@ -642,7 +858,7 @@ fn test_mmio_exit_readonly_memory() {
         ..Default::default()
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Mmio => {
             vcpu.handle_mmio(&mut |IoParams {
                                        address,
@@ -656,7 +872,7 @@ fn test_mmio_exit_readonly_memory() {
                     assert_eq!(size, 1);
                     assert_eq!(address, 0x5000);
                     assert_eq!(data[0], 0x67);
-                    None
+                    Ok(None)
                 }
             })
             .expect("failed to set the data");
@@ -708,20 +924,22 @@ fn test_cpuid_exit_handler() {
     };
 
     let exit_matcher =
-        |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-            HypervisorType::Whpx => match exit {
-                VcpuExit::Cpuid { entry } => {
-                    println!("Got Cpuid {:?}", entry);
-                    true // Break runloop
-                }
-                r => panic!("unexpected exit reason: {:?}", r),
-            },
-            _ => match exit {
-                VcpuExit::Hlt => {
-                    true // Break VM runloop
-                }
-                r => panic!("unexpected exit reason: {:?}", r),
-            },
+        |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+            match hypervisor_type {
+                HypervisorType::Whpx => match exit {
+                    VcpuExit::Cpuid { entry } => {
+                        println!("Got Cpuid {:?}", entry);
+                        true // Break runloop
+                    }
+                    r => panic!("unexpected exit reason: {:?}", r),
+                },
+                _ => match exit {
+                    VcpuExit::Hlt => {
+                        true // Break VM runloop
+                    }
+                    r => panic!("unexpected exit reason: {:?}", r),
+                },
+            }
         };
 
     run_tests!(setup, regs_matcher, exit_matcher);
@@ -762,21 +980,23 @@ fn test_control_register_access_invalid() {
     };
 
     let exit_matcher =
-        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-            HypervisorType::Kvm | HypervisorType::Haxm => {
-                match exit {
-                    VcpuExit::Shutdown(_) => {
-                        true // Break VM runloop
+        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+            match hypervisor_type {
+                HypervisorType::Kvm | HypervisorType::Haxm => {
+                    match exit {
+                        VcpuExit::Shutdown(_) => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
-            }
-            _ => {
-                match exit {
-                    VcpuExit::UnrecoverableException => {
-                        true // Break VM runloop
+                _ => {
+                    match exit {
+                        VcpuExit::UnrecoverableException => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
             }
         };
@@ -815,12 +1035,13 @@ fn test_control_register_access_valid() {
         );
     };
 
-    let exit_matcher = move |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match exit {
-        VcpuExit::Hlt => {
-            true // Break VM runloop
-        }
-        r => panic!("unexpected exit reason: {:?}", r),
-    };
+    let exit_matcher =
+        move |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
+            VcpuExit::Hlt => {
+                true // Break VM runloop
+            }
+            r => panic!("unexpected exit reason: {:?}", r),
+        };
     run_tests!(setup, regs_matcher, exit_matcher);
 }
 
@@ -854,7 +1075,7 @@ fn test_debug_register_access() {
         );
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -886,9 +1107,14 @@ fn test_msr_access_invalid() {
             rflags: 2,
             ..Default::default()
         },
-        // This run should fail due to the invalid EFER bit being set.
-        expect_run_success: false,
         ..Default::default()
+    };
+
+    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
+        VcpuExit::Shutdown(..) => {
+            true // Break VM runloop
+        }
+        r => panic!("unexpected exit reason: {:?}", r),
     };
 
     run_tests!(
@@ -896,10 +1122,7 @@ fn test_msr_access_invalid() {
         |_, regs, _| {
             assert_eq!(regs.rip, 0x1005); // Should stop at the wrmsr
         },
-        |_, _, _| {
-            /* unused */
-            true
-        }
+        exit_matcher
     );
 }
 
@@ -933,7 +1156,7 @@ fn test_msr_access_valid() {
         assert_eq!(regs.rip, 0x1008, "Should stop after the hlt instruction");
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -960,6 +1183,9 @@ fn test_getsec_instruction() {
             rflags: 2,
             ..Default::default()
         },
+        extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
+        })),
         ..Default::default()
     };
 
@@ -973,29 +1199,23 @@ fn test_getsec_instruction() {
         };
 
     let exit_matcher =
-        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-            HypervisorType::Kvm => {
-                match exit {
-                    VcpuExit::InternalError => {
-                        true // Break VM runloop
+        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+            match hypervisor_type {
+                HypervisorType::Whpx => {
+                    match exit {
+                        VcpuExit::UnrecoverableException => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
-            }
-            HypervisorType::Whpx => {
-                match exit {
-                    VcpuExit::Mmio => {
-                        true // Break VM runloop
+                _ => {
+                    match exit {
+                        VcpuExit::Shutdown(_) => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
-                }
-            }
-            _ => {
-                match exit {
-                    VcpuExit::Shutdown(_) => {
-                        true // Break VM runloop
-                    }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
             }
         };
@@ -1032,21 +1252,23 @@ fn test_invd_instruction() {
             }
         };
     let exit_matcher =
-        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-            HypervisorType::Haxm => {
-                match exit {
-                    VcpuExit::Shutdown(_) => {
-                        true // Break VM runloop
+        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+            match hypervisor_type {
+                HypervisorType::Haxm => {
+                    match exit {
+                        VcpuExit::Shutdown(_) => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
-            }
-            _ => {
-                match exit {
-                    VcpuExit::Hlt => {
-                        true // Break VM runloop
+                _ => {
+                    match exit {
+                        VcpuExit::Hlt => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
             }
         };
@@ -1079,6 +1301,9 @@ fn test_xsetbv_instruction() {
             rflags: 2,
             ..Default::default()
         },
+        extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
+        })),
         ..Default::default()
     };
 
@@ -1092,33 +1317,14 @@ fn test_xsetbv_instruction() {
             }
         };
 
-    let exit_matcher =
-        |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-            HypervisorType::Kvm => {
-                match exit {
-                    VcpuExit::InternalError => {
-                        true // Break VM runloop
-                    }
-                    r => panic!("unexpected exit reason: {:?}", r),
-                }
+    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+        match exit {
+            VcpuExit::Mmio => {
+                true // Break VM runloop
             }
-            HypervisorType::Whpx => {
-                match exit {
-                    VcpuExit::Mmio => {
-                        true // Break VM runloop
-                    }
-                    r => panic!("unexpected exit reason: {:?}", r),
-                }
-            }
-            _ => {
-                match exit {
-                    VcpuExit::Shutdown(_) => {
-                        true // Break VM runloop
-                    }
-                    r => panic!("unexpected exit reason: {:?}", r),
-                }
-            }
-        };
+            r => panic!("unexpected exit reason: {:?}", r),
+        }
+    };
 
     run_tests!(setup, regs_matcher, exit_matcher);
 }
@@ -1130,8 +1336,6 @@ global_asm_data!(
     "hlt",
 );
 
-// TODO(b/342183625): invept instruction is not valid in real mode. Reconsider how we should write
-// this test.
 #[test]
 fn test_invept_instruction() {
     let setup = TestSetup {
@@ -1143,6 +1347,9 @@ fn test_invept_instruction() {
             rflags: 2,
             ..Default::default()
         },
+        extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
+        })),
         ..Default::default()
     };
 
@@ -1157,29 +1364,23 @@ fn test_invept_instruction() {
         };
 
     let exit_matcher =
-        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-            HypervisorType::Kvm => {
-                match exit {
-                    VcpuExit::InternalError => {
-                        true // Break VM runloop
+        move |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+            match hypervisor_type {
+                HypervisorType::Whpx => {
+                    match exit {
+                        VcpuExit::UnrecoverableException => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
-            }
-            HypervisorType::Whpx => {
-                match exit {
-                    VcpuExit::Mmio => {
-                        true // Break VM runloop
+                _ => {
+                    match exit {
+                        VcpuExit::Shutdown(_) => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
-                }
-            }
-            _ => {
-                match exit {
-                    VcpuExit::Shutdown(_) => {
-                        true // Break VM runloop
-                    }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
             }
         };
@@ -1207,6 +1408,9 @@ fn test_invvpid_instruction() {
             rflags: 2,
             ..Default::default()
         },
+        extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
+        })),
         ..Default::default()
     };
 
@@ -1214,12 +1418,13 @@ fn test_invvpid_instruction() {
         assert_eq!(regs.rip, 0x1000, "INVVPID; expected RIP at 0x1000");
     };
 
-    let exit_matcher = move |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match exit {
-        VcpuExit::Mmio | VcpuExit::Shutdown(_) | VcpuExit::InternalError => {
-            true // Break VM runloop
-        }
-        r => panic!("unexpected exit reason: {:?}", r),
-    };
+    let exit_matcher =
+        move |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
+            VcpuExit::Mmio | VcpuExit::Shutdown(_) | VcpuExit::InternalError => {
+                true // Break VM runloop
+            }
+            r => panic!("unexpected exit reason: {:?}", r),
+        };
 
     run_tests!(setup, regs_matcher, exit_matcher);
 }
@@ -1267,24 +1472,26 @@ fn test_vm_instruction_set() {
             };
 
         let exit_matcher =
-            |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-                HypervisorType::Whpx => {
-                    match exit {
-                        VcpuExit::Mmio => {
-                            true // Break VM runloop
+            |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+                match hypervisor_type {
+                    HypervisorType::Whpx => {
+                        match exit {
+                            VcpuExit::Mmio => {
+                                true // Break VM runloop
+                            }
+                            r => panic!("unexpected exit reason: {:?}", r),
                         }
-                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                }
-                HypervisorType::Kvm => {
-                    true // Break VM runloop
-                }
-                _ => {
-                    match exit {
-                        VcpuExit::Shutdown(_) => {
-                            true // Break VM runloop
+                    HypervisorType::Kvm => {
+                        true // Break VM runloop
+                    }
+                    _ => {
+                        match exit {
+                            VcpuExit::Shutdown(_) => {
+                                true // Break VM runloop
+                            }
+                            r => panic!("unexpected exit reason: {:?}", r),
                         }
-                        r => panic!("unexpected exit reason: {:?}", r),
                     }
                 }
             };
@@ -1332,21 +1539,23 @@ fn test_software_interrupt() {
         };
 
     let exit_matcher =
-        |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match hypervisor_type {
-            HypervisorType::Kvm | HypervisorType::Whpx => {
-                match exit {
-                    VcpuExit::Mmio => {
-                        true // Break VM runloop
+        |hypervisor_type, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
+            match hypervisor_type {
+                HypervisorType::Kvm | HypervisorType::Whpx => {
+                    match exit {
+                        VcpuExit::Mmio => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
-            }
-            _ => {
-                match exit {
-                    VcpuExit::Shutdown(_) => {
-                        true // Break VM runloop
+                _ => {
+                    match exit {
+                        VcpuExit::Shutdown(_) => {
+                            true // Break VM runloop
+                        }
+                        r => panic!("unexpected exit reason: {:?}", r),
                     }
-                    r => panic!("unexpected exit reason: {:?}", r),
                 }
             }
         };
@@ -1383,8 +1592,10 @@ fn test_rdtsc_instruction() {
         );
     };
 
-    let exit_matcher =
-        |_: HypervisorType, exit: &VcpuExit, _: &mut dyn VcpuX86_64| matches!(exit, VcpuExit::Hlt);
+    let exit_matcher = |_: HypervisorType,
+                        exit: &VcpuExit,
+                        _: &mut dyn VcpuX86_64,
+                        _: &mut dyn Vm| { matches!(exit, VcpuExit::Hlt) };
 
     run_tests!(setup, regs_matcher, exit_matcher);
 }
@@ -1438,7 +1649,7 @@ fn test_register_access() {
                 start_addr + test_register_access_code::data().len() as u64
             );
         },
-        |_, exit, _| matches!(exit, VcpuExit::Hlt)
+        |_, exit, _, _: &mut dyn Vm| matches!(exit, VcpuExit::Hlt)
     );
 }
 
@@ -1477,7 +1688,7 @@ fn test_flags_register() {
                 start_addr + test_flags_register_code::data().len() as u64
             );
         },
-        |_, exit, _| matches!(exit, VcpuExit::Hlt)
+        |_, exit, _, _: &mut dyn Vm| matches!(exit, VcpuExit::Hlt)
     );
 }
 
@@ -1554,7 +1765,7 @@ fn test_vmm_set_segs() {
                 expect_rip_addr
             );
         },
-        |_, exit, _| matches!(exit, VcpuExit::Hlt)
+        |_, exit, _, _: &mut dyn Vm| matches!(exit, VcpuExit::Hlt)
     );
 }
 
@@ -1600,7 +1811,7 @@ fn test_set_cr_vmm() {
             assert_ne!(sregs.cr4 & (1 << 2), 0);
             assert_eq!(regs.rip, asm_addr + setup.assembly.len() as u64); // after hlt
         },
-        |_, exit, _| matches!(exit, VcpuExit::Hlt)
+        |_, exit, _, _: &mut dyn Vm| matches!(exit, VcpuExit::Hlt)
     );
 }
 
@@ -1644,18 +1855,8 @@ fn test_set_cr_guest() {
             assert_ne!(sregs.cr4 & (1 << 2), 0);
             assert_eq!(regs.rip, asm_addr + setup.assembly.len() as u64); // after hlt
         },
-        |_, exit, _| matches!(exit, VcpuExit::Hlt)
+        |_, exit, _, _: &mut dyn Vm| matches!(exit, VcpuExit::Hlt)
     );
-}
-
-#[repr(C, packed)]
-#[derive(AsBytes)]
-// Define IDTR value
-struct Idtr {
-    // The lower 2 bytes are limit.
-    limit: u16,
-    // The higher 4 bytes are base address.
-    base_address: u32,
 }
 
 mod test_minimal_interrupt_injection_code {
@@ -1706,10 +1907,13 @@ fn test_minimal_interrupt_injection() {
     let mut cur_addr = start_addr;
 
     let idtr_size: u32 = 6;
-    assert_eq!(Ok(std::mem::size_of::<Idtr>()), usize::try_from(idtr_size));
+    assert_eq!(
+        Ok(std::mem::size_of::<Idtr32>()),
+        usize::try_from(idtr_size)
+    );
     // The limit is calculated from 256 entries timed by 4 bytes per entry.
     let idt_size = 256u16 * 4u16;
-    let idtr = Idtr {
+    let idtr = Idtr32 {
         limit: idt_size - 1,
         // The IDT right follows the IDTR.
         base_address: start_addr + idtr_size,
@@ -1744,7 +1948,7 @@ fn test_minimal_interrupt_injection() {
             assert_eq!(regs.rax, 888);
             assert_eq!(regs.rbx, 990);
         },
-        |_, exit, vcpu: &mut dyn VcpuX86_64| {
+        |_, exit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
             match exit {
                 VcpuExit::Hlt => {
                     let regs = vcpu
@@ -1835,10 +2039,13 @@ fn test_multiple_interrupt_injection() {
     let mut cur_addr = start_addr;
 
     let idtr_size: u32 = 6;
-    assert_eq!(Ok(std::mem::size_of::<Idtr>()), usize::try_from(idtr_size));
+    assert_eq!(
+        Ok(std::mem::size_of::<Idtr32>()),
+        usize::try_from(idtr_size)
+    );
     // The limit is calculated from 256 entries timed by 4 bytes per entry.
     let idt_size = 256u16 * 4u16;
-    let idtr = Idtr {
+    let idtr = Idtr32 {
         limit: idt_size - 1,
         // The IDT right follows the IDTR.
         base_address: start_addr + idtr_size,
@@ -1910,7 +2117,7 @@ fn test_multiple_interrupt_injection() {
             assert_eq!(regs.rcx, 3);
             assert_eq!(regs.rdx, 281);
         },
-        |_, exit, vcpu: &mut dyn VcpuX86_64| {
+        |_, exit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
             match exit {
                 VcpuExit::Hlt => {
                     let regs = vcpu
@@ -2034,10 +2241,13 @@ fn test_interrupt_ready_when_normally_not_interruptible() {
     let mut cur_addr = start_addr;
 
     let idtr_size: u32 = 6;
-    assert_eq!(Ok(std::mem::size_of::<Idtr>()), usize::try_from(idtr_size));
+    assert_eq!(
+        Ok(std::mem::size_of::<Idtr32>()),
+        usize::try_from(idtr_size)
+    );
     // The limit is calculated from 256 entries timed by 4 bytes per entry.
     let idt_size = 256u16 * 4u16;
-    let idtr = Idtr {
+    let idtr = Idtr32 {
         limit: idt_size - 1,
         // The IDT right follows the IDTR.
         base_address: start_addr + idtr_size,
@@ -2105,7 +2315,7 @@ fn test_interrupt_ready_when_normally_not_interruptible() {
             );
             assert_eq!(regs.rip, u64::from(cur_addr));
         },
-        |_, exit, vcpu: &mut dyn VcpuX86_64| {
+        |_, exit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
             match exit {
                 VcpuExit::Io => {
                     let ready_for_interrupt = vcpu.ready_for_interrupt();
@@ -2178,7 +2388,7 @@ fn test_interrupt_ready_when_interrupt_enable_flag_not_set() {
             // For VMEXIT caused by HLT, the hypervisor will automatically advance the rIP register.
             assert_eq!(regs.rip, 0x1000 + assembly.len() as u64);
         },
-        |_, exit, vcpu| {
+        |_, exit, vcpu, _: &mut dyn Vm| {
             match exit {
                 VcpuExit::Io => {
                     let mut addr = 0;
@@ -2234,7 +2444,7 @@ fn test_enter_long_mode_direct() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            enter_long_mode(vcpu, vm);
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
         })),
 
         ..Default::default()
@@ -2257,7 +2467,7 @@ fn test_enter_long_mode_direct() {
         assert_eq!((sregs.cs.l), 1, "Long-mode bit not set in CS");
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, _: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, _: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -2267,15 +2477,12 @@ fn test_enter_long_mode_direct() {
     run_tests!(setup, regs_matcher, exit_matcher);
 }
 
-// KVM fails on the wrmsr instruction with a shutdown vmexit; issues with
-// running the asm in real-mode?
-#[cfg(any(feature = "whpx", feature = "haxm"))]
 #[test]
 fn test_enter_long_mode_asm() {
     global_asm_data!(
         pub enter_long_mode_asm,
         ".code16",
-        "lidt [0xd100]",             // IDT_OFFSET
+        "lidt [0xd100]",             // Address of the IDT limit + base
         "mov eax, cr4",
         "or ax, 1 << 7 | 1 << 5",    // Set the PAE-bit (bit 5) and  PGE (bit 7).
         "mov cr4, eax",
@@ -2317,7 +2524,11 @@ fn test_enter_long_mode_asm() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|_: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            configure_long_mode_memory(vm);
+            // TODO(b/354901961): configure_long_mode_memory loads GDT and IDT for 64 bit usage, and
+            // the ABI doesn't match real mode and protected mode, but in this test, we first launch
+            // in real mode.
+
+            ModeConfig::default_long_mode().configure_long_mode_memory(vm);
         })),
 
         ..Default::default()
@@ -2328,6 +2539,7 @@ fn test_enter_long_mode_asm() {
         biglier_mem_value.to_le_bytes().to_vec(),
     );
     setup.add_memory_initialization(GuestAddress(0xe000), long_mode_asm::data().to_vec());
+
     // GDT limit + base, to be loaded by the lgdt instruction.
     // Must be within 0xFFFF as it's executed in real-mode.
     setup.add_memory_initialization(GuestAddress(0xd000), 0xFFFF_u32.to_le_bytes().to_vec());
@@ -2341,7 +2553,7 @@ fn test_enter_long_mode_asm() {
     setup.add_memory_initialization(GuestAddress(0xd100), 0xFFFF_u32.to_le_bytes().to_vec());
     setup.add_memory_initialization(
         GuestAddress(0xd100 + 2),
-        (IDT_OFFSET as u32).to_le_bytes().to_vec(),
+        (DEFAULT_IDT_OFFSET as u32).to_le_bytes().to_vec(),
     );
 
     let regs_matcher = move |_: HypervisorType, regs: &Regs, sregs: &Sregs| {
@@ -2357,7 +2569,7 @@ fn test_enter_long_mode_asm() {
         assert_eq!((sregs.cs.l), 1, "Long-mode bit not set in CS");
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, _: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, _: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -2411,7 +2623,7 @@ fn test_request_interrupt_window() {
         {
             let mut io_counter = 0;
             let mut irq_window_received = false;
-            move |hypervisor_type, exit, vcpu: &mut dyn VcpuX86_64| {
+            move |hypervisor_type, exit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
                 let is_irq_window = if hypervisor_type == HypervisorType::Haxm {
                     matches!(exit, VcpuExit::Intr) && io_counter == 2
                 } else {
@@ -2452,7 +2664,6 @@ fn test_request_interrupt_window() {
     );
 }
 
-#[cfg(any(feature = "whpx", feature = "haxm"))]
 #[test]
 fn test_fsgsbase() {
     global_asm_data!(
@@ -2483,7 +2694,7 @@ fn test_fsgsbase() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            enter_long_mode(vcpu, vm);
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
 
             let mut sregs = vcpu.get_sregs().expect("unable to get sregs");
             sregs.cr4 |= 1 << 16; // FSGSBASE (bit 16)
@@ -2505,7 +2716,7 @@ fn test_fsgsbase() {
         assert_eq!(sregs.gs.base, gs);
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, _vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -2517,7 +2728,6 @@ fn test_fsgsbase() {
 
 /// Tests whether MMX state is being preserved by the hypervisor correctly (e.g. the hypervisor is
 /// properly using fxsave/fxrstor, or xsave/xrstor (or xsaves/xrstors)).
-#[cfg(any(feature = "whpx", feature = "haxm"))]
 #[test]
 fn test_mmx_state_is_preserved_by_hypervisor() {
     // This program stores a sentinel value into mm0 (the first MMX register) and verifies
@@ -2563,7 +2773,7 @@ fn test_mmx_state_is_preserved_by_hypervisor() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            enter_long_mode(vcpu, vm);
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
         })),
         memory_initializations: vec![],
         ..Default::default()
@@ -2577,7 +2787,7 @@ fn test_mmx_state_is_preserved_by_hypervisor() {
         );
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -2633,7 +2843,6 @@ fn test_mmx_state_is_preserved_by_hypervisor() {
 /// properly using xsave/xrstor (or xsaves/xrstors)). This is very similar to the MMX test, but
 /// AVX state is *not* captured by fxsave, so that's how we guarantee xsave state of some kind is
 /// being handled properly.
-#[cfg(any(feature = "whpx", feature = "haxm"))]
 #[test]
 fn test_avx_state_is_preserved_by_hypervisor() {
     if !is_x86_feature_detected!("avx") {
@@ -2704,7 +2913,7 @@ fn test_avx_state_is_preserved_by_hypervisor() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            enter_long_mode(vcpu, vm);
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
         })),
         memory_initializations: vec![],
         ..Default::default()
@@ -2718,7 +2927,7 @@ fn test_avx_state_is_preserved_by_hypervisor() {
         );
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -2771,7 +2980,6 @@ fn test_avx_state_is_preserved_by_hypervisor() {
 }
 
 /// Tests whether XSAVE works inside a guest.
-#[cfg(any(feature = "whpx", feature = "haxm"))]
 #[test]
 fn test_xsave() {
     let sentinel_xmm0_value = 0x1337FFFFu64;
@@ -2839,7 +3047,7 @@ fn test_xsave() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            enter_long_mode(vcpu, vm);
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
         })),
         memory_initializations: vec![(GuestAddress(0x10000), vec![0; 0x1000])],
         ..Default::default()
@@ -2853,7 +3061,7 @@ fn test_xsave() {
         );
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -2974,7 +3182,7 @@ fn test_xsaves() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            enter_long_mode(vcpu, vm);
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
         })),
         memory_initializations: vec![(GuestAddress(0x10000), vec![0; 0x1000])],
         ..Default::default()
@@ -2987,7 +3195,7 @@ fn test_xsaves() {
         assert_eq!(regs.rdx, 0, "test failed unexpectedly");
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -3038,7 +3246,7 @@ fn test_xsaves_is_disabled_on_haxm() {
             ..Default::default()
         },
         extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
-            enter_long_mode(vcpu, vm);
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
         })),
         memory_initializations: vec![],
         ..Default::default()
@@ -3049,7 +3257,7 @@ fn test_xsaves_is_disabled_on_haxm() {
         assert_eq!(regs.rdx, 0, "test failed unexpectedly");
     };
 
-    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64| match exit {
+    let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Hlt => {
             true // Break VM runloop
         }
@@ -3063,6 +3271,210 @@ fn test_xsaves_is_disabled_on_haxm() {
     };
 
     run_tests!(setup, regs_matcher, exit_matcher);
+}
+
+/// Tests whether SLAT is updated properly when a region is removed from the guest. A correctly
+/// implemented hypervisor will flush the TLB such that this immediately hits a SLAT fault and comes
+/// to us as MMIO. If we don't see that, and the guest actually reads from the removed region, the
+/// test will fail. In the real world, this would be a guest read from a random pfn, which is
+/// UB (and a major security problem).
+///
+/// Flakes should be treated as real failures (this test can show a false negative, but never a
+/// false positive).
+#[test]
+fn test_slat_on_region_removal_is_mmio() {
+    global_asm_data!(
+        pub test_asm,
+        ".code64",
+
+        // Load the TLB with a mapping for the test region.
+        "mov al, byte ptr [0x20000]",
+
+        // Signal to the host that VM is running. On this vmexit, the host will unmap the test
+        // region.
+        "out 0x5, al",
+
+        // This read should result in MMIO, and if it does, the test passes. If we hit the hlt, then
+        // the test fails (since it means we were able to satisfy this read without exiting).
+        "mov al, byte ptr [0x20000]",
+        "hlt"
+    );
+
+    const TEST_MEM_REGION_SIZE: usize = 0x1000;
+    let memslot: Arc<Mutex<Option<MemSlot>>> = Arc::new(Mutex::new(None));
+    let memslot_for_func = memslot.clone();
+
+    let code_addr = 0x1000;
+    let setup = TestSetup {
+        assembly: test_asm::data().to_vec(),
+        mem_size: 0x12000,
+        load_addr: GuestAddress(code_addr),
+        initial_regs: Regs {
+            rip: code_addr,
+            rflags: 0x2,
+            ..Default::default()
+        },
+        extra_vm_setup: Some(Box::new(
+            move |vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+                ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
+
+                // Create a test pinned memory region that is all 0xFF.
+                let shm = SharedMemory::new("test", TEST_MEM_REGION_SIZE as u64).unwrap();
+                let test_region = Box::new(
+                    MemoryMappingBuilder::new(TEST_MEM_REGION_SIZE)
+                        .from_shared_memory(&shm)
+                        .build()
+                        .unwrap(),
+                );
+                let ff_init = [0xFFu8; TEST_MEM_REGION_SIZE];
+                test_region.write_slice(&ff_init, 0).unwrap();
+                let test_region = Box::new(
+                    PinnedMemoryRegion::new(test_region).expect("failed to pin test region"),
+                );
+                *memslot_for_func.lock() = Some(
+                    vm.add_memory_region(
+                        GuestAddress(0x20000),
+                        test_region,
+                        false,
+                        false,
+                        MemCacheType::CacheCoherent,
+                    )
+                    .unwrap(),
+                );
+            },
+        )),
+        memory_initializations: vec![],
+        ..Default::default()
+    };
+
+    // Holds the test memory region after it's unmapped and the VM is still running. Without this,
+    // incorrect access to the region by the VM would be unsafe / UB.
+    let test_region_arc: Arc<Mutex<Option<Box<dyn MappedRegion>>>> = Arc::new(Mutex::new(None));
+    let test_region_arc_for_exit = test_region_arc.clone();
+
+    let exit_matcher =
+        move |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| match exit {
+            VcpuExit::Io => {
+                // WHPX insists on data being returned here or it throws MemoryCallbackFailed.
+                //
+                // We strictly don't care what this data is, since the VM exits before running any
+                // further instructions.
+                vcpu.handle_io(&mut |_| None)
+                    .expect("should handle IO successfully");
+
+                // Remove the test memory region to cause a SLAT fault (in the passing case).
+                //
+                // This also ensures the memory region remains pinned in host physical memory so any
+                // incorrect accesses to it by the VM will remain safe.
+                *test_region_arc_for_exit.lock() =
+                    Some(vm.remove_memory_region(memslot.lock().unwrap()).unwrap());
+                false
+            }
+            VcpuExit::Mmio => {
+                vcpu.handle_mmio(&mut |IoParams {
+                                           address,
+                                           size,
+                                           operation,
+                                       }| {
+                    assert_eq!(address, 0x20000, "MMIO for wrong address");
+                    assert_eq!(size, 1);
+                    assert!(
+                        matches!(operation, IoOperation::Read),
+                        "got unexpected IO operation {:?}",
+                        operation
+                    );
+                    // We won't vmenter again, so there's no need to actually satisfy the MMIO by
+                    // returning data; however, some hypervisors (WHPX) require it.
+                    Ok(Some([0u8; 8]))
+                })
+                .unwrap();
+                true
+            }
+            VcpuExit::Hlt => {
+                panic!("VM should not reach the hlt instruction (MMIO should've ended the VM)");
+            }
+            r => panic!("unexpected exit reason: {:?}", r),
+        };
+
+    // We want to catch if the hypervisor doesn't clear the VM's TLB. If we hop between CPUs, then
+    // we're likely to end up with a clean TLB on another CPU.
+    set_cpu_affinity(vec![0]).unwrap();
+
+    run_tests!(setup, move |_, _, _| {}, &exit_matcher);
+}
+
+struct PinnedMemoryRegion {
+    mem_region: Box<dyn MappedRegion>,
+}
+
+impl PinnedMemoryRegion {
+    fn new(mem_region: Box<dyn MappedRegion>) -> base::Result<Self> {
+        // SAFETY:
+        // ptr is a valid pointer and points to a region of the supplied size.
+        unsafe { pin_memory(mem_region.as_ptr() as *mut _, mem_region.size()) }?;
+        Ok(Self { mem_region })
+    }
+}
+
+// SAFETY:
+// Safe because ptr & size a memory range owned by this MemoryMapping that won't be unmapped
+// until it's dropped.
+unsafe impl MappedRegion for PinnedMemoryRegion {
+    fn as_ptr(&self) -> *mut u8 {
+        self.mem_region.as_ptr()
+    }
+
+    fn size(&self) -> usize {
+        self.mem_region.size()
+    }
+}
+
+impl Drop for PinnedMemoryRegion {
+    fn drop(&mut self) {
+        // SAFETY:
+        // memory region passed is a valid pointer and points to a region of the
+        // supplied size. We also panic on failure.
+        unsafe { unpin_memory(self.mem_region.as_ptr() as *mut _, self.mem_region.size()) }
+            .expect("failed to unpin memory")
+    }
+}
+
+unsafe fn pin_memory(ptr: *mut c_void, len: usize) -> base::Result<()> {
+    #[cfg(windows)]
+    {
+        if VirtualLock(ptr, len).into() {
+            Ok(())
+        } else {
+            Err(base::Error::last())
+        }
+    }
+    #[cfg(unix)]
+    {
+        if libc::mlock(ptr, len) != 0 {
+            Err(base::Error::last())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+unsafe fn unpin_memory(ptr: *mut c_void, len: usize) -> base::Result<()> {
+    #[cfg(windows)]
+    {
+        if VirtualUnlock(ptr, len).into() {
+            Ok(())
+        } else {
+            Err(base::Error::last())
+        }
+    }
+    #[cfg(unix)]
+    {
+        if libc::munlock(ptr, len) != 0 {
+            Err(base::Error::last())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[test]
@@ -3130,10 +3542,13 @@ fn test_interrupt_injection_when_not_ready() {
     let mut cur_addr = start_addr;
 
     let idtr_size: u32 = 6;
-    assert_eq!(Ok(std::mem::size_of::<Idtr>()), usize::try_from(idtr_size));
+    assert_eq!(
+        Ok(std::mem::size_of::<Idtr32>()),
+        usize::try_from(idtr_size)
+    );
     // The limit is calculated from 256 entries timed by 4 bytes per entry.
     let idt_size = 256u16 * 4u16;
-    let idtr = Idtr {
+    let idtr = Idtr32 {
         limit: idt_size - 1,
         // The IDT right follows the IDTR.
         base_address: start_addr + idtr_size,
@@ -3169,7 +3584,7 @@ fn test_interrupt_injection_when_not_ready() {
                  0x910 is 0)"
             );
         },
-        |_, exit, vcpu: &mut dyn VcpuX86_64| {
+        |_, exit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| {
             match exit {
                 // We exit and pass the test either the VCPU run fails or we hit hlt.
                 VcpuExit::FailEntry { .. } | VcpuExit::Shutdown(..) | VcpuExit::Hlt => true,
@@ -3234,7 +3649,7 @@ fn test_ready_for_interrupt_for_intercepted_instructions() {
             // For VMEXIT caused by HLT, the hypervisor will automatically advance the rIP register.
             assert_eq!(regs.rip, 0x1000 + assembly.len() as u64);
         },
-        |hypervisor_type, exit, vcpu| {
+        |hypervisor_type, exit, vcpu, _: &mut dyn Vm| {
             match exit {
                 VcpuExit::Hlt => true,
                 VcpuExit::Io => {
@@ -3262,5 +3677,387 @@ fn test_ready_for_interrupt_for_intercepted_instructions() {
                 r => panic!("unexpected exit reason: {:?}", r),
             }
         }
+    );
+}
+
+#[cfg(feature = "haxm")]
+#[test]
+fn test_cpuid_mwait_not_supported() {
+    global_asm_data!(
+        cpuid_code,
+        ".code64",
+        "mov eax, 1", // CPUID function 1
+        "cpuid",
+        "hlt"
+    );
+
+    let setup = TestSetup {
+        assembly: cpuid_code::data().to_vec(),
+        load_addr: GuestAddress(0x1000),
+        initial_regs: Regs {
+            rip: 0x1000,
+            rflags: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let regs_matcher = |_: HypervisorType, regs: &Regs, _: &Sregs| {
+        // Check if MWAIT is not supported
+        assert_eq!(
+            regs.rcx & (1 << 3),
+            0,
+            "MWAIT is supported, but it should not be."
+        );
+    };
+
+    let exit_matcher = |_, exit: &VcpuExit, _: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
+        VcpuExit::Hlt => {
+            true // Break VM runloop
+        }
+        r => panic!("unexpected exit reason: {:?}", r),
+    };
+
+    run_tests!(setup, regs_matcher, exit_matcher);
+}
+
+#[test]
+fn test_hardware_breakpoint_with_isr() {
+    global_asm_data!(
+        setup_debug_handler_code,
+        ".code64",
+        // Set up the stack
+        "mov sp, 0x900",
+        "mov rax, 0x1019", // Address of the instruction to trigger the breakpoint
+        "mov dr0, rax",
+        "mov rax, 0x00000001", // Enable the first breakpoint (local, exact) for execution
+        "mov dr7, rax",
+        "nop", // This should trigger the debug exception
+        "nop",
+        "hlt"
+    );
+
+    global_asm_data!(
+        debug_isr_code,
+        ".code64",
+        "mov rbx, 0xf00dbabe", // Set a value to indicate the ISR was called
+        "mov rax, 0",
+        "mov dr7, rax", // Disable debugging again
+        "mov rax, dr6",
+        "iretq" // Return from interrupt
+    );
+
+    global_asm_data!(
+        null_isr_code,
+        ".code64",
+        "mov rbx, 0xbaadf00d", // This ISR should never get called
+        "hlt"
+    );
+
+    let debug_isr_offset = 0x800;
+    let null_isr_offset = 0x700;
+    let debug_idt_entry = IdtEntry64::new(debug_isr_offset);
+    let null_idt_entry = IdtEntry64::new(null_isr_offset);
+
+    let setup = TestSetup {
+        assembly: setup_debug_handler_code::data().to_vec(),
+        load_addr: GuestAddress(0x1000),
+        mem_size: 0x20000,
+        initial_regs: Regs {
+            rip: 0x1000,
+            rflags: 2 | FLAGS_IF_BIT,
+            ..Default::default()
+        },
+        extra_vm_setup: Some(Box::new(
+            move |vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+                let guest_mem = vm.get_memory();
+
+                guest_mem
+                    .write_at_addr(
+                        debug_isr_code::data().to_vec().as_bytes(),
+                        GuestAddress(debug_isr_offset),
+                    )
+                    .expect("Failed to write debug ISR entry");
+
+                guest_mem
+                    .write_at_addr(
+                        null_isr_code::data().to_vec().as_bytes(),
+                        GuestAddress(null_isr_offset),
+                    )
+                    .expect("Failed to write null ISR entry");
+
+                let mut long_mode_config = ModeConfig::default_long_mode();
+                long_mode_config
+                    .set_idt_long_mode((0..256).map(|i| {
+                        if i == 0x01 {
+                            debug_idt_entry
+                        } else {
+                            null_idt_entry
+                        }
+                    }))
+                    .set_idt_base_addr(0x12_000);
+                long_mode_config.enter_long_mode(vcpu, vm);
+            },
+        )),
+        ..Default::default()
+    };
+
+    let regs_matcher = |_: HypervisorType, regs: &Regs, _: &Sregs| {
+        assert_eq!(regs.rax & 1, 1, "Breakpoint #0 not hit");
+        assert_eq!(
+            regs.rip,
+            0x1000 + (setup_debug_handler_code::data().len() as u64),
+            "rIP not at the right HLT"
+        );
+        assert_eq!(regs.rbx, 0xf00dbabe, "Debug ISR was not called");
+    };
+
+    let exit_matcher = |_, exit: &VcpuExit, _: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
+        VcpuExit::Hlt => {
+            true // Break VM runloop
+        }
+        r => panic!("unexpected exit reason: {:?}", r),
+    };
+
+    run_tests!(setup, regs_matcher, exit_matcher);
+}
+
+#[test]
+fn test_debug_register_persistence() {
+    global_asm_data!(
+        test_debug_registers_code,
+        ".code64",
+        "mov dr0, rax",
+        "inc rax",
+        "mov dr1, rax",
+        "inc rax",
+        "mov dr2, rax",
+        "inc rax",
+        "mov dr3, rax",
+        // Perform HLT to cause VMEXIT
+        "hlt",
+        "mov r8, dr0",
+        "mov r9, dr1",
+        "mov r10, dr2",
+        "mov r11, dr3",
+        "hlt"
+    );
+
+    let initial_dr_value: u64 = 0x12345678;
+
+    let setup = TestSetup {
+        assembly: test_debug_registers_code::data().to_vec(),
+        mem_size: 0x11000,
+        load_addr: GuestAddress(0x1000),
+        initial_regs: Regs {
+            rax: initial_dr_value,
+            rip: 0x1000,
+            rflags: 2,
+            ..Default::default()
+        },
+        extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+            ModeConfig::default_long_mode().enter_long_mode(vcpu, vm);
+        })),
+        ..Default::default()
+    };
+
+    let mut hlt_count = 0;
+
+    run_tests!(
+        setup,
+        |_, regs, _| {
+            assert_eq!(regs.r8, initial_dr_value, "DR0 value mismatch after VMEXIT");
+            assert_eq!(
+                regs.r9,
+                initial_dr_value + 1,
+                "DR1 value mismatch after VMEXIT"
+            );
+            assert_eq!(
+                regs.r10,
+                initial_dr_value + 2,
+                "DR2 value mismatch after VMEXIT"
+            );
+            assert_eq!(
+                regs.r11,
+                initial_dr_value + 3,
+                "DR3 value mismatch after VMEXIT"
+            );
+        },
+        |_, exit, _, _: &mut dyn Vm| match exit {
+            VcpuExit::Hlt => {
+                hlt_count += 1;
+                hlt_count > 1 // Halt execution after the second HLT
+            }
+            r => panic!("unexpected exit reason: {:?}", r),
+        }
+    );
+}
+
+#[test]
+fn test_minimal_exception_injection() {
+    // This test tries to write an invalid MSR, causing a General Protection exception to be
+    // injected by the hypervisor (since MSR writes cause a VMEXIT). We run it in long mode since
+    // real mode exception handling isn't always well supported (failed on Intel HAXM).
+    mod assembly {
+        use super::*;
+
+        // An ISR that handles any generic interrupt.
+        global_asm_data!(
+            pub isr_generic,
+            ".code64",
+            // Set EBX to 888 to observe this is where we halted.
+            "mov ebx, 888",
+            "hlt"
+        );
+
+        // An ISR that handles the General Protection fault specifically.
+        global_asm_data!(
+            pub isr_gp,
+            ".code64",
+            // Set EBX to 999 to observe this is where we halted.
+            "mov ebx, 999",
+            "hlt"
+        );
+
+        // Our VM entry (in long mode).
+        global_asm_data!(
+            pub init,
+            ".code64",
+            // Set up the stack, which will be used when CPU transfers the control to the ISR. If
+            // not set up, can cause faults (stack should be aligned).
+            "mov esp, 0x900",
+            // We will verify EBX, set it here first.
+            "mov ebx, 777",
+            // Should trigger GP fault when we try to write to MSR 0.
+            "wrmsr",
+            // We should never get here since we halt in the fault handlers.
+            "hlt",
+        );
+    }
+
+    let mem_size: u64 = 0x20000;
+
+    let setup = TestSetup {
+        initial_regs: Regs {
+            // WRMSR will try to write to ECX, we set it to zero to point to an old read-only MSR
+            // (IA32_P5_MC_ADDR).
+            rcx: 0,
+            // Intentionally not setting IF flag since exceptions don't check it.
+            rflags: 2,
+            ..Default::default()
+        },
+        mem_size,
+        extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+            let start_addr: u64 = 0x1000;
+            let guest_mem = vm.get_memory();
+
+            let isr_assembly = assembly::isr_generic::data().to_vec();
+            let isr_assembly_len =
+                u64::try_from(isr_assembly.len()).expect("ISR size should be within u64");
+
+            let isr_gp_assembly = assembly::isr_gp::data().to_vec();
+            let isr_gp_assembly_len =
+                u64::try_from(isr_gp_assembly.len()).expect("GP ISR size should be within u64");
+
+            let mut cur_addr = start_addr;
+
+            guest_mem
+                .write_at_addr(&isr_assembly, GuestAddress(cur_addr))
+                .expect("Failed to write ISR to guest memory");
+            cur_addr += isr_assembly_len;
+
+            guest_mem
+                .write_at_addr(&isr_gp_assembly, GuestAddress(cur_addr))
+                .expect("Failed to write ISR to guest memory");
+            cur_addr += isr_gp_assembly_len;
+
+            let mut regs = vcpu.get_regs().expect("Failed to get regs");
+            regs.rip = cur_addr;
+            vcpu.set_regs(&regs).expect("Failed to set regs");
+
+            let init_assembly = assembly::init::data().to_vec();
+            guest_mem
+                .write_at_addr(&init_assembly, GuestAddress(cur_addr))
+                .expect("Failed to write init assembly to guest memory");
+
+            let idt_entry_generic = IdtEntry64::new(start_addr);
+            let idt_entry_gp = IdtEntry64::new(start_addr + isr_assembly_len);
+
+            let mut long_mode_config = ModeConfig::default_long_mode();
+            long_mode_config
+                .set_idt_long_mode((0..256).map(|i| {
+                    // GP handler is vector 13.
+                    if i == 0x0D {
+                        idt_entry_gp
+                    } else {
+                        idt_entry_generic
+                    }
+                }))
+                .set_idt_base_addr(0x12_000);
+            long_mode_config.enter_long_mode(vcpu, vm);
+        })),
+        ..Default::default()
+    };
+
+    run_tests!(
+        setup,
+        |_, regs, _| {
+            // If EBX is 999 the GP handler ran.
+            assert_eq!(regs.rbx, 999);
+        },
+        |_, exit, _, _: &mut dyn Vm| matches!(exit, VcpuExit::Hlt)
+    );
+}
+
+#[test]
+fn test_pmode_segment_limit() {
+    // This test configures 32-bit protected mode and verifies that segment limits are converted
+    // correctly. The test setup configures a segment with the 20-bit limit field set to 0xFFFFF and
+    // the 4096-byte granularity bit set, which should result in a 4 GB limit (0xFFFFFFFF).
+    mod assembly {
+        use super::*;
+
+        global_asm_data!(
+            pub init,
+            ".code32",
+            // Load the CS segment limit into EAX.
+            "mov cx, cs",
+            "lsl eax, cx",
+            "hlt",
+        );
+    }
+
+    let mem_size: u64 = 0x20000;
+
+    let setup = TestSetup {
+        initial_regs: Regs {
+            ..Default::default()
+        },
+        mem_size,
+        extra_vm_setup: Some(Box::new(|vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| {
+            ModeConfig::default_protected_mode().enter_protected_mode(vcpu, vm);
+
+            let guest_mem = vm.get_memory();
+
+            let mut regs = vcpu.get_regs().expect("Failed to get regs");
+            regs.rax = 12345;
+            regs.rip = 0x1000;
+            vcpu.set_regs(&regs).expect("Failed to set regs");
+
+            let init_assembly = assembly::init::data().to_vec();
+            guest_mem
+                .write_at_addr(&init_assembly, GuestAddress(0x1000))
+                .expect("Failed to write init assembly to guest memory");
+        })),
+        ..Default::default()
+    };
+
+    run_tests!(
+        setup,
+        |_, regs, _| {
+            // The output of the LSL instruction should be 4GB - 1.
+            assert_eq!(regs.rax, 0xFFFFFFFF);
+        },
+        |_, exit, _, _: &mut dyn Vm| matches!(exit, VcpuExit::Hlt)
     );
 }

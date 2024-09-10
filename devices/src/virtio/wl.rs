@@ -72,7 +72,6 @@ use base::Error;
 use base::Event;
 use base::EventToken;
 use base::EventType;
-use base::FromRawDescriptor;
 #[cfg(feature = "gpu")]
 use base::IntoRawDescriptor;
 #[cfg(feature = "minigbm")]
@@ -464,7 +463,7 @@ struct VmRequester {
 fn to_safe_descriptor(r: RutabagaDescriptor) -> SafeDescriptor {
     // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
-    unsafe { SafeDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
+    unsafe { base::FromRawDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
 }
 
 impl VmRequester {
@@ -673,7 +672,6 @@ struct CtrlVfdNewDmabuf {
 #[cfg(feature = "minigbm")]
 #[repr(C)]
 #[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
-#[cfg(feature = "minigbm")]
 struct CtrlVfdDmabufSync {
     hdr: CtrlHeader,
     id: Le32,
@@ -1054,14 +1052,14 @@ impl WlVfd {
                 .send_vectored_with_fds(&data.get_remaining(), rds)
                 .map_err(WlError::SendVfd)?;
             // All remaining data in `data` is now considered consumed.
-            data.consume(::std::usize::MAX);
+            data.consume(usize::MAX);
             Ok(WlResp::Ok)
         } else if let Some((_, local_pipe)) = &mut self.local_pipe {
             // Impossible to send descriptors over a simple pipe.
             if !rds.is_empty() {
                 return Ok(WlResp::InvalidType);
             }
-            data.read_to(local_pipe, usize::max_value())
+            data.read_to(local_pipe, usize::MAX)
                 .map_err(WlError::WritePipe)?;
             Ok(WlResp::Ok)
         } else {
@@ -1494,7 +1492,9 @@ impl WlState {
                             *descriptor = dup.into_raw_descriptor();
                             // SAFETY:
                             // Safe because the fd comes from a valid SafeDescriptor.
-                            let file = unsafe { File::from_raw_descriptor(*descriptor) };
+                            let file: File = unsafe {
+                                base::FromRawDescriptor::from_raw_descriptor(*descriptor)
+                            };
                             bridged_files.push(file);
                         }
                         Err(_) => return Ok(WlResp::InvalidId),
@@ -1765,7 +1765,6 @@ pub struct DescriptorsExhausted;
 
 /// Handle incoming events and forward them to the VM over the input queue.
 pub fn process_in_queue(
-    interrupt: &Interrupt,
     in_queue: &mut Queue,
     state: &mut WlState,
 ) -> ::std::result::Result<(), DescriptorsExhausted> {
@@ -1804,7 +1803,7 @@ pub fn process_in_queue(
     }
 
     if needs_interrupt {
-        in_queue.trigger_interrupt(interrupt);
+        in_queue.trigger_interrupt();
     }
 
     if exhausted_queue {
@@ -1815,7 +1814,7 @@ pub fn process_in_queue(
 }
 
 /// Handle messages from the output queue and forward them to the display sever, if necessary.
-pub fn process_out_queue(interrupt: &Interrupt, out_queue: &mut Queue, state: &mut WlState) {
+pub fn process_out_queue(out_queue: &mut Queue, state: &mut WlState) {
     let mut needs_interrupt = false;
     while let Some(mut desc) = out_queue.pop() {
         let resp = match state.execute(&mut desc.reader) {
@@ -1836,7 +1835,7 @@ pub fn process_out_queue(interrupt: &Interrupt, out_queue: &mut Queue, state: &m
     }
 
     if needs_interrupt {
-        out_queue.trigger_interrupt(interrupt);
+        out_queue.trigger_interrupt();
     }
 }
 
@@ -1927,12 +1926,12 @@ impl Worker {
                     }
                     Token::OutQueue => {
                         let _ = self.out_queue.event().wait();
-                        process_out_queue(&self.interrupt, &mut self.out_queue, &mut self.state);
+                        process_out_queue(&mut self.out_queue, &mut self.state);
                     }
                     Token::Kill => break 'wait,
                     Token::State => {
                         if let Err(DescriptorsExhausted) =
-                            process_in_queue(&self.interrupt, &mut self.in_queue, &mut self.state)
+                            process_in_queue(&mut self.in_queue, &mut self.state)
                         {
                             if let Err(e) =
                                 wait_ctx.modify(&self.state.wait_ctx, EventType::None, Token::State)

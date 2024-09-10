@@ -51,7 +51,6 @@ use crate::virtio::vhost::user::device::handler::Error as DeviceError;
 use crate::virtio::vhost::user::device::handler::VhostUserDevice;
 use crate::virtio::vhost::user::device::handler::WorkerState;
 use crate::virtio::vhost::user::VhostUserDeviceBuilder;
-use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 
 // Async workers:
@@ -157,7 +156,9 @@ impl VhostUserDevice for SndBackend {
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        VhostUserProtocolFeatures::CONFIG | VhostUserProtocolFeatures::MQ
+        VhostUserProtocolFeatures::CONFIG
+            | VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::DEVICE_STATE
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -175,7 +176,6 @@ impl VhostUserDevice for SndBackend {
         idx: usize,
         queue: virtio::Queue,
         _mem: GuestMemory,
-        doorbell: Interrupt,
     ) -> anyhow::Result<()> {
         if self.workers[idx].is_some() {
             warn!(
@@ -212,7 +212,6 @@ impl VhostUserDevice for SndBackend {
                         &snd_data,
                         ctrl_queue,
                         &mut kick_evt,
-                        doorbell,
                         tx_send,
                         rx_send,
                         card_index,
@@ -246,7 +245,7 @@ impl VhostUserDevice for SndBackend {
 
                 let queue_response_queue = queue.clone();
                 let response_queue_task = self.ex.spawn_local(async move {
-                    send_pcm_response_worker(queue_response_queue, doorbell, &mut recv, None).await
+                    send_pcm_response_worker(queue_response_queue, &mut recv, None).await
                 });
 
                 self.response_workers[idx - PCM_RESPONSE_WORKER_IDX_OFFSET] = Some(WorkerState {
@@ -304,7 +303,7 @@ impl VhostUserDevice for SndBackend {
         }
     }
 
-    fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         // now_or_never will succeed here because no workers are running.
         let stream_info_snaps = if let Some(stream_infos) = &self.streams.lock().now_or_never() {
             let mut snaps = Vec::new();
@@ -327,7 +326,7 @@ impl VhostUserDevice for SndBackend {
             None
         };
         let snd_data_ref: &SndData = self.snd_data.borrow();
-        serde_json::to_vec(&SndBackendSnapshot {
+        serde_json::to_value(SndBackendSnapshot {
             avail_features: self.avail_features,
             stream_infos: stream_info_snaps,
             snd_data: snd_data_ref.clone(),
@@ -338,12 +337,11 @@ impl VhostUserDevice for SndBackend {
         ))
     }
 
-    fn restore(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
-        let deser: SndBackendSnapshot =
-            serde_json::from_slice(data.as_slice()).context(format!(
-                "[Card {}] Failed to deserialize SndBackendSnapshot",
-                self.card_index
-            ))?;
+    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+        let deser: SndBackendSnapshot = serde_json::from_value(data).context(format!(
+            "[Card {}] Failed to deserialize SndBackendSnapshot",
+            self.card_index
+        ))?;
         anyhow::ensure!(
             deser.avail_features == self.avail_features,
             "[Card {}] avail features doesn't match on restore: expected: {}, got: {}",
@@ -397,7 +395,7 @@ impl VhostUserDevice for SndBackend {
         Ok(())
     }
 
-    fn stop_non_queue_workers(&mut self) -> anyhow::Result<()> {
+    fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
         // This device has no non-queue workers to stop.
         Ok(())
     }

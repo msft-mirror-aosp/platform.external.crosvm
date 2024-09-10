@@ -27,8 +27,10 @@ use vmm_vhost::message::VhostSharedMemoryRegion;
 use vmm_vhost::message::VhostUserConfigFlags;
 use vmm_vhost::message::VhostUserInflight;
 use vmm_vhost::message::VhostUserMemoryRegion;
+use vmm_vhost::message::VhostUserMigrationPhase;
 use vmm_vhost::message::VhostUserProtocolFeatures;
 use vmm_vhost::message::VhostUserSingleMemoryRegion;
+use vmm_vhost::message::VhostUserTransferDirection;
 use vmm_vhost::message::VhostUserVringAddrFlags;
 use vmm_vhost::message::VhostUserVringState;
 use vmm_vhost::Error;
@@ -40,9 +42,9 @@ use crate::virtio::device_constants::vsock::NUM_QUEUES;
 use crate::virtio::vhost::user::device::handler::vmm_va_to_gpa;
 use crate::virtio::vhost::user::device::handler::MappingInfo;
 use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
+use crate::virtio::vhost::user::VhostUserConnectionTrait;
 use crate::virtio::vhost::user::VhostUserDeviceBuilder;
 use crate::virtio::vhost::user::VhostUserListener;
-use crate::virtio::vhost::user::VhostUserListenerTrait;
 use crate::virtio::Queue;
 use crate::virtio::QueueConfig;
 
@@ -420,18 +422,21 @@ impl vmm_vhost::Backend for VsockBackend {
         Err(Error::InvalidOperation)
     }
 
+    fn set_device_state_fd(
+        &mut self,
+        _transfer_direction: VhostUserTransferDirection,
+        _migration_phase: VhostUserMigrationPhase,
+        _fd: File,
+    ) -> Result<Option<File>> {
+        Err(Error::InvalidOperation)
+    }
+
+    fn check_device_state(&mut self) -> Result<()> {
+        Err(Error::InvalidOperation)
+    }
+
     fn get_shared_memory_regions(&mut self) -> Result<Vec<VhostSharedMemoryRegion>> {
         Ok(vec![])
-    }
-
-    fn sleep(&mut self) -> Result<()> {
-        base::warn!("Sleep not implemented for vsock.");
-        Ok(())
-    }
-
-    fn wake(&mut self) -> Result<()> {
-        base::warn!("wake not implemented for vsock.");
-        Ok(())
     }
 
     fn snapshot(&mut self) -> Result<Vec<u8>> {
@@ -439,7 +444,7 @@ impl vmm_vhost::Backend for VsockBackend {
         Ok(Vec::new())
     }
 
-    fn restore(&mut self, _data_bytes: &[u8], _queue_evts: Vec<File>) -> Result<()> {
+    fn restore(&mut self, _data_bytes: &[u8]) -> Result<()> {
         base::warn!("restore not implemented for vsock.");
         Ok(())
     }

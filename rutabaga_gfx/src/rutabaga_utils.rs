@@ -616,7 +616,7 @@ pub struct Transfer3D {
 impl Transfer3D {
     /// Constructs a 2 dimensional XY box in 3 dimensional space with unit depth and zero
     /// displacement on the Z axis.
-    pub fn new_2d(x: u32, y: u32, w: u32, h: u32) -> Transfer3D {
+    pub fn new_2d(x: u32, y: u32, w: u32, h: u32, offset: u64) -> Transfer3D {
         Transfer3D {
             x,
             y,
@@ -627,7 +627,7 @@ impl Transfer3D {
             level: 0,
             stride: 0,
             layer_stride: 0,
-            offset: 0,
+            offset,
         }
     }
 
@@ -670,6 +670,8 @@ pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0006;
 pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0007;
 pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0008;
 pub const RUTABAGA_FENCE_HANDLE_TYPE_ZIRCON: u32 = 0x0009;
+
+pub const RUTABAGA_FENCE_HANDLE_TYPE_EVENT_FD: u32 = 0x000a;
 
 /// Handle to OS-specific memory or synchronization objects.
 pub struct RutabagaHandle {

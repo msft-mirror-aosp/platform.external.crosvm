@@ -526,7 +526,11 @@ pub unsafe extern "C" fn rutabaga_resource_create_blob(
     catch_unwind(AssertUnwindSafe(|| {
         let mut iovecs_opt: Option<Vec<RutabagaIovec>> = None;
         if let Some(iovs) = iovecs {
-            let slice = from_raw_parts((*iovs).iovecs, (*iovs).num_iovecs);
+            let slice = if iovs.num_iovecs != 0 {
+                from_raw_parts(iovs.iovecs, iovs.num_iovecs)
+            } else {
+                &[]
+            };
             let vecs = slice
                 .iter()
                 .map(|iov| RutabagaIovec {
@@ -634,8 +638,17 @@ pub unsafe extern "C" fn rutabaga_submit_command(
     cmd: &rutabaga_command,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
-        let cmd_slice = from_raw_parts_mut(cmd.cmd, cmd.cmd_size as usize);
-        let fence_ids = from_raw_parts(cmd.fence_ids, cmd.num_in_fences as usize);
+        let cmd_slice = if cmd.cmd_size != 0 {
+            from_raw_parts_mut(cmd.cmd, cmd.cmd_size as usize)
+        } else {
+            &mut []
+        };
+        let fence_ids = if cmd.num_in_fences != 0 {
+            from_raw_parts(cmd.fence_ids, cmd.num_in_fences as usize)
+        } else {
+            &mut []
+        };
+
         let result = ptr.submit_command(cmd.ctx_id, cmd_slice, fence_ids);
         return_result(result)
     }))

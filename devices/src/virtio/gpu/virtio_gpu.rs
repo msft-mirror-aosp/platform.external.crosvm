@@ -382,7 +382,7 @@ impl VirtioGpuScanout {
             .framebuffer_region(surface_id, 0, 0, self.width, self.height)
             .ok_or(ErrUnspec)?;
 
-        let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height);
+        let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
         transfer.stride = fb.stride();
         let fb_slice = fb.as_volatile_slice();
         let buf = IoSliceMut::new(
@@ -848,7 +848,7 @@ impl VirtioGpu {
     }
 
     /// If supported, export the fence with the given `fence_id` to a file.
-    pub fn export_fence(&self, fence_id: u64) -> ResourceResponse {
+    pub fn export_fence(&mut self, fence_id: u64) -> ResourceResponse {
         match self.rutabaga.export_fence(fence_id) {
             Ok(handle) => ResourceResponse::Resource(ResourceInfo::Fence {
                 handle: to_safe_descriptor(handle.os_handle),
@@ -873,7 +873,7 @@ impl VirtioGpu {
                 index
             );
             Ok(OkCapsetInfo {
-                capset_id: u32::max_value(),
+                capset_id: u32::MAX,
                 version: 0,
                 size: 0,
             })

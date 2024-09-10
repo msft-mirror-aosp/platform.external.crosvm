@@ -30,11 +30,12 @@ use crate::cross_domain::sys::read_volatile;
 use crate::cross_domain::sys::write_volatile;
 use crate::cross_domain::sys::Receiver;
 use crate::cross_domain::sys::Sender;
-use crate::cross_domain::sys::SystemStream;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
+use crate::rutabaga_os::RawDescriptor;
 use crate::rutabaga_os::SafeDescriptor;
+use crate::rutabaga_os::Tube;
 use crate::rutabaga_os::WaitContext;
 use crate::rutabaga_utils::*;
 use crate::DrmFormat;
@@ -92,12 +93,11 @@ pub(crate) struct CrossDomainItems {
     table: Map<u32, CrossDomainItem>,
 }
 
-pub(crate) struct CrossDomainState {
+struct CrossDomainState {
     context_resources: CrossDomainResources,
     query_ring_id: u32,
     channel_ring_id: u32,
-    #[allow(dead_code)] // `connection` is never used on Windows.
-    pub(crate) connection: Option<SystemStream>,
+    connection: Option<Tube>,
     jobs: CrossDomainJobs,
     jobs_cvar: Condvar,
 }
@@ -113,7 +113,7 @@ pub(crate) struct CrossDomainContext {
     #[allow(dead_code)] // `channels` is unused on Windows.
     pub(crate) channels: Option<Vec<RutabagaChannel>>,
     gralloc: Arc<Mutex<RutabagaGralloc>>,
-    pub(crate) state: Option<Arc<CrossDomainState>>,
+    state: Option<Arc<CrossDomainState>>,
     pub(crate) context_resources: CrossDomainResources,
     pub(crate) item_state: CrossDomainItemState,
     fence_handler: RutabagaFenceHandler,
@@ -173,7 +173,7 @@ impl CrossDomainState {
         query_ring_id: u32,
         channel_ring_id: u32,
         context_resources: CrossDomainResources,
-        connection: Option<SystemStream>,
+        connection: Option<Tube>,
     ) -> CrossDomainState {
         CrossDomainState {
             query_ring_id,
@@ -182,6 +182,21 @@ impl CrossDomainState {
             connection,
             jobs: Mutex::new(Some(VecDeque::new())),
             jobs_cvar: Condvar::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn send_msg(&self, opaque_data: &[u8], descriptors: &[RawDescriptor]) -> RutabagaResult<usize> {
+        match self.connection {
+            Some(ref connection) => connection.send(opaque_data, descriptors),
+            None => Err(RutabagaError::InvalidCrossDomainChannel),
+        }
+    }
+
+    pub fn receive_msg(&self, opaque_data: &mut [u8]) -> RutabagaResult<(usize, Vec<File>)> {
+        match self.connection {
+            Some(ref connection) => connection.receive(opaque_data),
+            None => Err(RutabagaError::InvalidCrossDomainChannel),
         }
     }
 
@@ -284,7 +299,7 @@ impl CrossDomainWorker {
         thread_resample_evt: &Receiver,
         receive_buf: &mut [u8],
     ) -> RutabagaResult<()> {
-        let events = self.wait_ctx.wait()?;
+        let events = self.wait_ctx.wait(None)?;
 
         // The worker thread must:
         //
@@ -466,6 +481,20 @@ impl CrossDomain {
 }
 
 impl CrossDomainContext {
+    pub fn get_connection(&mut self, cmd_init: &CrossDomainInit) -> RutabagaResult<Tube> {
+        let channels = self
+            .channels
+            .take()
+            .ok_or(RutabagaError::InvalidCrossDomainChannel)?;
+        let base_channel = &channels
+            .iter()
+            .find(|channel| channel.channel_type == cmd_init.channel_type)
+            .ok_or(RutabagaError::InvalidCrossDomainChannel)?
+            .base_channel;
+
+        Tube::new(base_channel.clone())
+    }
+
     fn initialize(&mut self, cmd_init: &CrossDomainInit) -> RutabagaResult<()> {
         if !self
             .context_resources
@@ -497,18 +526,13 @@ impl CrossDomainContext {
             let (resample_evt, thread_resample_evt) = channel()?;
 
             let mut wait_ctx = WaitContext::new()?;
-            match &connection {
-                Some(connection) => {
-                    wait_ctx.add(CROSS_DOMAIN_CONTEXT_CHANNEL_ID, connection)?;
-                }
-                None => return Err(RutabagaError::Unsupported),
-            };
+            wait_ctx.add(CROSS_DOMAIN_CONTEXT_CHANNEL_ID, &connection)?;
 
             let state = Arc::new(CrossDomainState::new(
                 query_ring_id,
                 channel_ring_id,
                 context_resources,
-                connection,
+                Some(connection),
             ));
 
             let thread_state = state.clone();
@@ -751,11 +775,12 @@ impl RutabagaContext for CrossDomainContext {
         }
     }
 
-    fn submit_cmd(&mut self, mut commands: &mut [u8], fence_ids: &[u64]) -> RutabagaResult<()> {
-        if !fence_ids.is_empty() {
-            return Err(RutabagaError::Unsupported);
-        }
-
+    fn submit_cmd(
+        &mut self,
+        mut commands: &mut [u8],
+        _fence_ids: &[u64],
+        _shareable_fences: Vec<RutabagaHandle>,
+    ) -> RutabagaResult<()> {
         while !commands.is_empty() {
             let hdr = CrossDomainHeader::read_from_prefix(commands.as_bytes())
                 .ok_or(RutabagaError::InvalidCommandBuffer)?;
@@ -862,7 +887,10 @@ impl RutabagaContext for CrossDomainContext {
             .remove(&resource.resource_id);
     }
 
-    fn context_create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+    fn context_create_fence(
+        &mut self,
+        fence: RutabagaFence,
+    ) -> RutabagaResult<Option<RutabagaHandle>> {
         match fence.ring_idx as u32 {
             CROSS_DOMAIN_QUERY_RING => self.fence_handler.call(fence),
             CROSS_DOMAIN_CHANNEL_RING => {
@@ -873,7 +901,7 @@ impl RutabagaContext for CrossDomainContext {
             _ => return Err(RutabagaError::SpecViolation("unexpected ring type")),
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn component_type(&self) -> RutabagaComponentType {
@@ -890,7 +918,7 @@ impl RutabagaComponent for CrossDomain {
         let mut caps: CrossDomainCapabilities = Default::default();
         if let Some(ref channels) = self.channels {
             for channel in channels {
-                caps.supported_channels = 1 << channel.channel_type;
+                caps.supported_channels |= 1 << channel.channel_type;
             }
         }
 

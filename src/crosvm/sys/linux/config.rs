@@ -141,6 +141,7 @@ impl FromStr for SharedDir {
         //   0) This feature is arc_quota specific feature.
         // * max_dynamic_xattr=uint - number of maximum number of dynamic xattr paths (default: 0).
         //   This feature is arc_quota specific feature.
+        // * security_ctx=BOOL - indicates whether use FUSE_SECURITY_CONTEXT feature or not.
         //
         // These two options (uid/gid) are useful when the crosvm process has no
         // CAP_SETGID/CAP_SETUID but an identity mapping of the current user/group
@@ -225,7 +226,7 @@ impl FromStr for SharedDir {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PmemExt2Option {
     pub path: PathBuf,
@@ -234,15 +235,22 @@ pub struct PmemExt2Option {
     pub size: u32,
 }
 
+impl Default for PmemExt2Option {
+    fn default() -> Self {
+        let blocks_per_group = 4096;
+        let inodes_per_group = 1024;
+        let size = ext2::BLOCK_SIZE as u32 * blocks_per_group; // only one block group
+        Self {
+            path: Default::default(),
+            blocks_per_group,
+            inodes_per_group,
+            size,
+        }
+    }
+}
+
 pub fn parse_pmem_ext2_option(param: &str) -> Result<PmemExt2Option, String> {
-    let block_size = 4096;
-    let blocks_per_group = 4096;
-    let mut opt = PmemExt2Option {
-        blocks_per_group,
-        inodes_per_group: 1024,
-        size: blocks_per_group * block_size,
-        ..Default::default()
-    };
+    let mut opt = PmemExt2Option::default();
     let mut components = param.split(':');
     opt.path = PathBuf::from(
         components

@@ -85,6 +85,7 @@ pub struct PackedQueue {
     mem: GuestMemory,
 
     event: Event,
+    interrupt: Interrupt,
 
     // The queue size in elements the driver selected
     size: u16,
@@ -125,7 +126,12 @@ pub struct PackedQueueSnapshot {
 
 impl PackedQueue {
     /// Constructs an empty virtio queue with the given `max_size`.
-    pub fn new(config: &QueueConfig, mem: &GuestMemory, event: Event) -> Result<Self> {
+    pub fn new(
+        config: &QueueConfig,
+        mem: &GuestMemory,
+        event: Event,
+        interrupt: Interrupt,
+    ) -> Result<Self> {
         let size = config.size();
 
         let desc_table = config.desc_table();
@@ -154,6 +160,7 @@ impl PackedQueue {
         Ok(PackedQueue {
             mem: mem.clone(),
             event,
+            interrupt,
             size,
             vector: config.vector(),
             desc_table: config.desc_table(),
@@ -164,6 +171,15 @@ impl PackedQueue {
             use_index: PackedQueueIndex::default(),
             signalled_used_index: PackedQueueIndex::default(),
         })
+    }
+
+    pub fn vhost_user_reclaim(&mut self, _vring_base: u16) {
+        // TODO: b/331466964 - Need more than `vring_base` to reclaim a packed virtqueue.
+        unimplemented!()
+    }
+
+    pub fn next_avail_to_process(&self) -> u16 {
+        self.avail_index.index.0
     }
 
     /// Return the actual size of the queue, as the driver may not set up a
@@ -195,6 +211,11 @@ impl PackedQueue {
     /// Get a reference to the queue's "kick event"
     pub fn event(&self) -> &Event {
         &self.event
+    }
+
+    /// Get a reference to the queue's interrupt
+    pub fn interrupt(&self) -> &Interrupt {
+        &self.interrupt
     }
 
     fn area_sizes(
@@ -387,9 +408,9 @@ impl PackedQueue {
     /// inject interrupt into guest on this queue
     /// return true: interrupt is injected into guest for this queue
     ///        false: interrupt isn't injected
-    pub fn trigger_interrupt(&mut self, interrupt: &Interrupt) -> bool {
+    pub fn trigger_interrupt(&mut self) -> bool {
         if self.queue_wants_interrupt() {
-            interrupt.signal_used_queue(self.vector);
+            self.interrupt.signal_used_queue(self.vector);
             true
         } else {
             false
@@ -413,6 +434,7 @@ impl PackedQueue {
         _queue_value: serde_json::Value,
         _mem: &GuestMemory,
         _event: Event,
+        _interrupt: Interrupt,
     ) -> Result<PackedQueue> {
         bail!("Restore for packed virtqueue not implemented.");
     }

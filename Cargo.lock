@@ -6,6 +6,7 @@ version = 3
 name = "aarch64"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arch",
  "base",
  "cros_fdt",
@@ -1085,6 +1086,7 @@ dependencies = [
  "thiserror",
  "uuid",
  "vm_memory",
+ "winapi",
  "zerocopy",
 ]
 

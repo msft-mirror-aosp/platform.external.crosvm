@@ -4,14 +4,19 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::ops::RangeInclusive;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -22,13 +27,11 @@ use base::linux::MemfdSeals;
 use base::sys::SharedMemoryLinux;
 use base::ReadNotifier;
 use base::*;
-use devices::serial_device::SerialHardware;
 use devices::serial_device::SerialParameters;
 use devices::serial_device::SerialType;
 use devices::vfio::VfioContainerManager;
 use devices::virtio;
 use devices::virtio::block::DiskOption;
-use devices::virtio::console::asynchronous::AsyncConsole;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoBackendType;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
@@ -55,6 +58,7 @@ use devices::virtio::NetError;
 use devices::virtio::NetParameters;
 #[cfg(feature = "net")]
 use devices::virtio::NetParametersMode;
+use devices::virtio::PmemConfig;
 use devices::virtio::VhostUserFrontend;
 use devices::virtio::VirtioDevice;
 use devices::virtio::VirtioDeviceType;
@@ -325,23 +329,74 @@ impl<'a> VirtioDeviceBuilder for &'a ScsiConfig<'a> {
     }
 }
 
-fn vhost_user_connection(path: &Path) -> Result<UnixStream> {
-    UnixStream::connect(path).with_context(|| {
-        format!(
-            "failed to connect to vhost-user socket path {}",
-            path.display()
-        )
-    })
+fn vhost_user_connection(path: &Path, connect_timeout_ms: Option<u64>) -> Result<UnixStream> {
+    let deadline = connect_timeout_ms.map(|t| Instant::now() + Duration::from_millis(t));
+    let mut first = true;
+    loop {
+        match UnixStream::connect(path) {
+            Ok(x) => return Ok(x),
+            Err(e) => {
+                // ConnectionRefused => Might be a stale file the backend hasn't deleted yet.
+                // NotFound => Might be the backend hasn't bound the socket yet.
+                if e.kind() == ErrorKind::ConnectionRefused || e.kind() == ErrorKind::NotFound {
+                    if let Some(deadline) = deadline {
+                        if first {
+                            first = false;
+                            warn!(
+                                "vhost-user socket path {} not available. retrying up to {} ms",
+                                path.display(),
+                                connect_timeout_ms.unwrap()
+                            );
+                        }
+                        if Instant::now() > deadline {
+                            anyhow::bail!(
+                                "timeout waiting for vhost-user socket path {}: final error: {e:#}",
+                                path.display()
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                }
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to connect to vhost-user socket path {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn is_socket(path: &PathBuf) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.file_type().is_socket(),
+        Err(_) => false, // Assume not a socket if we can't get metadata
+    }
+}
+
+fn vhost_user_connection_from_socket_fd(fd: u32) -> Result<UnixStream> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", fd));
+    if !is_socket(&path) {
+        anyhow::bail!("path {} is not socket", path.display());
+    }
+
+    let safe_fd = safe_descriptor_from_fd(fd as i32)?;
+
+    let stream: UnixStream = UnixStream::from(safe_fd);
+    Ok(stream)
 }
 
 pub fn create_vhost_user_frontend(
     protection_type: ProtectionType,
     opt: &VhostUserFrontendOption,
+    connect_timeout_ms: Option<u64>,
 ) -> DeviceResult {
     let dev = VhostUserFrontend::new(
         opt.type_,
         virtio::base_features(protection_type),
-        vhost_user_connection(&opt.socket)?,
+        vhost_user_connection(&opt.socket, connect_timeout_ms)?,
         opt.max_queue_size,
         opt.pci_address,
     )
@@ -358,9 +413,15 @@ pub fn create_vhost_user_fs_device(
     protection_type: ProtectionType,
     option: &VhostUserFsOption,
 ) -> DeviceResult {
+    let connection = match (&option.socket_path, option.socket_fd) {
+        (Some(socket), None) => vhost_user_connection(socket, None)?,
+        (None, Some(fd)) => vhost_user_connection_from_socket_fd(fd)?,
+        (Some(_), Some(_)) => bail!("Cannot specify both a UDS path and a file descriptor"),
+        (None, None) => bail!("Must specify either a socket or a file descriptor"),
+    };
     let dev = VhostUserFrontend::new_fs(
         virtio::base_features(protection_type),
-        vhost_user_connection(&option.socket)?,
+        connection,
         option.max_queue_size,
         option.tag.as_deref(),
     )
@@ -925,8 +986,8 @@ pub fn create_video_device(
             let sys_devices_path = Path::new("/sys/devices");
             jail.mount_bind(sys_devices_path, sys_devices_path, false)?;
 
-            // Required for loading dri libraries loaded by minigbm on AMD devices.
-            jail_mount_bind_if_exists(&mut jail, &["/usr/lib64", "/usr/lib"])?;
+            // Required for loading dri or vulkan libraries loaded by minigbm on AMD devices.
+            jail_mount_bind_if_exists(&mut jail, &["/usr/lib64", "/usr/lib", "/usr/share/vulkan"])?;
         }
 
         // Device nodes required by libchrome which establishes Mojo connection in libvda.
@@ -1171,23 +1232,25 @@ pub fn create_pmem_device(
         arena
     };
 
-    let mapping_address = resources
-        .allocate_mmio(
-            arena_size,
-            Alloc::PmemDevice(index),
-            format!("pmem_disk_image_{}", index),
-            AllocOptions::new()
+    let mapping_address = GuestAddress(
+        resources
+            .allocate_mmio(
+                arena_size,
+                Alloc::PmemDevice(index),
+                format!("pmem_disk_image_{}", index),
+                AllocOptions::new()
                 .top_down(true)
                 .prefetchable(true)
                 // Linux kernel requires pmem namespaces to be 128 MiB aligned.
                 // cf. https://github.com/pmem/ndctl/issues/76
                 .align(128 * 1024 * 1024), /* 128 MiB */
-        )
-        .context("failed to allocate memory for pmem device")?;
+            )
+            .context("failed to allocate memory for pmem device")?,
+    );
 
-    let slot = vm
+    let mapping_arena_slot = vm
         .add_memory_region(
-            GuestAddress(mapping_address),
+            mapping_address,
             Box::new(arena),
             /* read_only = */ pmem.ro,
             /* log_dirty_pages = */ false,
@@ -1197,13 +1260,15 @@ pub fn create_pmem_device(
 
     let dev = virtio::Pmem::new(
         virtio::base_features(protection_type),
-        Some(fd),
-        GuestAddress(mapping_address),
-        slot,
-        arena_size,
-        pmem_device_tube,
-        pmem.swap_interval,
-        !pmem.ro,
+        PmemConfig {
+            disk_image: Some(fd),
+            mapping_address,
+            mapping_arena_slot,
+            mapping_size: arena_size,
+            pmem_device_tube,
+            swap_interval: pmem.swap_interval,
+            mapping_writable: !pmem.ro,
+        },
     )
     .context("failed to create pmem device")?;
 
@@ -1228,25 +1293,27 @@ pub fn create_pmem_ext2_device(
         size: opts.size,
     };
     let arena = ext2::create_ext2_region(&cfg, Some(opts.path.as_path()))?;
-    let arena_size = arena.size() as u64;
+    let mapping_size = arena.size() as u64;
 
-    let mapping_address = resources
-        .allocate_mmio(
-            arena_size,
-            Alloc::PmemDevice(index),
-            format!("pmem_ext2_image_{}", index),
-            AllocOptions::new()
+    let mapping_address = GuestAddress(
+        resources
+            .allocate_mmio(
+                mapping_size,
+                Alloc::PmemDevice(index),
+                format!("pmem_ext2_image_{}", index),
+                AllocOptions::new()
                 .top_down(true)
                 .prefetchable(true)
                 // 2MB alignment for DAX
                 // cf. https://docs.pmem.io/persistent-memory/getting-started-guide/creating-development-environments/linux-environments/advanced-topics/i-o-alignment-considerations#verifying-io-alignment
                 .align(2 * 1024 * 1024),
-        )
-        .context("failed to allocate memory for pmem device")?;
+            )
+            .context("failed to allocate memory for pmem device")?,
+    );
 
-    let slot = vm
+    let mapping_arena_slot = vm
         .add_memory_region(
-            GuestAddress(mapping_address),
+            mapping_address,
             Box::new(arena),
             /* read_only= */ true,
             /* log_dirty_pages= */ false,
@@ -1256,13 +1323,15 @@ pub fn create_pmem_ext2_device(
 
     let dev = virtio::Pmem::new(
         virtio::base_features(protection_type),
-        None,
-        GuestAddress(mapping_address),
-        slot,
-        arena_size,
-        pmem_device_tube,
-        /* swap_interval= */ None,
-        /* mapping_writable= */ false,
+        PmemConfig {
+            disk_image: None,
+            mapping_address,
+            mapping_arena_slot,
+            mapping_size,
+            pmem_device_tube,
+            swap_interval: None,
+            mapping_writable: false,
+        },
     )
     .context("failed to create pmem device")?;
 
@@ -1340,18 +1409,10 @@ impl VirtioDeviceBuilder for &SerialParameters {
         let mut keep_rds = Vec::new();
         let evt = Event::new().context("failed to create event")?;
 
-        // TODO(b/243198718): Switch back to AsyncConsole in android (remove the `true ||`).
-        if true || self.hardware == SerialHardware::LegacyVirtioConsole {
-            Ok(Box::new(
-                self.create_serial_device::<Console>(protection_type, &evt, &mut keep_rds)
-                    .context("failed to create console device")?,
-            ))
-        } else {
-            Ok(Box::new(
-                self.create_serial_device::<AsyncConsole>(protection_type, &evt, &mut keep_rds)
-                    .context("failed to create console device")?,
-            ))
-        }
+        Ok(Box::new(
+            self.create_serial_device::<Console>(protection_type, &evt, &mut keep_rds)
+                .context("failed to create console device")?,
+        ))
     }
 
     fn create_vhost_user_device(

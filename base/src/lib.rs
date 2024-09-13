@@ -92,6 +92,7 @@ cfg_if::cfg_if! {
         pub use linux::{
             clone_descriptor, safe_descriptor_from_path,
             validate_raw_descriptor, clear_descriptor_cloexec,
+            safe_descriptor_from_fd,
         };
 
         // Event/signal related exports.
@@ -111,6 +112,7 @@ cfg_if::cfg_if! {
         pub use linux::logical_core_capacity;
         pub use linux::logical_core_cluster_id;
         pub use linux::logical_core_frequencies_khz;
+        pub use linux::logical_core_max_freq_khz;
         pub use linux::sched_attr;
         pub use linux::sched_setattr;
         pub use linux::UnlinkUnixListener;

@@ -120,6 +120,7 @@ use devices::virtio::Console;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuParameters;
 use devices::BusDeviceObj;
+use devices::BusResumeDevice;
 #[cfg(feature = "gvm")]
 use devices::GvmIrqChip;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -216,10 +217,6 @@ use win_util::ProcessType;
 use x86_64::cpuid::adjust_cpuid;
 #[cfg(feature = "whpx")]
 use x86_64::cpuid::CpuIdContext;
-#[cfg(all(target_arch = "x86_64", feature = "haxm"))]
-use x86_64::get_cpu_manufacturer;
-#[cfg(all(target_arch = "x86_64", feature = "haxm"))]
-use x86_64::CpuManufacturer;
 #[cfg(target_arch = "x86_64")]
 use x86_64::X8664arch as Arch;
 
@@ -884,11 +881,12 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     suspended_pvclock_state: &mut Option<hypervisor::ClockState>,
 ) -> Result<Option<ExitState>> {
     let mut execute_vm_request = |request: VmRequest, guest_os: &mut RunnableLinuxVm<V, Vcpu>| {
-        let mut run_mode_opt = None;
+        if let VmRequest::Exit = request {
+            return (VmResponse::Ok, Some(VmRunMode::Exiting));
+        }
         let vcpu_size = vcpu_boxes.lock().len();
         let resp = request.execute(
             &guest_os.vm,
-            &mut run_mode_opt,
             disk_host_tubes,
             &mut guest_os.pm,
             #[cfg(feature = "gpu")]
@@ -905,6 +903,7 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     guest_os.irq_chip.as_ref(),
                     #[cfg(feature = "pvclock")]
                     pvclock_host_tube,
+                    &guest_os.resume_notify_devices,
                     msg,
                 );
             },
@@ -917,7 +916,7 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             || guest_os.irq_chip.as_ref().snapshot(vcpu_size),
             suspended_pvclock_state,
         );
-        (resp, run_mode_opt)
+        (resp, None)
     };
 
     match event.token {
@@ -1118,13 +1117,7 @@ fn handle_run_mode_change_for_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + '
         info!("control socket changed run mode to {}", run_mode);
         match run_mode {
             VmRunMode::Exiting => return Some(ExitState::Stop),
-            other => {
-                if other == &VmRunMode::Running {
-                    for dev in &guest_os.resume_notify_devices {
-                        dev.lock().resume_imminent();
-                    }
-                }
-            }
+            _ => unreachable!(),
         }
     }
     // No exit state change.
@@ -1458,6 +1451,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     guest_os.irq_chip.as_ref(),
                     #[cfg(feature = "pvclock")]
                     &pvclock_host_tube,
+                    &guest_os.resume_notify_devices,
                     msg,
                 )
             },
@@ -1491,6 +1485,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             guest_os.irq_chip.as_ref(),
             #[cfg(feature = "pvclock")]
             &pvclock_host_tube,
+            &guest_os.resume_notify_devices,
             // Other platforms (unix) have multiple modes they could start in (e.g. starting for
             // guest kernel debugging, etc). If/when we support those modes on Windows, we'll need
             // to enter that mode here rather than VmRunMode::Running.
@@ -1695,6 +1690,7 @@ fn kick_all_vcpus(
     vcpu_boxes: &Mutex<Vec<Box<dyn VcpuArch>>>,
     irq_chip: &dyn IrqChipArch,
     #[cfg(feature = "pvclock")] pvclock_host_tube: &Option<Tube>,
+    resume_notify_devices: &[Arc<Mutex<dyn BusResumeDevice>>],
     msg: VcpuControl,
 ) {
     // On Windows, we handle run mode switching directly rather than delegating to the VCPU thread
@@ -1711,6 +1707,9 @@ fn kick_all_vcpus(
             return;
         }
         VcpuControl::RunState(VmRunMode::Running) => {
+            for device in resume_notify_devices {
+                device.lock().resume_imminent();
+            }
             resume_all_vcpus(
                 run_mode,
                 vcpu_boxes,
@@ -1982,13 +1981,10 @@ pub fn get_default_hypervisor() -> Option<HypervisorKind> {
     };
 
     #[cfg(feature = "haxm")]
-    if get_cpu_manufacturer() == CpuManufacturer::Intel {
-        // Make sure Haxm device can be opened before selecting it.
-        match Haxm::new() {
-            Ok(_) => return Some(HypervisorKind::Ghaxm),
-            Err(e) => warn!("Cannot initialize HAXM: {}", e),
-        };
-    }
+    match Haxm::new() {
+        Ok(_) => return Some(HypervisorKind::Ghaxm),
+        Err(e) => warn!("Cannot initialize HAXM: {}", e),
+    };
 
     #[cfg(feature = "gvm")]
     // Make sure Gvm device can be opened before selecting it.
@@ -2634,6 +2630,7 @@ where
 
     let mut vcpu_ids = Vec::new();
 
+    let (vwmdt_host_tube, vmwdt_device_tube) = Tube::pair().context("failed to create tube")?;
     let windows = Arch::build_vm::<V, Vcpu>(
         components,
         &vm_evt_wrtube,
@@ -2652,6 +2649,7 @@ where
         None,
         /* guest_suspended_cvar= */ None,
         dt_overlays,
+        cfg.fdt_position,
     )
     .exit_context(Exit::BuildVm, "the architecture failed to build the vm")?;
 

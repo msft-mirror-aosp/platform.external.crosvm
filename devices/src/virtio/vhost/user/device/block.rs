@@ -18,7 +18,6 @@ use crate::virtio::block::asynchronous::BlockAsync;
 use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
 use crate::virtio::vhost::user::device::handler::VhostUserDevice;
 use crate::virtio::vhost::user::device::VhostUserDeviceBuilder;
-use crate::virtio::Interrupt;
 use crate::virtio::VirtioDevice;
 
 const NUM_QUEUES: u16 = 16;
@@ -61,6 +60,7 @@ impl VhostUserDevice for BlockBackend {
         VhostUserProtocolFeatures::CONFIG
             | VhostUserProtocolFeatures::MQ
             | VhostUserProtocolFeatures::BACKEND_REQ
+            | VhostUserProtocolFeatures::DEVICE_STATE
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -78,35 +78,33 @@ impl VhostUserDevice for BlockBackend {
         idx: usize,
         queue: virtio::Queue,
         mem: GuestMemory,
-        doorbell: Interrupt,
     ) -> anyhow::Result<()> {
-        self.inner.start_queue(idx, queue, mem, doorbell)
+        self.inner.start_queue(idx, queue, mem)
     }
 
     fn stop_queue(&mut self, idx: usize) -> anyhow::Result<virtio::Queue> {
         self.inner.stop_queue(idx)
     }
 
-    fn stop_non_queue_workers(&mut self) -> anyhow::Result<()> {
+    fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
         // TODO: This assumes that `reset` only stops workers which might not be true in the
         // future. Consider moving the `reset` code into a `stop_all_workers` method or, maybe,
         // make `stop_queue` implicitly stop a worker thread when there is no active queue.
-        self.inner.reset()
+        self.inner.reset()?;
+        Ok(())
     }
 
-    fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         // The queue states are being snapshotted in the device handler.
-        let serialized_bytes = serde_json::to_vec(&BlockBackendSnapshot {
+        serde_json::to_value(BlockBackendSnapshot {
             avail_features: self.avail_features,
         })
-        .context("Failed to serialize BlockBackendSnapshot")?;
-
-        Ok(serialized_bytes)
+        .context("Failed to serialize BlockBackendSnapshot")
     }
 
-    fn restore(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
         let block_backend_snapshot: BlockBackendSnapshot =
-            serde_json::from_slice(&data).context("Failed to deserialize BlockBackendSnapshot")?;
+            serde_json::from_value(data).context("Failed to deserialize BlockBackendSnapshot")?;
         anyhow::ensure!(
             self.avail_features == block_backend_snapshot.avail_features,
             "Vhost user block restored avail_features do not match. Live: {:?}, snapshot: {:?}",

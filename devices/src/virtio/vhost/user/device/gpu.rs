@@ -33,7 +33,6 @@ use crate::virtio::vhost::user::device::handler::VhostUserDevice;
 use crate::virtio::vhost::user::device::handler::WorkerState;
 use crate::virtio::DescriptorChain;
 use crate::virtio::Gpu;
-use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 use crate::virtio::SharedMemoryMapper;
 use crate::virtio::SharedMemoryRegion;
@@ -44,7 +43,6 @@ const MAX_QUEUE_NUM: usize = NUM_QUEUES;
 #[derive(Clone)]
 struct SharedReader {
     queue: Arc<Mutex<Queue>>,
-    doorbell: Interrupt,
 }
 
 impl gpu::QueueReader for SharedReader {
@@ -57,7 +55,7 @@ impl gpu::QueueReader for SharedReader {
     }
 
     fn signal_used(&self) {
-        self.queue.lock().trigger_interrupt(&self.doorbell);
+        self.queue.lock().trigger_interrupt();
     }
 }
 
@@ -93,6 +91,15 @@ struct GpuBackend {
     shmem_mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
 }
 
+impl GpuBackend {
+    fn stop_non_queue_workers(&mut self) -> anyhow::Result<()> {
+        for handle in self.platform_workers.borrow_mut().drain(..) {
+            let _ = self.ex.run_until(handle.cancel());
+        }
+        Ok(())
+    }
+}
+
 impl VhostUserDevice for GpuBackend {
     fn max_queue_num(&self) -> usize {
         MAX_QUEUE_NUM
@@ -112,6 +119,7 @@ impl VhostUserDevice for GpuBackend {
             | VhostUserProtocolFeatures::BACKEND_REQ
             | VhostUserProtocolFeatures::MQ
             | VhostUserProtocolFeatures::SHARED_MEMORY_REGIONS
+            | VhostUserProtocolFeatures::DEVICE_STATE
     }
 
     fn read_config(&self, offset: u64, dst: &mut [u8]) {
@@ -122,17 +130,13 @@ impl VhostUserDevice for GpuBackend {
         self.gpu.borrow_mut().write_config(offset, data)
     }
 
-    fn start_queue(
-        &mut self,
-        idx: usize,
-        queue: Queue,
-        mem: GuestMemory,
-        doorbell: Interrupt,
-    ) -> anyhow::Result<()> {
+    fn start_queue(&mut self, idx: usize, queue: Queue, mem: GuestMemory) -> anyhow::Result<()> {
         if self.queue_workers[idx].is_some() {
             warn!("Starting new queue handler without stopping old handler");
             self.stop_queue(idx)?;
         }
+
+        let doorbell = queue.interrupt().clone();
 
         // Create a refcounted queue. The GPU control queue uses a SharedReader which allows us to
         // handle fences in the RutabagaFenceHandler, and also handle queue messages in
@@ -154,7 +158,6 @@ impl VhostUserDevice for GpuBackend {
                     .context("failed to create EventAsync for kick_evt")?;
                 let reader = SharedReader {
                     queue: queue.clone(),
-                    doorbell: doorbell.clone(),
                 };
 
                 let state = if let Some(s) = self.state.as_ref() {
@@ -231,10 +234,8 @@ impl VhostUserDevice for GpuBackend {
         }
     }
 
-    fn stop_non_queue_workers(&mut self) -> anyhow::Result<()> {
-        for handle in self.platform_workers.borrow_mut().drain(..) {
-            let _ = self.ex.run_until(handle.cancel());
-        }
+    fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
+        self.stop_non_queue_workers()?;
         Ok(())
     }
 
@@ -268,16 +269,13 @@ impl VhostUserDevice for GpuBackend {
         }
     }
 
-    fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         // TODO(b/289431114): Snapshot more fields if needed. Right now we just need a bare bones
         // snapshot of the GPU to create a POC.
-        serde_json::to_vec(&serde_json::Value::Null)
-            .context("Failed to serialize Null in the GPU device")
+        Ok(serde_json::Value::Null)
     }
 
-    fn restore(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
-        let data: serde_json::Value = serde_json::from_slice(data.as_slice())
-            .context("Failed to deserialize NULL in the GPU device")?;
+    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
         anyhow::ensure!(
             data.is_null(),
             "unexpected snapshot data: should be null, got {}",

@@ -4,7 +4,6 @@
 
 //! Implements virtio devices, queues, and transport mechanisms.
 
-mod async_device;
 mod async_utils;
 #[cfg(feature = "balloon")]
 mod balloon;
@@ -125,6 +124,7 @@ cfg_if::cfg_if! {
         pub use self::net::VHOST_NET_DEFAULT_PATH;
         pub use self::p9::P9;
         pub use self::pmem::Pmem;
+        pub use self::pmem::PmemConfig;
         #[cfg(feature = "audio")]
         pub use self::snd::new_sound;
         pub use self::wl::Wl;

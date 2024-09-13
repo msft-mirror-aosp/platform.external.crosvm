@@ -35,7 +35,6 @@ use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
 use crate::virtio::vhost::user::device::handler::Error as DeviceError;
 use crate::virtio::vhost::user::device::handler::VhostUserDevice;
 use crate::virtio::vhost::user::VhostUserDeviceBuilder;
-use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 
 thread_local! {
@@ -49,7 +48,6 @@ const MAX_QUEUE_NUM: usize = 3; /* rx, tx, ctrl */
 async fn run_tx_queue<T: TapT>(
     mut queue: Queue,
     mut tap: T,
-    doorbell: Interrupt,
     kick_evt: EventAsync,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Queue {
@@ -69,7 +67,7 @@ async fn run_tx_queue<T: TapT>(
             }
         }
 
-        process_tx(&doorbell, &mut queue, &mut tap);
+        process_tx(&mut queue, &mut tap);
     }
     queue
 }
@@ -77,7 +75,6 @@ async fn run_tx_queue<T: TapT>(
 async fn run_ctrl_queue<T: TapT>(
     mut queue: Queue,
     mut tap: T,
-    doorbell: Interrupt,
     kick_evt: EventAsync,
     acked_features: u64,
     vq_pairs: u16,
@@ -99,7 +96,7 @@ async fn run_ctrl_queue<T: TapT>(
             }
         }
 
-        if let Err(e) = process_ctrl(&doorbell, &mut queue, &mut tap, acked_features, vq_pairs) {
+        if let Err(e) = process_ctrl(&mut queue, &mut tap, acked_features, vq_pairs) {
             error!("Failed to process ctrl queue: {}", e);
             break;
         }
@@ -163,7 +160,7 @@ where
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::CONFIG | VhostUserProtocolFeatures::DEVICE_STATE
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -178,9 +175,8 @@ where
         idx: usize,
         queue: virtio::Queue,
         mem: GuestMemory,
-        doorbell: Interrupt,
     ) -> anyhow::Result<()> {
-        sys::start_queue(self, idx, queue, mem, doorbell)
+        sys::start_queue(self, idx, queue, mem)
     }
 
     fn stop_queue(&mut self, idx: usize) -> anyhow::Result<virtio::Queue> {
@@ -203,16 +199,21 @@ where
         }
     }
 
-    fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
-        serde_json::to_vec(&NetBackendSnapshot {
+    fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
+        // No non-queue workers.
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        serde_json::to_value(NetBackendSnapshot {
             acked_feature: self.acked_features,
         })
         .context("Failed to serialize NetBackendSnapshot")
     }
 
-    fn restore(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
         let net_backend_snapshot: NetBackendSnapshot =
-            serde_json::from_slice(&data).context("Failed to deserialize NetBackendSnapshot")?;
+            serde_json::from_value(data).context("Failed to deserialize NetBackendSnapshot")?;
         self.acked_features = net_backend_snapshot.acked_feature;
         Ok(())
     }

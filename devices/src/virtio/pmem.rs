@@ -264,7 +264,6 @@ fn handle_request(
 async fn handle_queue(
     queue: &mut Queue,
     mut queue_event: EventAsync,
-    interrupt: Interrupt,
     pmem_device_tube: &Tube,
     mapping_arena_slot: u32,
     mapping_size: usize,
@@ -291,7 +290,7 @@ async fn handle_queue(
             }
         };
         queue.add_used(avail_desc, written as u32);
-        queue.trigger_interrupt(&interrupt);
+        queue.trigger_interrupt();
     }
 }
 
@@ -316,7 +315,6 @@ fn run_worker(
     let queue_fut = handle_queue(
         queue,
         queue_evt,
-        interrupt.clone(),
         pmem_device_tube,
         mapping_arena_slot,
         mapping_size,
@@ -368,35 +366,45 @@ struct PmemSnapshot {
     mapping_size: u64,
 }
 
+/// Configuration of a virtio-pmem device.
+pub struct PmemConfig {
+    /// Disk image exposed to the guest.
+    /// If the memory region is not backed by a file, this should be `None`.
+    pub disk_image: Option<File>,
+    /// Guest physical address where the memory will be mapped.
+    pub mapping_address: GuestAddress,
+    /// The index of the guest-mapped memory regions.
+    pub mapping_arena_slot: MemSlot,
+    /// The size of the mapped region.
+    pub mapping_size: u64,
+    /// A communication channel to the main process to send memory requests.
+    pub pmem_device_tube: Tube,
+    /// Interval for periodic swap out of memory mapping
+    pub swap_interval: Option<Duration>,
+    /// Whether the region is writeble or not.
+    pub mapping_writable: bool,
+}
+
 impl Pmem {
-    pub fn new(
-        base_features: u64,
-        disk_image: Option<File>,
-        mapping_address: GuestAddress,
-        mapping_arena_slot: MemSlot,
-        mapping_size: u64,
-        pmem_device_tube: Tube,
-        swap_interval: Option<Duration>,
-        mapping_writable: bool,
-    ) -> SysResult<Pmem> {
-        if mapping_size > usize::MAX as u64 {
+    pub fn new(base_features: u64, cfg: PmemConfig) -> SysResult<Pmem> {
+        if cfg.mapping_size > usize::MAX as u64 {
             return Err(SysError::new(libc::EOVERFLOW));
         }
 
         let mut avail_features = base_features;
-        if mapping_writable {
+        if cfg.mapping_writable {
             avail_features |= 1 << VIRTIO_PMEM_F_DISCARD;
         }
 
         Ok(Pmem {
             worker_thread: None,
             features: avail_features,
-            disk_image,
-            mapping_address,
-            mapping_arena_slot,
-            mapping_size,
-            pmem_device_tube: Some(pmem_device_tube),
-            swap_interval,
+            disk_image: cfg.disk_image,
+            mapping_address: cfg.mapping_address,
+            mapping_arena_slot: cfg.mapping_arena_slot,
+            mapping_size: cfg.mapping_size,
+            pmem_device_tube: Some(cfg.pmem_device_tube),
+            swap_interval: cfg.swap_interval,
         })
     }
 }

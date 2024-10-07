@@ -7,6 +7,7 @@ mod android;
 pub mod cmdline;
 pub mod config;
 mod device_helpers;
+pub(crate) mod ext2;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu;
 #[cfg(feature = "pci-hotplug")]
@@ -89,8 +90,8 @@ use devices::virtio::gpu::EventDevice;
 #[cfg(target_arch = "x86_64")]
 use devices::virtio::memory_mapper::MemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
+use devices::virtio::vhost::user::VhostUserConnectionTrait;
 use devices::virtio::vhost::user::VhostUserListener;
-use devices::virtio::vhost::user::VhostUserListenerTrait;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonFeatures;
 #[cfg(feature = "pci-hotplug")]
@@ -225,7 +226,9 @@ fn create_virtio_devices(
     #[cfg(feature = "balloon")] dynamic_mapping_device_tube: Option<Tube>,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
+    pmem_ext2_mem_clients: &mut Vec<VmMemoryClient>,
     fs_device_tubes: &mut Vec<Tube>,
+    worker_process_pids: &mut BTreeSet<Pid>,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
@@ -405,14 +408,16 @@ fn create_virtio_devices(
 
     for (index, pmem_ext2) in cfg.pmem_ext2.iter().enumerate() {
         let pmem_device_tube = pmem_device_tubes.remove(0);
+        let vm_memory_client = pmem_ext2_mem_clients.remove(0);
         devs.push(create_pmem_ext2_device(
             cfg.protection_type,
             &cfg.jail_config,
-            vm,
             resources,
             pmem_ext2,
             index,
+            vm_memory_client,
             pmem_device_tube,
+            worker_process_pids,
         )?);
     }
 
@@ -794,6 +799,7 @@ fn create_devices(
     #[cfg(feature = "balloon")] dynamic_mapping_device_tube: Option<Tube>,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
+    pmem_ext2_mem_clients: &mut Vec<VmMemoryClient>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "usb")] usb_provider: DeviceProvider,
     #[cfg(feature = "gpu")] gpu_control_tube: Tube,
@@ -802,6 +808,8 @@ fn create_devices(
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
     #[cfg(feature = "pvclock")] pvclock_device_tube: Option<Tube>,
     vfio_container_manager: &mut VfioContainerManager,
+    // Stores a set of PID of child processes that are suppose to exit cleanly.
+    worker_process_pids: &mut BTreeSet<Pid>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -938,7 +946,9 @@ fn create_devices(
         dynamic_mapping_device_tube,
         disk_device_tubes,
         pmem_device_tubes,
+        pmem_ext2_mem_clients,
         fs_device_tubes,
+        worker_process_pids,
         #[cfg(feature = "gpu")]
         gpu_control_tube,
         #[cfg(feature = "gpu")]
@@ -1870,6 +1880,19 @@ where
         pmem_device_tubes.push(pmem_device_tube);
         control_tubes.push(TaggedControlTube::VmMsync(pmem_host_tube));
     }
+    let mut pmem_ext2_mem_client = Vec::new();
+    for _ in 0..cfg.pmem_ext2.len() {
+        let (pmem_ext2_host_tube, pmem_ext2_device_tube) =
+            Tube::pair().context("failed to create tube")?;
+        // Prepare two communication channels for pmem-ext2 device
+        // - pmem_ext2_mem_client: To send a request for mmap() and memory registeration.
+        // - vm_memory_control_tubes: To receive a memory slot number once the memory is registered.
+        pmem_ext2_mem_client.push(VmMemoryClient::new(pmem_ext2_device_tube));
+        vm_memory_control_tubes.push(VmMemoryTube {
+            tube: pmem_ext2_host_tube,
+            expose_with_viommu: false,
+        });
+    }
 
     if let Some(ioapic_host_tube) = ioapic_host_tube {
         irq_control_tubes.push(ioapic_host_tube);
@@ -1978,6 +2001,8 @@ where
     let (reg_evt_wrtube, reg_evt_rdtube) =
         Tube::directional_pair().context("failed to create registered event tube")?;
 
+    let mut worker_process_pids = BTreeSet::new();
+
     let mut devices = create_devices(
         &cfg,
         &mut vm,
@@ -1995,6 +2020,7 @@ where
         dynamic_mapping_device_tube,
         &mut disk_device_tubes,
         &mut pmem_device_tubes,
+        &mut pmem_ext2_mem_client,
         &mut fs_device_tubes,
         #[cfg(feature = "usb")]
         usb_provider,
@@ -2008,6 +2034,7 @@ where
         #[cfg(feature = "pvclock")]
         pvclock_device_tube,
         &mut vfio_container_manager,
+        &mut worker_process_pids,
     )?;
 
     #[cfg(feature = "pci-hotplug")]
@@ -2289,6 +2316,7 @@ where
         pvclock_host_tube,
         metrics_recv,
         vfio_container_manager,
+        worker_process_pids,
     )
 }
 
@@ -2332,9 +2360,9 @@ fn start_pci_root_worker(
                 })
                 .context("failed to send request")?;
             match self.vm_control_tube.recv::<VmMemoryResponse>() {
-                Ok(VmMemoryResponse::RegisterMemory(slot)) => {
+                Ok(VmMemoryResponse::RegisterMemory { region_id, .. }) => {
                     let cur_id = self.next_id;
-                    self.registered_regions.insert(cur_id, slot);
+                    self.registered_regions.insert(cur_id, region_id);
                     self.next_id += 1;
                     Ok(cur_id)
                 }
@@ -2826,6 +2854,7 @@ pub fn trigger_vm_suspend_and_wait_for_entry(
 }
 
 #[cfg(feature = "pvclock")]
+#[derive(Debug)]
 /// The action requested by the pvclock device to perform on the main thread.
 enum PvClockAction {
     #[cfg(target_arch = "aarch64")]
@@ -2954,6 +2983,17 @@ struct ControlLoopState<'a, V: VmArch, Vcpu: VcpuArch> {
     vcpus_pid_tid: &'a BTreeMap<usize, (u32, u32)>,
 }
 
+struct VmRequestResult {
+    response: Option<VmResponse>,
+    exit: bool,
+}
+
+impl VmRequestResult {
+    fn new(response: Option<VmResponse>, exit: bool) -> Self {
+        VmRequestResult { response, exit }
+    }
+}
+
 fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     state: &mut ControlLoopState<V, Vcpu>,
     id: usize,
@@ -2964,16 +3004,16 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         allow(unused_variables, clippy::ptr_arg)
     )]
     add_tubes: &mut Vec<TaggedControlTube>,
-) -> Result<(Option<VmResponse>, bool, Option<VmRunMode>)> {
-    let mut suspend_requested = false;
-    let mut run_mode_opt = None;
-
+) -> Result<VmRequestResult> {
     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
     let mut add_irq_control_tubes = Vec::new();
     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
     let mut add_vm_memory_control_tubes = Vec::new();
 
     let response = match request {
+        VmRequest::Exit => {
+            return Ok(VmRequestResult::new(Some(VmResponse::Ok), true));
+        }
         VmRequest::HotPlugVfioCommand { device, add } => {
             #[cfg(target_arch = "x86_64")]
             {
@@ -3060,16 +3100,16 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         VmRequest::BalloonCommand(cmd) => {
             if let Some(tube) = state.balloon_tube.as_mut() {
                 let Some((r, key)) = tube.send_cmd(cmd, Some(id)) else {
-                    return Ok((None, false, None));
+                    return Ok(VmRequestResult::new(None, false));
                 };
                 if key != id {
                     let Some(TaggedControlTube::Vm(tube)) = state.control_tubes.get(&key) else {
-                        return Ok((None, false, None));
+                        return Ok(VmRequestResult::new(None, false));
                     };
                     if let Err(e) = tube.send(&r) {
                         error!("failed to send VmResponse: {}", e);
                     }
-                    return Ok((None, false, None));
+                    return Ok(VmRequestResult::new(None, false));
                 }
                 r
             } else {
@@ -3080,9 +3120,39 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             pid_tid_map: state.vcpus_pid_tid.clone(),
         },
         _ => {
+            if !state.cfg.force_s2idle {
+                #[cfg(feature = "pvclock")]
+                if let Some(ref pvclock_host_tube) = state.pvclock_host_tube {
+                    // Update clock offset when pvclock is used.
+                    if let VmRequest::ResumeVcpus = request {
+                        let cmd = PvClockCommand::Resume;
+                        match send_pvclock_cmd(pvclock_host_tube, cmd.clone()) {
+                            Ok(action) => {
+                                info!("{:?} command successfully processed", cmd);
+                                if let Some(action) = action {
+                                    match action {
+                                        #[cfg(target_arch = "aarch64")]
+                                        PvClockAction::SetCounterOffset(offset) => {
+                                            state.linux.vm.set_counter_offset(offset)?;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => error!("{:?} command failed: {:#}", cmd, e),
+                        };
+                    }
+                }
+            }
+            let kick_all_vcpus = |msg| {
+                if let VcpuControl::RunState(VmRunMode::Running) = msg {
+                    for dev in &state.linux.resume_notify_devices {
+                        dev.lock().resume_imminent();
+                    }
+                }
+                vcpu::kick_all_vcpus(state.vcpu_handles, state.linux.irq_chip.as_irq_chip(), msg);
+            };
             let response = request.execute(
                 &state.linux.vm,
-                &mut run_mode_opt,
                 state.disk_host_tubes,
                 &mut state.linux.pm,
                 #[cfg(feature = "gpu")]
@@ -3094,13 +3164,7 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 #[cfg(not(feature = "usb"))]
                 None,
                 &mut state.linux.bat_control,
-                |msg| {
-                    vcpu::kick_all_vcpus(
-                        state.vcpu_handles,
-                        state.linux.irq_chip.as_irq_chip(),
-                        msg,
-                    )
-                },
+                kick_all_vcpus,
                 state.cfg.force_s2idle,
                 #[cfg(feature = "swap")]
                 state.swap_controller.as_ref(),
@@ -3112,8 +3176,6 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             );
             if state.cfg.force_s2idle {
                 if let VmRequest::SuspendVcpus = request {
-                    suspend_requested = true;
-
                     // Spawn s2idle wait thread.
                     let send_tube = tube.try_clone_send_tube().unwrap();
                     let suspend_tube = state.linux.suspend_tube.0.clone();
@@ -3133,30 +3195,22 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                             )
                         })
                         .context("failed to spawn s2idle_wait thread")?;
+
+                    // For s2idle, omit the response since it will be sent by
+                    // s2idle_wait thread when suspension actually happens.
+                    return Ok(VmRequestResult::new(None, false));
                 }
             } else {
-                // if not doing s2idle, the guest clock should
-                // behave as the host does, so let the guest
-                // know about the suspend / resume via
-                // virtio-pvclock.
                 #[cfg(feature = "pvclock")]
                 if let Some(ref pvclock_host_tube) = state.pvclock_host_tube {
-                    let cmd = match request {
-                        VmRequest::SuspendVcpus => Some(PvClockCommand::Suspend),
-                        VmRequest::ResumeVcpus => Some(PvClockCommand::Resume),
-                        _ => None,
-                    };
-                    if let Some(cmd) = cmd {
+                    // Record the time after VCPUs are suspended to track suspension duration.
+                    if let VmRequest::SuspendVcpus = request {
+                        let cmd = PvClockCommand::Suspend;
                         match send_pvclock_cmd(pvclock_host_tube, cmd.clone()) {
                             Ok(action) => {
                                 info!("{:?} command successfully processed", cmd);
                                 if let Some(action) = action {
-                                    match action {
-                                        #[cfg(target_arch = "aarch64")]
-                                        PvClockAction::SetCounterOffset(offset) => {
-                                            state.linux.vm.set_counter_offset(offset)?;
-                                        }
-                                    }
+                                    error!("Unexpected action {:?} requested for suspend", action);
                                 }
                             }
                             Err(e) => error!("{:?} command failed: {:#}", cmd, e),
@@ -3187,7 +3241,7 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         }
     }
 
-    Ok((Some(response), suspend_requested, run_mode_opt))
+    Ok(VmRequestResult::new(Some(response), false))
 }
 
 fn process_vm_control_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
@@ -3200,44 +3254,16 @@ fn process_vm_control_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     match socket {
         TaggedControlTube::Vm(tube) => match tube.recv::<VmRequest>() {
             Ok(request) => {
-                let (response, suspend_requested, run_mode_opt) =
-                    process_vm_request(state, id, tube, request, &mut add_tubes)?;
+                let res = process_vm_request(state, id, tube, request, &mut add_tubes)?;
 
-                if let Some(response) = response {
-                    // If suspend requested skip that step since it will be
-                    // performed by s2idle_wait thread when suspension actually
-                    // happens.
-                    if !suspend_requested {
-                        if let Err(e) = tube.send(&response) {
-                            error!("failed to send VmResponse: {}", e);
-                        }
+                if let Some(response) = res.response {
+                    if let Err(e) = tube.send(&response) {
+                        error!("failed to send VmResponse: {}", e);
                     }
                 }
 
-                if let Some(run_mode) = run_mode_opt {
-                    info!("control socket changed run mode to {}", run_mode);
-                    match run_mode {
-                        VmRunMode::Exiting => {
-                            return Ok((true, Vec::new(), Vec::new()));
-                        }
-                        other => {
-                            if other == VmRunMode::Running {
-                                for dev in &state.linux.resume_notify_devices {
-                                    dev.lock().resume_imminent();
-                                }
-                            }
-                            // If suspend requested skip that step since it
-                            // will be performed by s2idle_wait thread when
-                            // needed.
-                            if !suspend_requested {
-                                vcpu::kick_all_vcpus(
-                                    state.vcpu_handles,
-                                    state.linux.irq_chip.as_irq_chip(),
-                                    VcpuControl::RunState(other),
-                                );
-                            }
-                        }
-                    }
+                if res.exit {
+                    return Ok((true, Vec::new(), Vec::new()));
                 }
             }
             Err(e) => {
@@ -3392,6 +3418,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     #[cfg(feature = "pvclock")] pvclock_host_tube: Option<Tube>,
     metrics_tube: RecvTube,
     mut vfio_container_manager: VfioContainerManager,
+    // A set of PID of child processes whose clean exit is expected and can be ignored.
+    mut worker_process_pids: BTreeSet<Pid>,
 ) -> Result<ExitState> {
     #[derive(EventToken)]
     enum Token {
@@ -3922,6 +3950,16 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                             && siginfo.ssi_code == libc::CLD_EXITED
                             && siginfo.ssi_status == 0
                         {
+                            continue;
+                        }
+
+                        // Allow clean exits of a child process in `worker_process_pids`.
+                        if siginfo.ssi_signo == libc::SIGCHLD as u32
+                            && siginfo.ssi_code == libc::CLD_EXITED
+                            && siginfo.ssi_status == 0
+                            && worker_process_pids.remove(&(pid as Pid))
+                        {
+                            info!("child {pid} exited successfully");
                             continue;
                         }
 
@@ -4469,6 +4507,7 @@ fn vm_memory_handler_thread(
                         match tube.recv::<VmMemoryRequest>() {
                             Ok(request) => {
                                 let response = request.execute(
+                                    tube,
                                     &mut vm,
                                     &mut sys_allocator_mutex.lock(),
                                     &mut gralloc,
@@ -4603,8 +4642,9 @@ fn jail_and_start_vu_device<T: VirtioDeviceBuilder>(
     let device = params
         .create_vhost_user_device(&mut keep_rds)
         .context("failed to create vhost-user device")?;
-    let mut listener = VhostUserListener::new(vhost, Some(&mut keep_rds))
-        .context("failed to create the vhost listener")?;
+    let mut listener =
+        VhostUserListener::new(vhost).context("failed to create the vhost listener")?;
+    keep_rds.push(listener.as_raw_descriptor());
     let parent_resources = listener.take_parent_process_resources();
 
     // Executor must be created before jail in order to prevent the jailed process from creating

@@ -363,6 +363,18 @@ fn get_vcpu_mpidr_aff<Vcpu: VcpuAArch64>(vcpus: &[Vcpu], index: usize) -> Option
     Some(vcpus.get(index)?.get_mpidr().ok()? & MPIDR_AFF_MASK)
 }
 
+fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?Sized)) -> u64 {
+    // Static swiotlb is allocated from the end of RAM as a separate memory region, so, if
+    // enabled, make the RAM memory region smaller to leave room for it.
+    let mut main_memory_size = components.memory_size;
+    if let Some(size) = components.swiotlb {
+        if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
+            main_memory_size -= size;
+        }
+    }
+    main_memory_size
+}
+
 impl arch::LinuxArch for AArch64 {
     type Error = Error;
 
@@ -372,14 +384,7 @@ impl arch::LinuxArch for AArch64 {
         components: &VmComponents,
         hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
-        // Static swiotlb is allocated from the end of RAM as a separate memory region, so, if
-        // enabled, make the RAM memory region smaller to leave room for it.
-        let mut main_memory_size = components.memory_size;
-        if let Some(size) = components.swiotlb {
-            if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
-                main_memory_size -= size;
-            }
-        }
+        let main_memory_size = main_memory_size(components, hypervisor);
 
         let mut memory_regions = vec![(
             GuestAddress(AARCH64_PHYS_MEM_START),
@@ -442,6 +447,8 @@ impl arch::LinuxArch for AArch64 {
         let has_bios = matches!(components.vm_image, VmImage::Bios(_));
         let mem = vm.get_memory().clone();
 
+        let main_memory_size = main_memory_size(&components, vm.get_hypervisor());
+
         let fdt_position = fdt_position.unwrap_or(if has_bios {
             FdtPosition::Start
         } else {
@@ -481,7 +488,7 @@ impl arch::LinuxArch for AArch64 {
                         let initrd_addr =
                             (kernel_end + (AARCH64_INITRD_ALIGN - 1)) & !(AARCH64_INITRD_ALIGN - 1);
                         let initrd_max_size =
-                            components.memory_size - (initrd_addr - AARCH64_PHYS_MEM_START);
+                            main_memory_size - (initrd_addr - AARCH64_PHYS_MEM_START);
                         let initrd_addr = GuestAddress(initrd_addr);
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
@@ -497,7 +504,7 @@ impl arch::LinuxArch for AArch64 {
             }
         };
 
-        let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + components.memory_size);
+        let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + main_memory_size);
 
         let fdt_address = match fdt_position {
             FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START),
@@ -570,7 +577,7 @@ impl arch::LinuxArch for AArch64 {
             .map_err(Error::MapPvtimeError)?;
         }
 
-        if components.hv_cfg.protection_type.loads_firmware() {
+        if components.hv_cfg.protection_type.needs_firmware_loaded() {
             arch::load_image(
                 &mem,
                 &mut components
@@ -815,7 +822,9 @@ impl arch::LinuxArch for AArch64 {
             components.cpu_capacity,
             components.cpu_frequencies,
             fdt_address,
-            cmdline.as_str(),
+            cmdline
+                .as_str_with_max_len(AARCH64_CMDLINE_MAX_SIZE - 1)
+                .map_err(Error::Cmdline)?,
             (payload.entry(), payload.size() as usize),
             initrd,
             components.android_fstab,
@@ -1160,7 +1169,7 @@ impl<T: VcpuAArch64> arch::GdbOps<T> for AArch64 {
 impl AArch64 {
     /// This returns a base part of the kernel command for this architecture
     fn get_base_linux_cmdline() -> kernel_cmdline::Cmdline {
-        let mut cmdline = kernel_cmdline::Cmdline::new(AARCH64_CMDLINE_MAX_SIZE);
+        let mut cmdline = kernel_cmdline::Cmdline::new();
         cmdline.insert_str("panic=-1").unwrap();
         cmdline
     }
@@ -1296,7 +1305,7 @@ impl AArch64 {
 
         // Other cpus are powered off initially
         if vcpu_id == boot_cpu {
-            let entry_addr = if protection_type.loads_firmware() {
+            let entry_addr = if protection_type.needs_firmware_loaded() {
                 Some(AARCH64_PROTECTED_VM_FW_START)
             } else if protection_type.runs_firmware() {
                 None // Initial PC value is set by the hypervisor

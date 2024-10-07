@@ -42,6 +42,7 @@ use base::WorkerThread;
 use data_model::*;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
+use hypervisor::MemCacheType;
 pub use parameters::AudioDeviceMode;
 pub use parameters::GpuParameters;
 use rutabaga_gfx::*;
@@ -85,6 +86,7 @@ use super::Interrupt;
 use super::Queue;
 use super::Reader;
 use super::SharedMemoryMapper;
+use super::SharedMemoryPrepareType;
 use super::SharedMemoryRegion;
 use super::VirtioDevice;
 use super::Writer;
@@ -184,14 +186,12 @@ pub trait QueueReader {
 
 struct LocalQueueReader {
     queue: RefCell<Queue>,
-    interrupt: Interrupt,
 }
 
 impl LocalQueueReader {
-    fn new(queue: Queue, interrupt: Interrupt) -> Self {
+    fn new(queue: Queue) -> Self {
         Self {
             queue: RefCell::new(queue),
-            interrupt,
         }
     }
 }
@@ -206,21 +206,19 @@ impl QueueReader for LocalQueueReader {
     }
 
     fn signal_used(&self) {
-        self.queue.borrow_mut().trigger_interrupt(&self.interrupt);
+        self.queue.borrow_mut().trigger_interrupt();
     }
 }
 
 #[derive(Clone)]
 struct SharedQueueReader {
     queue: Arc<Mutex<Queue>>,
-    interrupt: Interrupt,
 }
 
 impl SharedQueueReader {
-    fn new(queue: Queue, interrupt: Interrupt) -> Self {
+    fn new(queue: Queue) -> Self {
         Self {
             queue: Arc::new(Mutex::new(queue)),
-            interrupt,
         }
     }
 }
@@ -235,7 +233,7 @@ impl QueueReader for SharedQueueReader {
     }
 
     fn signal_used(&self) {
-        self.queue.lock().trigger_interrupt(&self.interrupt);
+        self.queue.lock().trigger_interrupt();
     }
 }
 
@@ -449,6 +447,7 @@ impl Frontend {
                     info.r.y.to_native(),
                     info.r.width.to_native(),
                     info.r.height.to_native(),
+                    info.offset.to_native(),
                 );
                 self.virtio_gpu.transfer_write(0, resource_id, transfer)
             }
@@ -1755,8 +1754,8 @@ impl VirtioDevice for Gpu {
             ));
         }
 
-        let ctrl_queue = SharedQueueReader::new(queues.remove(&0).unwrap(), interrupt.clone());
-        let cursor_queue = LocalQueueReader::new(queues.remove(&1).unwrap(), interrupt.clone());
+        let ctrl_queue = SharedQueueReader::new(queues.remove(&0).unwrap());
+        let cursor_queue = LocalQueueReader::new(queues.remove(&1).unwrap());
 
         match self
             .worker_thread
@@ -1796,6 +1795,19 @@ impl VirtioDevice for Gpu {
     fn expose_shmem_descriptors_with_viommu(&self) -> bool {
         // TODO(b/323368701): integrate with fixed_blob_mapping so this can always return true.
         !self.fixed_blob_mapping
+    }
+
+    fn get_shared_memory_prepare_type(&mut self) -> SharedMemoryPrepareType {
+        if self.fixed_blob_mapping {
+            let cache_type = if cfg!(feature = "noncoherent-dma") {
+                MemCacheType::CacheNonCoherent
+            } else {
+                MemCacheType::CacheCoherent
+            };
+            SharedMemoryPrepareType::SingleMappingOnFirst(cache_type)
+        } else {
+            SharedMemoryPrepareType::DynamicPerMapping
+        }
     }
 
     // Notes on sleep/wake/snapshot/restore functionality.

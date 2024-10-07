@@ -8,6 +8,9 @@
 
 mod fdt;
 
+#[cfg(feature = "gdb")]
+mod gdb;
+
 const SETUP_DTB: u32 = 2;
 const SETUP_RNG_SEED: u32 = 9;
 
@@ -38,10 +41,10 @@ pub mod smbios;
 
 use std::arch::x86_64::CpuidResult;
 use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::ffi::CString;
+use std::fmt;
 use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -60,8 +63,8 @@ use arch::GetSerialCmdlineError;
 use arch::RunnableLinuxVm;
 use arch::VmComponents;
 use arch::VmImage;
-#[cfg(feature = "seccomp_trace")]
 use base::debug;
+use base::info;
 use base::warn;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use base::AsRawDescriptors;
@@ -103,18 +106,6 @@ use devices::VirtualPmc;
 use devices::FW_CFG_BASE_PORT;
 use devices::FW_CFG_MAX_FILE_SLOTS;
 use devices::FW_CFG_WIDTH;
-#[cfg(feature = "gdb")]
-use gdbstub_arch::x86::reg::id::X86_64CoreRegId;
-#[cfg(feature = "gdb")]
-use gdbstub_arch::x86::reg::X86SegmentRegs;
-#[cfg(feature = "gdb")]
-use gdbstub_arch::x86::reg::X86_64CoreRegs;
-#[cfg(feature = "gdb")]
-use gdbstub_arch::x86::reg::X87FpuInternalRegs;
-#[cfg(feature = "gdb")]
-use hypervisor::x86_64::Regs;
-#[cfg(feature = "gdb")]
-use hypervisor::x86_64::Sregs;
 use hypervisor::CpuConfigX86_64;
 use hypervisor::Hypervisor;
 use hypervisor::HypervisorX86_64;
@@ -146,11 +137,13 @@ use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
 use vm_memory::MemoryRegionOptions;
+use vm_memory::MemoryRegionPurpose;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 use zerocopy::FromZeroes;
 
 use crate::bootparam::boot_params;
+use crate::bootparam::setup_header;
 use crate::bootparam::XLF_CAN_BE_LOADED_ABOVE_4G;
 use crate::cpuid::EDX_HYBRID_CPU_SHIFT;
 
@@ -174,6 +167,10 @@ pub enum Error {
     CloneTube(TubeError),
     #[error("the given kernel command line was invalid: {0}")]
     Cmdline(kernel_cmdline::Error),
+    #[error("failed writing command line to guest memory")]
+    CommandLineCopy,
+    #[error("command line overflowed guest memory")]
+    CommandLineOverflow,
     #[error("failed to configure hotplugged pci device: {0}")]
     ConfigurePciDevice(arch::DeviceRegistrationError),
     #[error("failed to configure segment registers: {0}")]
@@ -231,8 +228,8 @@ pub enum Error {
     LoadBios(io::Error),
     #[error("error loading kernel bzImage: {0}")]
     LoadBzImage(bzimage::Error),
-    #[error("error loading command line: {0}")]
-    LoadCmdline(kernel_loader::Error),
+    #[error("error loading custom pVM firmware: {0}")]
+    LoadCustomPvmFw(arch::LoadImageError),
     #[error("error loading initrd: {0}")]
     LoadInitrd(arch::LoadImageError),
     #[error("error loading Kernel: {0}")]
@@ -241,6 +238,10 @@ pub enum Error {
     LoadPflash(io::Error),
     #[error("error translating address: Page not present")]
     PageNotPresent,
+    #[error("pci mmio overlaps with pVM firmware memory")]
+    PciMmioOverlapPvmFw,
+    #[error("pVM firmware not supported when bios is used on x86_64")]
+    PvmFwBiosUnsupported,
     #[error("error reading guest memory {0}")]
     ReadingGuestMemory(vm_memory::GuestMemoryError),
     #[error("single register read not supported on x86_64")]
@@ -330,9 +331,17 @@ pub struct SetupData {
     pub type_: SetupDataType,
 }
 
+#[derive(Copy, Clone, Debug)]
 enum E820Type {
     Ram = 0x01,
     Reserved = 0x2,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct E820Entry {
+    pub address: GuestAddress,
+    pub len: u64,
+    pub mem_type: E820Type,
 }
 
 const MB: u64 = 1 << 20;
@@ -342,6 +351,16 @@ pub const BOOT_STACK_POINTER: u64 = 0x8000;
 const START_OF_RAM_32BITS: u64 = 0;
 const FIRST_ADDR_PAST_20BITS: u64 = 1 << 20;
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
+// Make sure it align to 256MB for MTRR convenient
+const MEM_32BIT_GAP_SIZE: u64 = 768 * MB;
+const END_ADDR_BEFORE_32BITS: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
+// Reserved memory for nand_bios/LAPIC/IOAPIC/HPET/.....
+const RESERVED_MEM_SIZE: u64 = 0x800_0000;
+const PCI_MMIO_END: u64 = FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - 1;
+// Reserve 64MB for pcie enhanced configuration
+const DEFAULT_PCIE_CFG_MMIO_SIZE: u64 = 0x400_0000;
+const DEFAULT_PCIE_CFG_MMIO_END: u64 = FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - 1;
+const DEFAULT_PCIE_CFG_MMIO_START: u64 = DEFAULT_PCIE_CFG_MMIO_END - DEFAULT_PCIE_CFG_MMIO_SIZE + 1;
 // Linux (with 4-level paging) has a physical memory limit of 46 bits (64 TiB).
 const HIGH_MMIO_MAX_END: u64 = (1u64 << 46) - 1;
 pub const KERNEL_32BIT_ENTRY_OFFSET: u64 = 0x0;
@@ -368,6 +387,12 @@ pub const X86_64_SCI_IRQ: u32 = 5;
 pub const X86_64_IRQ_BASE: u32 = 9;
 const ACPI_HI_RSDP_WINDOW_BASE: u64 = 0x000E_0000;
 
+// pVM firmware memory. Should be within the low 4GB, so that it is identity-mapped
+// by setup_page_tables() when a protected VM boots in long mode, since the pVM firmware is
+// the VM entry point.
+const PROTECTED_VM_FW_MAX_SIZE: u64 = 0x40_0000;
+const PROTECTED_VM_FW_START: u64 = END_ADDR_BEFORE_32BITS - PROTECTED_VM_FW_MAX_SIZE;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CpuManufacturer {
     Intel,
@@ -385,22 +410,18 @@ struct LowMemoryLayout {
     pci_mmio: AddressRange,
     // the pcie cfg mmio range
     pcie_cfg_mmio: AddressRange,
+    // the pVM firmware memory (if running a protected VM)
+    pvmfw_mem: Option<AddressRange>,
 }
 
 static LOW_MEMORY_LAYOUT: OnceCell<LowMemoryLayout> = OnceCell::new();
 
-pub fn init_low_memory_layout(pcie_ecam: Option<AddressRange>, pci_low_start: Option<u64>) {
+pub fn init_low_memory_layout(
+    pcie_ecam: Option<AddressRange>,
+    pci_low_start: Option<u64>,
+    has_protected_vm_firmware: bool,
+) -> Result<()> {
     LOW_MEMORY_LAYOUT.get_or_init(|| {
-        // Make sure it align to 256MB for MTRR convenient
-        const MEM_32BIT_GAP_SIZE: u64 = 768 * MB;
-        // Reserved memory for nand_bios/LAPIC/IOAPIC/HPET/.....
-        const RESERVED_MEM_SIZE: u64 = 0x800_0000;
-        const PCI_MMIO_END: u64 = FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - 1;
-        // Reserve 64MB for pcie enhanced configuration
-        const DEFAULT_PCIE_CFG_MMIO_SIZE: u64 = 0x400_0000;
-        const DEFAULT_PCIE_CFG_MMIO_END: u64 = FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - 1;
-        const DEFAULT_PCIE_CFG_MMIO_START: u64 =
-            DEFAULT_PCIE_CFG_MMIO_END - DEFAULT_PCIE_CFG_MMIO_SIZE + 1;
         const DEFAULT_PCIE_CFG_MMIO: AddressRange = AddressRange {
             start: DEFAULT_PCIE_CFG_MMIO_START,
             end: DEFAULT_PCIE_CFG_MMIO_END,
@@ -422,11 +443,32 @@ pub fn init_low_memory_layout(pcie_ecam: Option<AddressRange>, pci_low_start: Op
             }
         };
 
+        let pvmfw_mem = if has_protected_vm_firmware {
+            Some(AddressRange {
+                start: PROTECTED_VM_FW_START,
+                end: PROTECTED_VM_FW_START + PROTECTED_VM_FW_MAX_SIZE - 1,
+            })
+        } else {
+            None
+        };
+
         LowMemoryLayout {
             pci_mmio,
             pcie_cfg_mmio,
+            pvmfw_mem,
         }
     });
+
+    if has_protected_vm_firmware {
+        let pci_mmio = read_pci_mmio_before_32bit();
+        let pvmfw_mem = read_pvmfw_mem().unwrap();
+
+        if !pci_mmio.intersect(pvmfw_mem).is_empty() {
+            return Err(Error::PciMmioOverlapPvmFw);
+        }
+    }
+
+    Ok(())
 }
 
 pub fn read_pci_mmio_before_32bit() -> AddressRange {
@@ -434,6 +476,18 @@ pub fn read_pci_mmio_before_32bit() -> AddressRange {
 }
 pub fn read_pcie_cfg_mmio() -> AddressRange {
     LOW_MEMORY_LAYOUT.get().unwrap().pcie_cfg_mmio
+}
+fn read_pvmfw_mem() -> Option<AddressRange> {
+    LOW_MEMORY_LAYOUT.get().unwrap().pvmfw_mem
+}
+
+fn max_ram_end_before_32bit(has_protected_vm_firmware: bool) -> u64 {
+    let pci_start = read_pci_mmio_before_32bit().start;
+    if has_protected_vm_firmware {
+        pci_start.min(PROTECTED_VM_FW_START)
+    } else {
+        pci_start
+    }
 }
 
 /// The x86 reset vector for i386+ and x86_64 puts the processor into an "unreal mode" where it
@@ -461,10 +515,10 @@ fn tss_addr_end() -> GuestAddress {
 fn configure_system(
     guest_mem: &GuestMemory,
     cmdline_addr: GuestAddress,
-    cmdline_size: usize,
     setup_data: Option<GuestAddress>,
     initrd: Option<(GuestAddress, usize)>,
     mut params: boot_params,
+    e820_entries: &[E820Entry],
 ) -> Result<()> {
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
     const KERNEL_HDR_MAGIC: u32 = 0x5372_6448;
@@ -476,7 +530,6 @@ fn configure_system(
     params.hdr.header = KERNEL_HDR_MAGIC;
     params.hdr.cmd_line_ptr = cmdline_addr.offset() as u32;
     params.ext_cmd_line_ptr = (cmdline_addr.offset() >> 32) as u32;
-    params.hdr.cmdline_size = cmdline_size as u32;
     params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
     if let Some(setup_data) = setup_data {
         params.hdr.setup_data = setup_data.offset();
@@ -488,49 +541,16 @@ fn configure_system(
         params.ext_ramdisk_size = (initrd_size as u64 >> 32) as u32;
     }
 
-    // Some guest kernels expect a typical PC memory layout where the region between 640 KB and 1 MB
-    // is reserved for device memory/ROMs and get confused if there is a RAM region spanning this
-    // area, so we provide the traditional 640 KB low memory and 1 MB+ high memory regions.
-    let ram_below_1m_end = 640 * 1024;
-    let ram_below_1m = AddressRange {
-        start: START_OF_RAM_32BITS,
-        end: ram_below_1m_end - 1,
-    };
-    // GuestMemory::end_addr() returns the first address past the end, so subtract 1 to get the
-    // inclusive end.
-    let guest_mem_end = guest_mem.end_addr().offset() - 1;
-    let ram_below_4g = AddressRange {
-        start: FIRST_ADDR_PAST_20BITS,
-        end: guest_mem_end.min(read_pci_mmio_before_32bit().start - 1),
-    };
-    let ram_above_4g = AddressRange {
-        start: FIRST_ADDR_PAST_32BITS,
-        end: guest_mem_end,
-    };
-    add_e820_entry(&mut params, ram_below_1m, E820Type::Ram)?;
-    add_e820_entry(&mut params, ram_below_4g, E820Type::Ram)?;
-    if !ram_above_4g.is_empty() {
-        add_e820_entry(&mut params, ram_above_4g, E820Type::Ram)?
+    if e820_entries.len() >= params.e820_table.len() {
+        return Err(Error::E820Configuration);
     }
 
-    let pcie_cfg_mmio_range = read_pcie_cfg_mmio();
-    add_e820_entry(&mut params, pcie_cfg_mmio_range, E820Type::Reserved)?;
-
-    add_e820_entry(
-        &mut params,
-        X8664arch::get_pcie_vcfg_mmio_range(guest_mem, &pcie_cfg_mmio_range),
-        E820Type::Reserved,
-    )?;
-
-    // Reserve memory section for Identity map and TSS
-    add_e820_entry(
-        &mut params,
-        AddressRange {
-            start: identity_map_addr_start().offset(),
-            end: tss_addr_end().offset() - 1,
-        },
-        E820Type::Reserved,
-    )?;
+    for (src, dst) in e820_entries.iter().zip(params.e820_table.iter_mut()) {
+        dst.addr = src.address.offset();
+        dst.size = src.len;
+        dst.type_ = src.mem_type as u32;
+    }
+    params.e820_entries = e820_entries.len() as u8;
 
     let zero_page_addr = GuestAddress(ZERO_PAGE_OFFSET);
     if !guest_mem.is_valid_range(zero_page_addr, mem::size_of::<boot_params>() as u64) {
@@ -622,20 +642,64 @@ fn setup_data_rng_seed() -> SetupData {
 }
 
 /// Add an e820 region to the e820 map.
-/// Returns Ok(()) if successful, or an error if there is no space left in the map.
-fn add_e820_entry(params: &mut boot_params, range: AddressRange, mem_type: E820Type) -> Result<()> {
-    if params.e820_entries >= params.e820_table.len() as u8 {
-        return Err(Error::E820Configuration);
-    }
-
-    let size = range.len().ok_or(Error::E820Configuration)?;
-
-    params.e820_table[params.e820_entries as usize].addr = range.start;
-    params.e820_table[params.e820_entries as usize].size = size;
-    params.e820_table[params.e820_entries as usize].type_ = mem_type as u32;
-    params.e820_entries += 1;
+fn add_e820_entry(
+    e820_entries: &mut Vec<E820Entry>,
+    range: AddressRange,
+    mem_type: E820Type,
+) -> Result<()> {
+    e820_entries.push(E820Entry {
+        address: GuestAddress(range.start),
+        len: range.len().ok_or(Error::E820Configuration)?,
+        mem_type,
+    });
 
     Ok(())
+}
+
+/// Generate a memory map in INT 0x15 AX=0xE820 format.
+fn generate_e820_memory_map(
+    guest_mem: &GuestMemory,
+    ram_below_1m: AddressRange,
+    ram_below_4g: AddressRange,
+    ram_above_4g: AddressRange,
+    has_protected_vm_firmware: bool,
+) -> Result<Vec<E820Entry>> {
+    let mut e820_entries = Vec::new();
+
+    add_e820_entry(&mut e820_entries, ram_below_1m, E820Type::Ram)?;
+    add_e820_entry(&mut e820_entries, ram_below_4g, E820Type::Ram)?;
+    if !ram_above_4g.is_empty() {
+        add_e820_entry(&mut e820_entries, ram_above_4g, E820Type::Ram)?
+    }
+
+    if has_protected_vm_firmware {
+        // After the pVM firmware jumped to the guest, the pVM firmware itself
+        // is no longer running, so its memory is reusable by the guest OS.
+        // So add this memory as RAM rather than Reserved.
+        let pvmfw_range = read_pvmfw_mem().unwrap();
+        add_e820_entry(&mut e820_entries, pvmfw_range, E820Type::Ram)?;
+    }
+
+    let pcie_cfg_mmio_range = read_pcie_cfg_mmio();
+    add_e820_entry(&mut e820_entries, pcie_cfg_mmio_range, E820Type::Reserved)?;
+
+    add_e820_entry(
+        &mut e820_entries,
+        X8664arch::get_pcie_vcfg_mmio_range(guest_mem, &pcie_cfg_mmio_range),
+        E820Type::Reserved,
+    )?;
+
+    // Reserve memory section for Identity map and TSS
+    add_e820_entry(
+        &mut e820_entries,
+        AddressRange {
+            start: identity_map_addr_start().offset(),
+            end: tss_addr_end().offset() - 1,
+        },
+        E820Type::Reserved,
+    )?;
+
+    Ok(e820_entries)
 }
 
 /// Returns a Vec of the valid memory addresses.
@@ -645,23 +709,41 @@ fn add_e820_entry(params: &mut boot_params, range: AddressRange, mem_type: E820T
 pub fn arch_memory_regions(
     size: u64,
     bios_size: Option<u64>,
+    has_protected_vm_firmware: bool,
 ) -> Vec<(GuestAddress, u64, MemoryRegionOptions)> {
+    let mut mem_size = size;
+    let mut regions = Vec::new();
+
+    if has_protected_vm_firmware {
+        regions.push((
+            GuestAddress(PROTECTED_VM_FW_START),
+            PROTECTED_VM_FW_MAX_SIZE,
+            MemoryRegionOptions::new().purpose(MemoryRegionPurpose::ProtectedFirmwareRegion),
+        ));
+
+        // pVM firmware memory is a part of normal guest memory, since it is reusable
+        // by the guest OS once the pVM firmware jumped to the guest. So count its size
+        // as a part of the total guest memory size.
+        if mem_size > PROTECTED_VM_FW_MAX_SIZE {
+            mem_size -= PROTECTED_VM_FW_MAX_SIZE;
+        }
+    }
+
     let mem_start = START_OF_RAM_32BITS;
-    let mem_end = GuestAddress(size + mem_start);
+    let mem_end = GuestAddress(mem_size + mem_start);
 
     let first_addr_past_32bits = GuestAddress(FIRST_ADDR_PAST_32BITS);
-    let end_32bit_gap_start = GuestAddress(read_pci_mmio_before_32bit().start);
+    let max_end_32bits = GuestAddress(max_ram_end_before_32bit(has_protected_vm_firmware));
 
-    let mut regions = Vec::new();
-    if mem_end <= end_32bit_gap_start {
-        regions.push((GuestAddress(mem_start), size, Default::default()));
+    if mem_end <= max_end_32bits {
+        regions.push((GuestAddress(mem_start), mem_size, Default::default()));
         if let Some(bios_size) = bios_size {
             regions.push((bios_start(bios_size), bios_size, Default::default()));
         }
     } else {
         regions.push((
             GuestAddress(mem_start),
-            end_32bit_gap_start.offset() - mem_start,
+            max_end_32bits.offset() - mem_start,
             Default::default(),
         ));
         if let Some(bios_size) = bios_size {
@@ -669,7 +751,7 @@ pub fn arch_memory_regions(
         }
         regions.push((
             first_addr_past_32bits,
-            mem_end.offset_from(end_32bit_gap_start),
+            mem_end.offset_from(max_end_32bits),
             Default::default(),
         ));
     }
@@ -684,14 +766,24 @@ impl arch::LinuxArch for X8664arch {
         components: &VmComponents,
         _hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
-        init_low_memory_layout(components.pcie_ecam, components.pci_low_start);
+        let has_protected_vm_firmware = components.hv_cfg.protection_type.runs_firmware();
+
+        init_low_memory_layout(
+            components.pcie_ecam,
+            components.pci_low_start,
+            has_protected_vm_firmware,
+        )?;
 
         let bios_size = match &components.vm_image {
             VmImage::Bios(bios_file) => Some(bios_file.metadata().map_err(Error::LoadBios)?.len()),
             VmImage::Kernel(_) => None,
         };
 
-        Ok(arch_memory_regions(components.memory_size, bios_size))
+        Ok(arch_memory_regions(
+            components.memory_size,
+            bios_size,
+            has_protected_vm_firmware,
+        ))
     }
 
     fn get_system_allocator_config<V: Vm>(vm: &V) -> SystemAllocatorConfig {
@@ -732,7 +824,7 @@ impl arch::LinuxArch for X8664arch {
         V: VmX86_64,
         Vcpu: VcpuX86_64,
     {
-        if components.hv_cfg.protection_type != ProtectionType::Unprotected {
+        if components.hv_cfg.protection_type.isolates_memory() {
             return Err(Error::UnsupportedProtectionType);
         }
 
@@ -872,8 +964,14 @@ impl arch::LinuxArch for X8664arch {
             let (host_tube, device_tube) = Tube::pair()
                 .context("create tube")
                 .map_err(Error::SetupCmos)?;
-            Self::setup_legacy_cmos_device(&io_bus, irq_chip, device_tube, components.memory_size)
-                .map_err(Error::SetupCmos)?;
+            Self::setup_legacy_cmos_device(
+                &io_bus,
+                irq_chip,
+                device_tube,
+                components.memory_size,
+                components.hv_cfg.protection_type.runs_firmware(),
+            )
+            .map_err(Error::SetupCmos)?;
             Some(host_tube)
         } else {
             None
@@ -1010,39 +1108,79 @@ impl arch::LinuxArch for X8664arch {
         let mut vcpu_init = vec![VcpuInitX86_64::default(); vcpu_count];
         let mut msrs = BTreeMap::new();
 
+        let protection_type = components.hv_cfg.protection_type;
+
         match components.vm_image {
             VmImage::Bios(ref mut bios) => {
+                if protection_type.runs_firmware() {
+                    return Err(Error::PvmFwBiosUnsupported);
+                }
+
                 // Allow a bios to hardcode CMDLINE_OFFSET and read the kernel command line from it.
-                kernel_loader::load_cmdline(
+                Self::load_cmdline(
                     &mem,
                     GuestAddress(CMDLINE_OFFSET),
-                    &CString::new(cmdline).unwrap(),
-                )
-                .map_err(Error::LoadCmdline)?;
+                    cmdline,
+                    CMDLINE_MAX_SIZE as usize - 1,
+                )?;
                 Self::load_bios(&mem, bios)?;
                 regs::set_default_msrs(&mut msrs);
                 // The default values for `Regs` and `Sregs` already set up the reset vector.
             }
             VmImage::Kernel(ref mut kernel_image) => {
-                let (params, kernel_end, kernel_entry, cpu_mode) =
+                let (params, kernel_end, kernel_entry, cpu_mode, kernel_type) =
                     Self::load_kernel(&mem, kernel_image)?;
+
+                info!("Loaded {} kernel", kernel_type);
 
                 Self::setup_system_memory(
                     &mem,
-                    &CString::new(cmdline).unwrap(),
+                    cmdline,
                     components.initrd_image,
                     components.android_fstab,
                     kernel_end,
                     params,
                     dump_device_tree_blob,
                     device_tree_overlays,
+                    protection_type.runs_firmware(),
                 )?;
 
-                // Configure the bootstrap VCPU for the Linux/x86 64-bit boot protocol.
-                // <https://www.kernel.org/doc/html/latest/x86/boot.html>
-                vcpu_init[0].regs.rip = kernel_entry.offset();
-                vcpu_init[0].regs.rsp = BOOT_STACK_POINTER;
-                vcpu_init[0].regs.rsi = ZERO_PAGE_OFFSET;
+                if protection_type.needs_firmware_loaded() {
+                    arch::load_image(
+                        &mem,
+                        &mut components
+                            .pvm_fw
+                            .expect("pvmfw must be available if ProtectionType loads it"),
+                        GuestAddress(PROTECTED_VM_FW_START),
+                        PROTECTED_VM_FW_MAX_SIZE,
+                    )
+                    .map_err(Error::LoadCustomPvmFw)?;
+                }
+
+                let entry_addr = if protection_type.runs_firmware() {
+                    PROTECTED_VM_FW_START
+                } else {
+                    kernel_entry.offset()
+                };
+
+                vcpu_init[0].regs.rip = entry_addr;
+
+                match kernel_type {
+                    KernelType::BzImage | KernelType::Elf => {
+                        // Configure the bootstrap VCPU for the Linux/x86 boot protocol.
+                        // <https://www.kernel.org/doc/html/latest/x86/boot.html>
+                        vcpu_init[0].regs.rsp = BOOT_STACK_POINTER;
+                        vcpu_init[0].regs.rsi = ZERO_PAGE_OFFSET;
+                    }
+                }
+
+                if protection_type.runs_firmware() {
+                    // Pass pVM payload entry address to pVM firmware.
+                    // NOTE: this ABI is subject to change. Possibly we will pass
+                    // all the needed info (payload entry, start and size) in in-memory
+                    // structures (e.g. DTB) instead.
+                    vcpu_init[0].regs.rdi = kernel_entry.offset();
+                }
 
                 match cpu_mode {
                     CpuMode::LongMode => {
@@ -1196,290 +1334,6 @@ impl arch::LinuxArch for X8664arch {
     }
 }
 
-#[cfg(feature = "gdb")]
-impl<T: VcpuX86_64> arch::GdbOps<T> for X8664arch {
-    type Error = Error;
-
-    fn read_registers(vcpu: &T) -> Result<X86_64CoreRegs> {
-        // General registers: RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, r8-r15
-        let gregs = vcpu.get_regs().map_err(Error::ReadRegs)?;
-        let regs = [
-            gregs.rax, gregs.rbx, gregs.rcx, gregs.rdx, gregs.rsi, gregs.rdi, gregs.rbp, gregs.rsp,
-            gregs.r8, gregs.r9, gregs.r10, gregs.r11, gregs.r12, gregs.r13, gregs.r14, gregs.r15,
-        ];
-
-        // GDB exposes 32-bit eflags instead of 64-bit rflags.
-        // https://github.com/bminor/binutils-gdb/blob/master/gdb/features/i386/64bit-core.xml
-        let eflags = gregs.rflags as u32;
-        let rip = gregs.rip;
-
-        // Segment registers: CS, SS, DS, ES, FS, GS
-        let sregs = vcpu.get_sregs().map_err(Error::ReadRegs)?;
-        let segments = X86SegmentRegs {
-            cs: sregs.cs.selector as u32,
-            ss: sregs.ss.selector as u32,
-            ds: sregs.ds.selector as u32,
-            es: sregs.es.selector as u32,
-            fs: sregs.fs.selector as u32,
-            gs: sregs.gs.selector as u32,
-        };
-
-        // x87 FPU internal state
-        // TODO(dverkamp): floating point tag word, instruction pointer, and data pointer
-        let fpu = vcpu.get_fpu().map_err(Error::ReadRegs)?;
-        let fpu_internal = X87FpuInternalRegs {
-            fctrl: u32::from(fpu.fcw),
-            fstat: u32::from(fpu.fsw),
-            fop: u32::from(fpu.last_opcode),
-            ..Default::default()
-        };
-
-        let mut regs = X86_64CoreRegs {
-            regs,
-            eflags,
-            rip,
-            segments,
-            st: Default::default(),
-            fpu: fpu_internal,
-            xmm: Default::default(),
-            mxcsr: fpu.mxcsr,
-        };
-
-        // x87 FPU registers: ST0-ST7
-        for (dst, src) in regs.st.iter_mut().zip(fpu.fpr.iter()) {
-            // `fpr` contains the x87 floating point registers in FXSAVE format.
-            // Each element contains an 80-bit floating point value.
-            *dst = (*src).into();
-        }
-
-        // SSE registers: XMM0-XMM15
-        for (dst, src) in regs.xmm.iter_mut().zip(fpu.xmm.iter()) {
-            *dst = u128::from_le_bytes(*src);
-        }
-
-        Ok(regs)
-    }
-
-    fn write_registers(vcpu: &T, regs: &X86_64CoreRegs) -> Result<()> {
-        // General purpose registers (RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, r8-r15) + RIP + rflags
-        let orig_gregs = vcpu.get_regs().map_err(Error::ReadRegs)?;
-        let gregs = Regs {
-            rax: regs.regs[0],
-            rbx: regs.regs[1],
-            rcx: regs.regs[2],
-            rdx: regs.regs[3],
-            rsi: regs.regs[4],
-            rdi: regs.regs[5],
-            rbp: regs.regs[6],
-            rsp: regs.regs[7],
-            r8: regs.regs[8],
-            r9: regs.regs[9],
-            r10: regs.regs[10],
-            r11: regs.regs[11],
-            r12: regs.regs[12],
-            r13: regs.regs[13],
-            r14: regs.regs[14],
-            r15: regs.regs[15],
-            rip: regs.rip,
-            // Update the lower 32 bits of rflags.
-            rflags: (orig_gregs.rflags & !(u32::MAX as u64)) | (regs.eflags as u64),
-        };
-        vcpu.set_regs(&gregs).map_err(Error::WriteRegs)?;
-
-        // Segment registers: CS, SS, DS, ES, FS, GS
-        // Since GDB care only selectors, we call get_sregs() first.
-        let mut sregs = vcpu.get_sregs().map_err(Error::ReadRegs)?;
-        sregs.cs.selector = regs.segments.cs as u16;
-        sregs.ss.selector = regs.segments.ss as u16;
-        sregs.ds.selector = regs.segments.ds as u16;
-        sregs.es.selector = regs.segments.es as u16;
-        sregs.fs.selector = regs.segments.fs as u16;
-        sregs.gs.selector = regs.segments.gs as u16;
-
-        vcpu.set_sregs(&sregs).map_err(Error::WriteRegs)?;
-
-        // FPU and SSE registers
-        let mut fpu = vcpu.get_fpu().map_err(Error::ReadRegs)?;
-        fpu.fcw = regs.fpu.fctrl as u16;
-        fpu.fsw = regs.fpu.fstat as u16;
-        fpu.last_opcode = regs.fpu.fop as u16;
-        // TODO(dverkamp): floating point tag word, instruction pointer, and data pointer
-
-        // x87 FPU registers: ST0-ST7
-        for (dst, src) in fpu.fpr.iter_mut().zip(regs.st.iter()) {
-            *dst = (*src).into();
-        }
-
-        // SSE registers: XMM0-XMM15
-        for (dst, src) in fpu.xmm.iter_mut().zip(regs.xmm.iter()) {
-            dst.copy_from_slice(&src.to_le_bytes());
-        }
-
-        vcpu.set_fpu(&fpu).map_err(Error::WriteRegs)?;
-
-        Ok(())
-    }
-
-    #[inline]
-    fn read_register(_vcpu: &T, _reg: X86_64CoreRegId) -> Result<Vec<u8>> {
-        Err(Error::ReadRegIsUnsupported)
-    }
-
-    #[inline]
-    fn write_register(_vcpu: &T, _reg: X86_64CoreRegId, _buf: &[u8]) -> Result<()> {
-        Err(Error::WriteRegIsUnsupported)
-    }
-
-    fn read_memory(
-        vcpu: &T,
-        guest_mem: &GuestMemory,
-        vaddr: GuestAddress,
-        len: usize,
-    ) -> Result<Vec<u8>> {
-        let sregs = vcpu.get_sregs().map_err(Error::ReadRegs)?;
-        let mut buf = vec![0; len];
-        let mut total_read = 0u64;
-        // Handle reads across page boundaries.
-
-        while total_read < len as u64 {
-            let (paddr, psize) = phys_addr(guest_mem, vaddr.0 + total_read, &sregs)?;
-            let read_len = std::cmp::min(len as u64 - total_read, psize - (paddr & (psize - 1)));
-            guest_mem
-                .get_slice_at_addr(GuestAddress(paddr), read_len as usize)
-                .map_err(Error::ReadingGuestMemory)?
-                .copy_to(&mut buf[total_read as usize..]);
-            total_read += read_len;
-        }
-        Ok(buf)
-    }
-
-    fn write_memory(
-        vcpu: &T,
-        guest_mem: &GuestMemory,
-        vaddr: GuestAddress,
-        buf: &[u8],
-    ) -> Result<()> {
-        let sregs = vcpu.get_sregs().map_err(Error::ReadRegs)?;
-        let mut total_written = 0u64;
-        // Handle writes across page boundaries.
-        while total_written < buf.len() as u64 {
-            let (paddr, psize) = phys_addr(guest_mem, vaddr.0 + total_written, &sregs)?;
-            let write_len = std::cmp::min(
-                buf.len() as u64 - total_written,
-                psize - (paddr & (psize - 1)),
-            );
-
-            guest_mem
-                .write_all_at_addr(
-                    &buf[total_written as usize..(total_written as usize + write_len as usize)],
-                    GuestAddress(paddr),
-                )
-                .map_err(Error::WritingGuestMemory)?;
-            total_written += write_len;
-        }
-        Ok(())
-    }
-
-    fn enable_singlestep(vcpu: &T) -> Result<()> {
-        vcpu.set_guest_debug(&[], true /* enable_singlestep */)
-            .map_err(Error::EnableSinglestep)
-    }
-
-    fn get_max_hw_breakpoints(_vcpu: &T) -> Result<usize> {
-        Ok(4usize)
-    }
-
-    fn set_hw_breakpoints(vcpu: &T, breakpoints: &[GuestAddress]) -> Result<()> {
-        vcpu.set_guest_debug(breakpoints, false /* enable_singlestep */)
-            .map_err(Error::SetHwBreakpoint)
-    }
-}
-
-#[cfg(feature = "gdb")]
-// return the translated address and the size of the page it resides in.
-fn phys_addr(mem: &GuestMemory, vaddr: u64, sregs: &Sregs) -> Result<(u64, u64)> {
-    const CR0_PG_MASK: u64 = 1 << 31;
-    const CR4_PAE_MASK: u64 = 1 << 5;
-    const CR4_LA57_MASK: u64 = 1 << 12;
-    const MSR_EFER_LMA: u64 = 1 << 10;
-    // bits 12 through 51 are the address in a PTE.
-    const PTE_ADDR_MASK: u64 = ((1 << 52) - 1) & !0x0fff;
-    const PAGE_PRESENT: u64 = 0x1;
-    const PAGE_PSE_MASK: u64 = 0x1 << 7;
-
-    const PAGE_SIZE_4K: u64 = 4 * 1024;
-    const PAGE_SIZE_2M: u64 = 2 * 1024 * 1024;
-    const PAGE_SIZE_1G: u64 = 1024 * 1024 * 1024;
-
-    fn next_pte(mem: &GuestMemory, curr_table_addr: u64, vaddr: u64, level: usize) -> Result<u64> {
-        let ent: u64 = mem
-            .read_obj_from_addr(GuestAddress(
-                (curr_table_addr & PTE_ADDR_MASK) + page_table_offset(vaddr, level),
-            ))
-            .map_err(|_| Error::TranslatingVirtAddr)?;
-        /* TODO - convert to a trace
-        println!(
-            "level {} vaddr {:x} table-addr {:x} mask {:x} ent {:x} offset {:x}",
-            level,
-            vaddr,
-            curr_table_addr,
-            PTE_ADDR_MASK,
-            ent,
-            page_table_offset(vaddr, level)
-        );
-        */
-        if ent & PAGE_PRESENT == 0 {
-            return Err(Error::PageNotPresent);
-        }
-        Ok(ent)
-    }
-
-    // Get the offset in to the page of `vaddr`.
-    fn page_offset(vaddr: u64, page_size: u64) -> u64 {
-        vaddr & (page_size - 1)
-    }
-
-    // Get the offset in to the page table of the given `level` specified by the virtual `address`.
-    // `level` is 1 through 5 in x86_64 to handle the five levels of paging.
-    fn page_table_offset(addr: u64, level: usize) -> u64 {
-        let offset = (level - 1) * 9 + 12;
-        ((addr >> offset) & 0x1ff) << 3
-    }
-
-    if sregs.cr0 & CR0_PG_MASK == 0 {
-        return Ok((vaddr, PAGE_SIZE_4K));
-    }
-
-    if sregs.cr4 & CR4_PAE_MASK == 0 {
-        return Err(Error::TranslatingVirtAddr);
-    }
-
-    if sregs.efer & MSR_EFER_LMA != 0 {
-        // TODO - check LA57
-        if sregs.cr4 & CR4_LA57_MASK != 0 {
-            todo!("handle LA57");
-        }
-        let p4_ent = next_pte(mem, sregs.cr3, vaddr, 4)?;
-        let p3_ent = next_pte(mem, p4_ent, vaddr, 3)?;
-        // TODO check if it's a 1G page with the PSE bit in p2_ent
-        if p3_ent & PAGE_PSE_MASK != 0 {
-            // It's a 1G page with the PSE bit in p3_ent
-            let paddr = p3_ent & PTE_ADDR_MASK | page_offset(vaddr, PAGE_SIZE_1G);
-            return Ok((paddr, PAGE_SIZE_1G));
-        }
-        let p2_ent = next_pte(mem, p3_ent, vaddr, 2)?;
-        if p2_ent & PAGE_PSE_MASK != 0 {
-            // It's a 2M page with the PSE bit in p2_ent
-            let paddr = p2_ent & PTE_ADDR_MASK | page_offset(vaddr, PAGE_SIZE_2M);
-            return Ok((paddr, PAGE_SIZE_2M));
-        }
-        let p1_ent = next_pte(mem, p2_ent, vaddr, 1)?;
-        let paddr = p1_ent & PTE_ADDR_MASK | page_offset(vaddr, PAGE_SIZE_4K);
-        return Ok((paddr, PAGE_SIZE_4K));
-    }
-    Err(Error::TranslatingVirtAddr)
-}
-
 // OSC returned status register in CDW1
 const OSC_STATUS_UNSUPPORT_UUID: u32 = 0x4;
 // pci host bridge OSC returned control register in CDW3
@@ -1570,6 +1424,21 @@ pub enum CpuMode {
     LongMode,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum KernelType {
+    BzImage,
+    Elf,
+}
+
+impl fmt::Display for KernelType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            KernelType::BzImage => write!(f, "bzImage"),
+            KernelType::Elf => write!(f, "ELF"),
+        }
+    }
+}
+
 impl X8664arch {
     /// Loads the bios from an open file.
     ///
@@ -1637,6 +1506,37 @@ impl X8664arch {
         Ok(())
     }
 
+    /// Writes the command line string to the given memory slice.
+    ///
+    /// # Arguments
+    ///
+    /// * `guest_mem` - A u8 slice that will be partially overwritten by the command line.
+    /// * `guest_addr` - The address in `guest_mem` at which to load the command line.
+    /// * `cmdline` - The kernel command line.
+    /// * `kernel_max_cmdline_len` - The maximum command line length (without NUL terminator)
+    ///   supported by the kernel.
+    fn load_cmdline(
+        guest_mem: &GuestMemory,
+        guest_addr: GuestAddress,
+        cmdline: kernel_cmdline::Cmdline,
+        kernel_max_cmdline_len: usize,
+    ) -> Result<()> {
+        let mut cmdline_guest_mem_slice = guest_mem
+            .get_slice_at_addr(guest_addr, CMDLINE_MAX_SIZE as usize)
+            .map_err(|_| Error::CommandLineOverflow)?;
+
+        let mut cmdline_bytes: Vec<u8> = cmdline
+            .into_bytes_with_max_len(kernel_max_cmdline_len)
+            .map_err(Error::Cmdline)?;
+        cmdline_bytes.push(0u8); // Add NUL terminator.
+
+        cmdline_guest_mem_slice
+            .write_all(&cmdline_bytes)
+            .map_err(|_| Error::CommandLineOverflow)?;
+
+        Ok(())
+    }
+
     /// Loads the kernel from an open file.
     ///
     /// # Arguments
@@ -1647,21 +1547,29 @@ impl X8664arch {
     /// # Returns
     ///
     /// On success, returns the Linux x86_64 boot protocol parameters, the first address past the
-    /// end of the kernel, the entry point (initial `RIP` value), and the initial CPU mode.
+    /// end of the kernel, the entry point (initial `RIP` value), the initial CPU mode, and the type
+    /// of kernel.
     fn load_kernel(
         mem: &GuestMemory,
         kernel_image: &mut File,
-    ) -> Result<(boot_params, u64, GuestAddress, CpuMode)> {
+    ) -> Result<(boot_params, u64, GuestAddress, CpuMode, KernelType)> {
         let kernel_start = GuestAddress(KERNEL_START_OFFSET);
         match kernel_loader::load_elf64(mem, kernel_start, kernel_image, 0) {
             Ok(loaded_kernel) => {
                 // ELF kernels don't contain a `boot_params` structure, so synthesize a default one.
-                let boot_params = Default::default();
+                let boot_params = boot_params {
+                    hdr: setup_header {
+                        cmdline_size: CMDLINE_MAX_SIZE as u32 - 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
                 Ok((
                     boot_params,
                     loaded_kernel.address_range.end,
                     loaded_kernel.entry,
                     CpuMode::LongMode,
+                    KernelType::Elf,
                 ))
             }
             Err(kernel_loader::Error::InvalidMagicNumber) => {
@@ -1669,7 +1577,13 @@ impl X8664arch {
                 let (boot_params, bzimage_end, bzimage_entry, cpu_mode) =
                     bzimage::load_bzimage(mem, kernel_start, kernel_image)
                         .map_err(Error::LoadBzImage)?;
-                Ok((boot_params, bzimage_end, bzimage_entry, cpu_mode))
+                Ok((
+                    boot_params,
+                    bzimage_end,
+                    bzimage_entry,
+                    cpu_mode,
+                    KernelType::BzImage,
+                ))
             }
             Err(e) => Err(Error::LoadKernel(e)),
         }
@@ -1685,16 +1599,68 @@ impl X8664arch {
     /// * `initrd_file` - an initial ramdisk image
     pub fn setup_system_memory(
         mem: &GuestMemory,
-        cmdline: &CStr,
+        cmdline: kernel_cmdline::Cmdline,
         initrd_file: Option<File>,
         android_fstab: Option<File>,
         kernel_end: u64,
         params: boot_params,
         dump_device_tree_blob: Option<PathBuf>,
         device_tree_overlays: Vec<DtbOverlay>,
+        has_protected_vm_firmware: bool,
     ) -> Result<()> {
-        kernel_loader::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)
-            .map_err(Error::LoadCmdline)?;
+        // Some guest kernels expect a typical PC memory layout where the region between 640 KB and
+        // 1 MB is reserved for device memory/ROMs and get confused if there is a RAM region
+        // spanning this area, so we provide the traditional 640 KB low memory and 1 MB+
+        // high memory regions.
+        let ram_below_1m_end = 640 * 1024;
+        let ram_below_1m = AddressRange {
+            start: START_OF_RAM_32BITS,
+            end: ram_below_1m_end - 1,
+        };
+
+        // GuestMemory::end_addr() returns the first address past the end, so subtract 1 to get the
+        // inclusive end.
+        let guest_mem_end = mem.end_addr().offset() - 1;
+
+        // Find the end of the part of guest memory below 4G that is not pVM firmware memory.
+        // This part of guest memory includes just one region, so just find the end of this region.
+        let max_ram_end_below_4g = max_ram_end_before_32bit(has_protected_vm_firmware) - 1;
+        let guest_mem_end_below_4g = mem
+            .regions()
+            .map(|r| r.guest_addr.offset() + r.size as u64 - 1)
+            .find(|&addr| addr <= max_ram_end_below_4g)
+            .expect("no memory region below 4G");
+
+        let ram_below_4g = AddressRange {
+            start: FIRST_ADDR_PAST_20BITS,
+            end: guest_mem_end_below_4g,
+        };
+        let ram_above_4g = AddressRange {
+            start: FIRST_ADDR_PAST_32BITS,
+            end: guest_mem_end,
+        };
+
+        let e820_entries = generate_e820_memory_map(
+            mem,
+            ram_below_1m,
+            ram_below_4g,
+            ram_above_4g,
+            has_protected_vm_firmware,
+        )?;
+
+        let kernel_max_cmdline_len = if params.hdr.cmdline_size == 0 {
+            // Old kernels have a maximum length of 255 bytes, not including the NUL.
+            255
+        } else {
+            params.hdr.cmdline_size as usize
+        };
+        debug!("kernel_max_cmdline_len={kernel_max_cmdline_len}");
+        Self::load_cmdline(
+            mem,
+            GuestAddress(CMDLINE_OFFSET),
+            cmdline,
+            kernel_max_cmdline_len,
+        )?;
 
         let mut setup_data = Vec::<SetupData>::new();
         if let Some(android_fstab) = android_fstab {
@@ -1728,6 +1694,9 @@ impl X8664arch {
                     &mut initrd_file,
                     GuestAddress(kernel_end),
                     GuestAddress(initrd_addr_max),
+                    Some(|region| {
+                        region.options.purpose != MemoryRegionPurpose::ProtectedFirmwareRegion
+                    }),
                     base::pagesize() as u64,
                 )
                 .map_err(Error::LoadInitrd)?;
@@ -1739,10 +1708,10 @@ impl X8664arch {
         configure_system(
             mem,
             GuestAddress(CMDLINE_OFFSET),
-            cmdline.to_bytes().len() + 1,
             setup_data,
             initrd,
             params,
+            &e820_entries,
         )?;
         Ok(())
     }
@@ -1773,7 +1742,7 @@ impl X8664arch {
 
     /// This returns a minimal kernel command for this architecture
     pub fn get_base_linux_cmdline() -> kernel_cmdline::Cmdline {
-        let mut cmdline = kernel_cmdline::Cmdline::new(CMDLINE_MAX_SIZE as usize);
+        let mut cmdline = kernel_cmdline::Cmdline::new();
         cmdline.insert_str("panic=-1").unwrap();
 
         cmdline
@@ -1782,9 +1751,9 @@ impl X8664arch {
     /// Sets up fw_cfg device.
     ///  # Arguments
     ///
-    /// * - `io_bus` - the IO bus object
-    /// * - `fw_cfg_parameters` - command-line specified data to add to device. May contain
-    /// all None fields if user did not specify data to add to the device
+    /// * `io_bus` - the IO bus object
+    /// * `fw_cfg_parameters` - command-line specified data to add to device. May contain all None
+    ///   fields if user did not specify data to add to the device
     fn setup_fw_cfg_device(
         io_bus: &Bus,
         fw_cfg_parameters: Vec<FwCfgParameters>,
@@ -1883,8 +1852,9 @@ impl X8664arch {
         irq_chip: &mut dyn IrqChipX86_64,
         vm_control: Tube,
         mem_size: u64,
+        has_protected_vm_firmware: bool,
     ) -> anyhow::Result<()> {
-        let mem_regions = arch_memory_regions(mem_size, None);
+        let mem_regions = arch_memory_regions(mem_size, None, has_protected_vm_firmware);
 
         let mem_below_4g = mem_regions
             .iter()
@@ -1927,15 +1897,15 @@ impl X8664arch {
     ///
     /// # Arguments
     ///
-    /// * - `io_bus` the I/O bus to add the devices to
-    /// * - `resources` the SystemAllocator to allocate IO and MMIO for acpi devices.
-    /// * - `suspend_tube` the tube object which used to suspend/resume the VM.
-    /// * - `sdts` ACPI system description tables
-    /// * - `irq_chip` the IrqChip object for registering irq events
-    /// * - `battery` indicate whether to create the battery
-    /// * - `mmio_bus` the MMIO bus to add the devices to
-    /// * - `pci_irqs` IRQ assignment of PCI devices. Tuples of (PCI address, gsi, PCI interrupt
-    ///   pin). Note that this matches one of the return values of generate_pci_root.
+    /// * `io_bus` the I/O bus to add the devices to
+    /// * `resources` the SystemAllocator to allocate IO and MMIO for acpi devices.
+    /// * `suspend_tube` the tube object which used to suspend/resume the VM.
+    /// * `sdts` ACPI system description tables
+    /// * `irq_chip` the IrqChip object for registering irq events
+    /// * `battery` indicate whether to create the battery
+    /// * `mmio_bus` the MMIO bus to add the devices to
+    /// * `pci_irqs` IRQ assignment of PCI devices. Tuples of (PCI address, gsi, PCI interrupt pin).
+    ///   Note that this matches one of the return values of generate_pci_root.
     pub fn setup_acpi_devices(
         pci_root: Arc<Mutex<PciRoot>>,
         mem: &GuestMemory,
@@ -2385,13 +2355,17 @@ mod tests {
     fn setup() {
         let pcie_ecam = Some(AddressRange::from_start_and_size(3 * GB, 256 * MB).unwrap());
         let pci_start = Some(2 * GB);
-        init_low_memory_layout(pcie_ecam, pci_start);
+        init_low_memory_layout(pcie_ecam, pci_start, false).expect("init_low_memory_layout");
     }
 
     #[test]
     fn regions_lt_4gb_nobios() {
         setup();
-        let regions = arch_memory_regions(512 * MB, /* bios_size */ None);
+        let regions = arch_memory_regions(
+            512 * MB,
+            /* bios_size */ None,
+            /* has_protected_vm_firmware */ false,
+        );
         assert_eq!(1, regions.len());
         assert_eq!(GuestAddress(START_OF_RAM_32BITS), regions[0].0);
         assert_eq!(1u64 << 29, regions[0].1);
@@ -2401,7 +2375,9 @@ mod tests {
     fn regions_gt_4gb_nobios() {
         setup();
         let size = 4 * GB + 0x8000;
-        let regions = arch_memory_regions(size, /* bios_size */ None);
+        let regions = arch_memory_regions(
+            size, /* bios_size */ None, /* has_protected_vm_firmware */ false,
+        );
         assert_eq!(2, regions.len());
         assert_eq!(GuestAddress(START_OF_RAM_32BITS), regions[0].0);
         assert_eq!(GuestAddress(4 * GB), regions[1].0);
@@ -2412,7 +2388,11 @@ mod tests {
     fn regions_lt_4gb_bios() {
         setup();
         let bios_len = 1 * MB;
-        let regions = arch_memory_regions(512 * MB, Some(bios_len));
+        let regions = arch_memory_regions(
+            512 * MB,
+            Some(bios_len),
+            /* has_protected_vm_firmware */ false,
+        );
         assert_eq!(2, regions.len());
         assert_eq!(GuestAddress(START_OF_RAM_32BITS), regions[0].0);
         assert_eq!(512 * MB, regions[0].1);
@@ -2427,7 +2407,11 @@ mod tests {
     fn regions_gt_4gb_bios() {
         setup();
         let bios_len = 1 * MB;
-        let regions = arch_memory_regions(4 * GB + 0x8000, Some(bios_len));
+        let regions = arch_memory_regions(
+            4 * GB + 0x8000,
+            Some(bios_len),
+            /* has_protected_vm_firmware */ false,
+        );
         assert_eq!(3, regions.len());
         assert_eq!(GuestAddress(START_OF_RAM_32BITS), regions[0].0);
         assert_eq!(
@@ -2445,6 +2429,7 @@ mod tests {
         let regions = arch_memory_regions(
             TEST_MEMORY_SIZE - START_OF_RAM_32BITS,
             /* bios_size */ None,
+            /* has_protected_vm_firmware */ false,
         );
         dbg!(&regions);
         assert_eq!(1, regions.len());
@@ -2457,7 +2442,11 @@ mod tests {
         setup();
         // Test with exact size of 4GB - the overhead.
         let bios_len = 1 * MB;
-        let regions = arch_memory_regions(TEST_MEMORY_SIZE - START_OF_RAM_32BITS, Some(bios_len));
+        let regions = arch_memory_regions(
+            TEST_MEMORY_SIZE - START_OF_RAM_32BITS,
+            Some(bios_len),
+            /* has_protected_vm_firmware */ false,
+        );
         assert_eq!(2, regions.len());
         assert_eq!(GuestAddress(START_OF_RAM_32BITS), regions[0].0);
         assert_eq!(TEST_MEMORY_SIZE - START_OF_RAM_32BITS, regions[0].1);
@@ -2559,5 +2548,43 @@ mod tests {
             mem.read_obj_from_addr::<[u8; 9]>(entry2_data_addr).unwrap(),
             entry2_data
         );
+    }
+
+    #[test]
+    fn cmdline_overflow() {
+        const MEM_SIZE: u64 = 0x1000;
+        let gm = GuestMemory::new(&[(GuestAddress(0x0), MEM_SIZE)]).unwrap();
+        let mut cmdline = kernel_cmdline::Cmdline::new();
+        cmdline.insert_str("12345").unwrap();
+        let cmdline_address = GuestAddress(MEM_SIZE - 5);
+        let err =
+            X8664arch::load_cmdline(&gm, cmdline_address, cmdline, CMDLINE_MAX_SIZE as usize - 1)
+                .unwrap_err();
+        assert!(matches!(err, Error::CommandLineOverflow));
+    }
+
+    #[test]
+    fn cmdline_write_end() {
+        const MEM_SIZE: u64 = 0x1000;
+        let gm = GuestMemory::new(&[(GuestAddress(0x0), MEM_SIZE)]).unwrap();
+        let mut cmdline = kernel_cmdline::Cmdline::new();
+        cmdline.insert_str("1234").unwrap();
+        let mut cmdline_address = GuestAddress(45);
+        X8664arch::load_cmdline(&gm, cmdline_address, cmdline, CMDLINE_MAX_SIZE as usize - 1)
+            .unwrap();
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'1');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'2');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'3');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'4');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'\0');
     }
 }

@@ -59,6 +59,7 @@ use anyhow::Context;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use base::clear_fd_flags;
 use base::error;
+use base::trace;
 use base::warn;
 use base::Event;
 use base::Protection;
@@ -156,13 +157,7 @@ pub trait VhostUserDevice {
     /// Indicates that the backend should start processing requests for virtio queue number `idx`.
     /// This method must not block the current thread so device backends should either spawn an
     /// async task or another thread to handle messages from the Queue.
-    fn start_queue(
-        &mut self,
-        idx: usize,
-        queue: Queue,
-        mem: GuestMemory,
-        doorbell: Interrupt,
-    ) -> anyhow::Result<()>;
+    fn start_queue(&mut self, idx: usize, queue: Queue, mem: GuestMemory) -> anyhow::Result<()>;
 
     /// Indicates that the backend should stop processing requests for virtio queue number `idx`.
     /// This method should return the queue passed to `start_queue` for the corresponding `idx`.
@@ -193,36 +188,19 @@ pub trait VhostUserDevice {
     /// One reasonably foolproof way to satisfy the requirements is to stop all worker threads.
     ///
     /// Called after a `stop_queue` call if there are no running queues left. Also called soon
-    /// after device creation to detect support (if supported, it is assumed the device is acting
-    /// suspended immediately on construction).
+    /// after device creation to ensure the device is acting suspended immediately on construction.
     ///
     /// The next `start_queue` call implicitly exits the "suspend device state".
     ///
-    /// `Ok(false)` is returned to signal that this state isn't supported. In that case, the
-    /// framework will block some features, e.g. snapshot/restore and
-    /// `VHOST_USER_SET_DEVICE_STATE_FD`.
-    ///
-    /// * Ok(true)  => device successfully suspended
-    /// * Ok(false) => "suspended device state" not supported
+    /// * Ok(())    => device successfully suspended
     /// * Err(_)    => unrecoverable error
-    fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
-        Ok(false)
-    }
+    fn enter_suspended_state(&mut self) -> anyhow::Result<()>;
 
-    /// Snapshot device and return serialized bytes.
-    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
-        anyhow::bail!(
-            "snapshot not implemented for vhost user device {}",
-            std::any::type_name::<Self>()
-        );
-    }
+    /// Snapshot device and return serialized state.
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value>;
 
-    fn restore(&mut self, _data: serde_json::Value) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "snapshot not implemented for vhost user device {}",
-            std::any::type_name::<Self>()
-        );
-    }
+    /// Restore device state from a snapshot.
+    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()>;
 }
 
 /// A virtio ring entry.
@@ -327,8 +305,6 @@ impl VhostUserRegularOps {
 pub struct DeviceRequestHandler<T: VhostUserDevice> {
     vrings: Vec<Vring>,
     owned: bool,
-    // true iff all queues are stopped and `enter_suspended_state` succeeded.
-    suspended: bool,
     vmm_maps: Option<Vec<MappingInfo>>,
     mem: Option<GuestMemory>,
     acked_features: u64,
@@ -359,14 +335,15 @@ impl<T: VhostUserDevice> DeviceRequestHandler<T> {
             vrings.push(Vring::new(Queue::MAX_SIZE, backend.features()));
         }
 
-        let suspended = backend
+        // VhostUserDevice implementations must support `enter_suspended_state()`.
+        // Call it on startup to ensure it works and to initialize the device in a suspended state.
+        backend
             .enter_suspended_state()
             .expect("enter_suspended_state failed on device init");
 
         DeviceRequestHandler {
             vrings,
             owned: false,
-            suspended,
             vmm_maps: None,
             mem: None,
             acked_features: 0,
@@ -377,6 +354,13 @@ impl<T: VhostUserDevice> DeviceRequestHandler<T> {
             )),
             device_state_thread: None,
         }
+    }
+
+    /// Check if all queues are stopped.
+    ///
+    /// The device can be suspended with `enter_suspended_state()` only when all queues are stopped.
+    fn all_queues_stopped(&self) -> bool {
+        self.vrings.iter().all(|vring| !vring.queue.ready())
     }
 }
 
@@ -547,19 +531,21 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
                 }
             };
 
+            trace!("stopped queue {index}");
+
             vring.reset();
+
+            if self.all_queues_stopped() {
+                trace!("all queues stopped; entering suspended state");
+                self.backend
+                    .enter_suspended_state()
+                    .map_err(VhostError::EnterSuspendedState)?;
+            }
 
             queue.next_avail_to_process()
         } else {
             0
         };
-
-        if self.vrings.iter().all(|vring| !vring.queue.ready()) {
-            self.suspended = self
-                .backend
-                .enter_suspended_state()
-                .map_err(VhostError::EnterSuspendedState)?;
-        }
 
         Ok(VhostUserVringState::new(index, vring_base.into()))
     }
@@ -587,7 +573,9 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
             .cloned()
             .ok_or(VhostError::InvalidOperation)?;
 
-        let queue = match vring.queue.activate(&mem, kick_evt) {
+        let doorbell = vring.doorbell.clone().ok_or(VhostError::InvalidOperation)?;
+
+        let queue = match vring.queue.activate(&mem, kick_evt, doorbell) {
             Ok(queue) => queue,
             Err(e) => {
                 error!("failed to activate vring: {:#}", e);
@@ -595,17 +583,12 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
             }
         };
 
-        let doorbell = vring.doorbell.clone().ok_or(VhostError::InvalidOperation)?;
-
-        if let Err(e) = self
-            .backend
-            .start_queue(index as usize, queue, mem, doorbell)
-        {
+        if let Err(e) = self.backend.start_queue(index as usize, queue, mem) {
             error!("Failed to start queue {}: {}", index, e);
             return Err(VhostError::BackendInternalError);
         }
 
-        self.suspended = false;
+        trace!("started queue {index}");
 
         Ok(())
     }
@@ -733,7 +716,7 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         if migration_phase != VhostUserMigrationPhase::Stopped {
             return Err(VhostError::InvalidOperation);
         }
-        if !self.suspended {
+        if !self.all_queues_stopped() {
             return Err(VhostError::InvalidOperation);
         }
         if self.device_state_thread.is_some() {
@@ -813,54 +796,6 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         } else {
             Vec::new()
         })
-    }
-
-    fn snapshot(&mut self) -> VhostResult<Vec<u8>> {
-        if !self.suspended {
-            return Err(VhostError::InvalidOperation);
-        }
-        match serde_json::to_vec(&DeviceRequestHandlerSnapshot {
-            acked_features: self.acked_features,
-            acked_protocol_features: self.acked_protocol_features.bits(),
-            // TODO: The backend's snapshot is getting double serialized. Consider serializing just
-            // the other fields and then passing along the backend's snapshot as is.
-            backend: self.backend.snapshot().map_err(VhostError::SnapshotError)?,
-        }) {
-            Ok(serialized_json) => Ok(serialized_json),
-            Err(e) => {
-                error!("Failed to serialize DeviceRequestHandlerSnapshot: {}", e);
-                Err(VhostError::SerializationFailed)
-            }
-        }
-    }
-
-    fn restore(&mut self, data_bytes: &[u8]) -> VhostResult<()> {
-        if !self.suspended {
-            return Err(VhostError::InvalidOperation);
-        }
-        let device_request_handler_snapshot: DeviceRequestHandlerSnapshot =
-            serde_json::from_slice(data_bytes).map_err(|e| {
-                error!("Failed to deserialize DeviceRequestHandlerSnapshot: {}", e);
-                VhostError::DeserializationFailed
-            })?;
-
-        self.acked_features = device_request_handler_snapshot.acked_features;
-        self.acked_protocol_features = VhostUserProtocolFeatures::from_bits(
-            device_request_handler_snapshot.acked_protocol_features,
-        )
-        .with_context(|| {
-            format!(
-                "unsupported bits in acked_protocol_features: {:#x}",
-                device_request_handler_snapshot.acked_protocol_features
-            )
-        })
-        .map_err(VhostError::RestoreError)?;
-
-        self.backend
-            .restore(device_request_handler_snapshot.backend)
-            .map_err(VhostError::RestoreError)?;
-
-        Ok(())
     }
 }
 
@@ -1041,7 +976,6 @@ mod tests {
     use zerocopy::FromBytes;
     use zerocopy::FromZeroes;
 
-    use super::sys::test_helpers;
     use super::*;
     use crate::virtio::vhost_user_frontend::VhostUserFrontend;
     use crate::virtio::DeviceType;
@@ -1061,7 +995,6 @@ mod tests {
         acked_features: u64,
         active_queues: Vec<Option<Queue>>,
         allow_backend_req: bool,
-        supports_device_state: bool,
         backend_conn: Option<Arc<VhostBackendReqConnection>>,
     }
 
@@ -1081,7 +1014,6 @@ mod tests {
                 acked_features: 0,
                 active_queues,
                 allow_backend_req: false,
-                supports_device_state: false,
                 backend_conn: None,
             }
         }
@@ -1109,12 +1041,10 @@ mod tests {
         }
 
         fn protocol_features(&self) -> VhostUserProtocolFeatures {
-            let mut features = VhostUserProtocolFeatures::CONFIG;
+            let mut features =
+                VhostUserProtocolFeatures::CONFIG | VhostUserProtocolFeatures::DEVICE_STATE;
             if self.allow_backend_req {
                 features |= VhostUserProtocolFeatures::BACKEND_REQ;
-            }
-            if self.supports_device_state {
-                features |= VhostUserProtocolFeatures::DEVICE_STATE;
             }
             features
         }
@@ -1130,7 +1060,6 @@ mod tests {
             idx: usize,
             queue: Queue,
             _mem: GuestMemory,
-            _doorbell: Interrupt,
         ) -> anyhow::Result<()> {
             self.active_queues[idx] = Some(queue);
             Ok(())
@@ -1146,8 +1075,8 @@ mod tests {
             self.backend_conn = Some(conn);
         }
 
-        fn enter_suspended_state(&mut self) -> anyhow::Result<bool> {
-            Ok(true)
+        fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
+            Ok(())
         }
 
         fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
@@ -1167,33 +1096,20 @@ mod tests {
 
     #[test]
     fn test_vhost_user_lifecycle() {
-        test_vhost_user_lifecycle_parameterized(false, true);
-    }
-
-    #[test]
-    fn test_vhost_user_lifecycle_legacy_snapshot() {
-        test_vhost_user_lifecycle_parameterized(false, false);
+        test_vhost_user_lifecycle_parameterized(false);
     }
 
     #[test]
     #[cfg(not(windows))] // Windows requries more complex connection setup.
     fn test_vhost_user_lifecycle_with_backend_req() {
-        test_vhost_user_lifecycle_parameterized(true, true);
+        test_vhost_user_lifecycle_parameterized(true);
     }
 
-    #[test]
-    #[cfg(not(windows))] // Windows requries more complex connection setup.
-    fn test_vhost_user_lifecycle_with_backend_req_legacy_snapshot() {
-        test_vhost_user_lifecycle_parameterized(true, false);
-    }
-
-    fn test_vhost_user_lifecycle_parameterized(
-        allow_backend_req: bool,
-        supports_device_state: bool,
-    ) {
+    fn test_vhost_user_lifecycle_parameterized(allow_backend_req: bool) {
         const QUEUES_NUM: usize = 2;
 
-        let (dev, vmm) = test_helpers::setup();
+        let (client_connection, server_connection) =
+            vmm_vhost::Connection::<FrontendReq>::pair().unwrap();
 
         let vmm_bar = Arc::new(Barrier::new(2));
         let dev_bar = vmm_bar.clone();
@@ -1205,10 +1121,9 @@ mod tests {
             // VMM side
             ready_rx.recv().unwrap(); // Ensure the device is ready.
 
-            let connection = test_helpers::connect(vmm);
-
             let mut vmm_device =
-                VhostUserFrontend::new(DeviceType::Console, 0, connection, None, None).unwrap();
+                VhostUserFrontend::new(DeviceType::Console, 0, client_connection, None, None)
+                    .unwrap();
 
             println!("read_config");
             let mut buf = vec![0; std::mem::size_of::<FakeConfig>()];
@@ -1226,7 +1141,7 @@ mod tests {
                     let mut queue = QueueConfig::new(0x10, 0);
                     queue.set_ready(true);
                     let queue = queue
-                        .activate(&mem, Event::new().unwrap())
+                        .activate(&mem, Event::new().unwrap(), interrupt.clone())
                         .expect("QueueConfig::activate");
                     queues.insert(idx, queue);
                 }
@@ -1284,12 +1199,11 @@ mod tests {
         // Device side
         let mut handler = DeviceRequestHandler::new(FakeBackend::new());
         handler.as_mut().allow_backend_req = allow_backend_req;
-        handler.as_mut().supports_device_state = supports_device_state;
 
         // Notify listener is ready.
         ready_tx.send(()).unwrap();
 
-        let mut req_handler = test_helpers::listen(dev, handler);
+        let mut req_handler = BackendServer::new(server_connection, handler);
 
         // VhostUserFrontend::new()
         handle_request(&mut req_handler, FrontendReq::SET_OWNER).unwrap();
@@ -1350,19 +1264,12 @@ mod tests {
             handle_request(&mut req_handler, FrontendReq::GET_VRING_BASE).unwrap();
         }
 
-        if supports_device_state {
-            // VhostUserFrontend::virtio_snapshot()
-            handle_request(&mut req_handler, FrontendReq::SET_DEVICE_STATE_FD).unwrap();
-            handle_request(&mut req_handler, FrontendReq::CHECK_DEVICE_STATE).unwrap();
-            // VhostUserFrontend::virtio_restore()
-            handle_request(&mut req_handler, FrontendReq::SET_DEVICE_STATE_FD).unwrap();
-            handle_request(&mut req_handler, FrontendReq::CHECK_DEVICE_STATE).unwrap();
-        } else {
-            // VhostUserFrontend::virtio_snapshot()
-            handle_request(&mut req_handler, FrontendReq::SNAPSHOT).unwrap();
-            // VhostUserFrontend::virtio_restore()
-            handle_request(&mut req_handler, FrontendReq::RESTORE).unwrap();
-        }
+        // VhostUserFrontend::virtio_snapshot()
+        handle_request(&mut req_handler, FrontendReq::SET_DEVICE_STATE_FD).unwrap();
+        handle_request(&mut req_handler, FrontendReq::CHECK_DEVICE_STATE).unwrap();
+        // VhostUserFrontend::virtio_restore()
+        handle_request(&mut req_handler, FrontendReq::SET_DEVICE_STATE_FD).unwrap();
+        handle_request(&mut req_handler, FrontendReq::CHECK_DEVICE_STATE).unwrap();
 
         // VhostUserFrontend::virtio_wake()
         handle_request(&mut req_handler, FrontendReq::SET_MEM_TABLE).unwrap();

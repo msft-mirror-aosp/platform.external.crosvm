@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use anyhow::Context;
 use base::linux::max_open_files;
+use base::AsRawDescriptor;
 use base::RawDescriptor;
 use cros_async::Executor;
 use jail::create_base_minijail;
@@ -16,8 +17,7 @@ use minijail::Minijail;
 
 use crate::virtio::vhost::user::device::fs::FsBackend;
 use crate::virtio::vhost::user::device::fs::Options;
-use crate::virtio::vhost::user::device::listener::sys::VhostUserListener;
-use crate::virtio::vhost::user::device::listener::VhostUserListenerTrait;
+use crate::virtio::vhost::user::device::BackendConnection;
 
 fn default_uidmap() -> String {
     // SAFETY: trivially safe
@@ -41,7 +41,9 @@ fn jail_and_fork(
     gid_map: Option<String>,
     disable_sandbox: bool,
 ) -> anyhow::Result<i32> {
-    let limit = max_open_files().context("failed to get max open files")?;
+    let limit = max_open_files()
+        .context("failed to get max open files")?
+        .rlim_max;
     // Create new minijail sandbox
     let jail = if disable_sandbox {
         create_base_minijail(dir_path.as_path(), limit)?
@@ -110,7 +112,10 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
     let fs_device = FsBackend::new(&ex, &opts.tag, opts.cfg)?;
 
     let mut keep_rds = fs_device.keep_rds.clone();
-    let listener = VhostUserListener::new_socket(&opts.socket, Some(&mut keep_rds))?;
+
+    let conn =
+        BackendConnection::from_opts(opts.socket.as_deref(), opts.socket_path.as_deref(), opts.fd)?;
+    keep_rds.push(conn.as_raw_descriptor());
 
     base::syslog::push_descriptors(&mut keep_rds);
     cros_tracing::push_descriptors!(&mut keep_rds);
@@ -157,5 +162,5 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
     }
 
     // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
-    ex.run_until(listener.run_backend(fs_device, &ex))?
+    ex.run_until(conn.run_backend(fs_device, &ex))?
 }

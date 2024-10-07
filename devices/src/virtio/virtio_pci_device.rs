@@ -9,6 +9,7 @@ use std::sync::Arc;
 use acpi_tables::sdt::SDT;
 use anyhow::anyhow;
 use anyhow::Context;
+use base::debug;
 use base::error;
 use base::trace;
 use base::AsRawDescriptor;
@@ -651,7 +652,7 @@ impl VirtioPciDevice {
                 Ok((
                     queue_index,
                     queue
-                        .activate(&self.mem, queue_evt)
+                        .activate(&self.mem, queue_evt, interrupt.clone())
                         .context("failed to activate queue")?,
                 ))
             })
@@ -1093,19 +1094,25 @@ where
             bar: config.bar_index() as u8,
         };
 
+        let vm_memory_client = virtio_pci_device
+            .shared_memory_vm_memory_client
+            .take()
+            .expect("missing shared_memory_tube");
+
+        // See comment VmMemoryRequest::execute
+        let can_prepare = !virtio_pci_device
+            .device
+            .expose_shmem_descriptors_with_viommu();
+        let prepare_type = if can_prepare {
+            virtio_pci_device.device.get_shared_memory_prepare_type()
+        } else {
+            SharedMemoryPrepareType::DynamicPerMapping
+        };
+
+        let vm_requester = Box::new(VmRequester::new(vm_memory_client, alloc, prepare_type));
         virtio_pci_device
             .device
-            .set_shared_memory_mapper(Box::new(VmRequester::new(
-                virtio_pci_device
-                    .shared_memory_vm_memory_client
-                    .take()
-                    .expect("missing shared_memory_tube"),
-                alloc,
-                // See comment VmMemoryRequest::execute
-                !virtio_pci_device
-                    .device
-                    .expose_shmem_descriptors_with_viommu(),
-            )));
+            .set_shared_memory_mapper(vm_requester);
 
         vec![config]
     };
@@ -1316,6 +1323,30 @@ impl Suspendable for VirtioPciDevice {
         self.msix_config.lock().restore(deser.msix_config)?;
         self.common_config = deser.common_config;
 
+        // Restore the interrupt. This must be done after restoring the MSI-X configuration, but
+        // before restoring the queues.
+        if let Some(deser_interrupt) = deser.interrupt {
+            self.interrupt = Some(Interrupt::new_from_snapshot(
+                self.interrupt_evt
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("{} interrupt_evt is none", self.debug_label()))?
+                    .try_clone()
+                    .with_context(|| {
+                        format!("{} failed to clone interrupt_evt", self.debug_label())
+                    })?,
+                Some(self.msix_config.clone()),
+                self.common_config.msix_config,
+                deser_interrupt,
+                #[cfg(target_arch = "x86_64")]
+                Some((
+                    PmWakeupEvent::new(self.vm_control_tube.clone(), self.pm_config.clone()),
+                    MetricEventType::VirtioWakeup {
+                        virtio_id: self.device.device_type() as u32,
+                    },
+                )),
+            ));
+        }
+
         assert_eq!(
             self.queues.len(),
             deser.queues.len(),
@@ -1337,6 +1368,10 @@ impl Suspendable for VirtioPciDevice {
         };
         // Restore `sleep_state`.
         if let Some(activated_queues_snapshot) = deser.activated_queues {
+            let interrupt = self
+                .interrupt
+                .as_ref()
+                .context("tried to restore active queues without an interrupt")?;
             let mut activated_queues = BTreeMap::new();
             for (index, queue_snapshot) in activated_queues_snapshot {
                 let queue_config = self
@@ -1352,7 +1387,13 @@ impl Suspendable for VirtioPciDevice {
                     .context("failed to clone queue event")?;
                 activated_queues.insert(
                     index,
-                    Queue::restore(queue_config, queue_snapshot, &self.mem, queue_evt)?,
+                    Queue::restore(
+                        queue_config,
+                        queue_snapshot,
+                        &self.mem,
+                        queue_evt,
+                        interrupt.clone(),
+                    )?,
                 );
             }
 
@@ -1360,32 +1401,6 @@ impl Suspendable for VirtioPciDevice {
             self.sleep_state = Some(SleepState::Active { activated_queues });
         } else {
             self.sleep_state = Some(SleepState::Inactive);
-        }
-
-        // Also replicate the other work in activate: initialize the interrupt and queues
-        // events. This could just as easily be done in `wake` instead.
-        // NOTE: Needs to be done last in `restore` because it relies on the other VirtioPciDevice
-        // fields.
-        if let Some(deser_interrupt) = deser.interrupt {
-            self.interrupt = Some(Interrupt::new_from_snapshot(
-                self.interrupt_evt
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("{} interrupt_evt is none", self.debug_label()))?
-                    .try_clone()
-                    .with_context(|| {
-                        format!("{} failed to clone interrupt_evt", self.debug_label())
-                    })?,
-                Some(self.msix_config.clone()),
-                self.common_config.msix_config,
-                deser_interrupt,
-                #[cfg(target_arch = "x86_64")]
-                Some((
-                    PmWakeupEvent::new(self.vm_control_tube.clone(), self.pm_config.clone()),
-                    MetricEventType::VirtioWakeup {
-                        virtio_id: self.device.device_type() as u32,
-                    },
-                )),
-            ));
         }
 
         // Call register_io_events for the activated queue events.
@@ -1433,16 +1448,22 @@ struct VmRequester {
     vm_memory_client: VmMemoryClient,
     alloc: Alloc,
     mappings: BTreeMap<u64, VmMemoryRegionId>,
-    needs_prepare: bool,
+    prepare_type: SharedMemoryPrepareType,
+    prepared: bool,
 }
 
 impl VmRequester {
-    fn new(vm_memory_client: VmMemoryClient, alloc: Alloc, do_prepare: bool) -> Self {
+    fn new(
+        vm_memory_client: VmMemoryClient,
+        alloc: Alloc,
+        prepare_type: SharedMemoryPrepareType,
+    ) -> Self {
         Self {
             vm_memory_client,
             alloc,
             mappings: BTreeMap::new(),
-            needs_prepare: do_prepare,
+            prepare_type,
+            prepared: false,
         }
     }
 }
@@ -1455,11 +1476,31 @@ impl SharedMemoryMapper for VmRequester {
         prot: Protection,
         cache: MemCacheType,
     ) -> anyhow::Result<()> {
-        if self.needs_prepare {
-            self.vm_memory_client
-                .prepare_shared_memory_region(self.alloc, cache)
-                .context("prepare_shared_memory_region failed")?;
-            self.needs_prepare = false;
+        if !self.prepared {
+            if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
+                self.prepare_type
+            {
+                debug!(
+                    "lazy prepare_shared_memory_region with {:?}",
+                    prepare_cache_type
+                );
+                self.vm_memory_client
+                    .prepare_shared_memory_region(self.alloc, prepare_cache_type)
+                    .context("lazy prepare_shared_memory_region failed")?;
+            }
+            self.prepared = true;
+        }
+
+        // devices must implement VirtioDevice::get_shared_memory_prepare_type(), returning
+        // SharedMemoryPrepareType::SingleMappingOnFirst(MemCacheType::CacheNonCoherent) in order to
+        // add any mapping that requests MemCacheType::CacheNonCoherent.
+        if cache == MemCacheType::CacheNonCoherent {
+            if let SharedMemoryPrepareType::SingleMappingOnFirst(MemCacheType::CacheCoherent) =
+                self.prepare_type
+            {
+                error!("invalid request to map with CacheNonCoherent for device with prepared CacheCoherent memory");
+                return Err(anyhow!("invalid MemCacheType"));
+            }
         }
 
         let id = self

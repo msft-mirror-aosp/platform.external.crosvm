@@ -17,6 +17,7 @@ use argh::FromArgs;
 use base::clone_descriptor;
 use base::error;
 use base::warn;
+use base::RawDescriptor;
 use base::SafeDescriptor;
 use base::Tube;
 use base::UnixSeqpacket;
@@ -43,16 +44,13 @@ use crate::virtio::vhost::user::device::handler::VhostBackendReqConnection;
 use crate::virtio::vhost::user::device::handler::VhostBackendReqConnectionState;
 use crate::virtio::vhost::user::device::handler::VhostUserDevice;
 use crate::virtio::vhost::user::device::handler::WorkerState;
-use crate::virtio::vhost::user::device::listener::sys::VhostUserListener;
-use crate::virtio::vhost::user::device::listener::VhostUserListenerTrait;
+use crate::virtio::vhost::user::device::BackendConnection;
 use crate::virtio::wl;
-use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 use crate::virtio::SharedMemoryRegion;
 
 async fn run_out_queue(
     queue: Rc<RefCell<Queue>>,
-    doorbell: Interrupt,
     kick_evt: EventAsync,
     wlstate: Rc<RefCell<wl::WlState>>,
 ) {
@@ -62,17 +60,12 @@ async fn run_out_queue(
             break;
         }
 
-        wl::process_out_queue(
-            &doorbell,
-            &mut queue.borrow_mut(),
-            &mut wlstate.borrow_mut(),
-        );
+        wl::process_out_queue(&mut queue.borrow_mut(), &mut wlstate.borrow_mut());
     }
 }
 
 async fn run_in_queue(
     queue: Rc<RefCell<Queue>>,
-    doorbell: Interrupt,
     kick_evt: EventAsync,
     wlstate: Rc<RefCell<wl::WlState>>,
     wlstate_ctx: IoSource<AsyncWrapper<SafeDescriptor>>,
@@ -86,11 +79,8 @@ async fn run_in_queue(
             break;
         }
 
-        if wl::process_in_queue(
-            &doorbell,
-            &mut queue.borrow_mut(),
-            &mut wlstate.borrow_mut(),
-        ) == Err(wl::DescriptorsExhausted)
+        if wl::process_in_queue(&mut queue.borrow_mut(), &mut wlstate.borrow_mut())
+            == Err(wl::DescriptorsExhausted)
         {
             if let Err(e) = kick_evt.next_val().await {
                 error!("Failed to read kick event for in queue: {}", e);
@@ -172,13 +162,7 @@ impl VhostUserDevice for WlBackend {
 
     fn read_config(&self, _offset: u64, _dst: &mut [u8]) {}
 
-    fn start_queue(
-        &mut self,
-        idx: usize,
-        queue: Queue,
-        _mem: GuestMemory,
-        doorbell: Interrupt,
-    ) -> anyhow::Result<()> {
+    fn start_queue(&mut self, idx: usize, queue: Queue, _mem: GuestMemory) -> anyhow::Result<()> {
         if self.workers[idx].is_some() {
             warn!("Starting new queue handler without stopping old handler");
             self.stop_queue(idx)?;
@@ -248,17 +232,12 @@ impl VhostUserDevice for WlBackend {
                             .context("failed to create async WaitContext")
                     })?;
 
-                self.ex.spawn_local(run_in_queue(
-                    queue.clone(),
-                    doorbell,
-                    kick_evt,
-                    wlstate,
-                    wlstate_ctx,
-                ))
+                self.ex
+                    .spawn_local(run_in_queue(queue.clone(), kick_evt, wlstate, wlstate_ctx))
             }
             1 => self
                 .ex
-                .spawn_local(run_out_queue(queue.clone(), doorbell, kick_evt, wlstate)),
+                .spawn_local(run_out_queue(queue.clone(), kick_evt, wlstate)),
             _ => bail!("attempted to start unknown queue: {}", idx),
         };
         self.workers[idx] = Some(WorkerState { queue_task, queue });
@@ -301,6 +280,19 @@ impl VhostUserDevice for WlBackend {
 
         self.backend_req_conn = VhostBackendReqConnectionState::Connected(conn);
     }
+
+    fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
+        // No non-queue workers.
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        bail!("snapshot not implemented for vhost-user wl");
+    }
+
+    fn restore(&mut self, _data: serde_json::Value) -> anyhow::Result<()> {
+        bail!("snapshot not implemented for vhost-user wl");
+    }
 }
 
 pub fn parse_wayland_sock(value: &str) -> Result<(String, PathBuf), String> {
@@ -329,9 +321,18 @@ pub fn parse_wayland_sock(value: &str) -> Result<(String, PathBuf), String> {
 #[argh(subcommand, name = "wl")]
 /// Wayland device
 pub struct Options {
+    #[argh(option, arg_name = "PATH", hidden_help)]
+    /// deprecated - please use --socket-path instead
+    socket: Option<String>,
     #[argh(option, arg_name = "PATH")]
-    /// path to bind a listening vhost-user socket
-    socket: String,
+    /// path to the vhost-user socket to bind to.
+    /// If this flag is set, --fd cannot be specified.
+    socket_path: Option<String>,
+    #[argh(option, arg_name = "FD")]
+    /// file descriptor of a connected vhost-user socket.
+    /// If this flag is set, --socket-path cannot be specified.
+    fd: Option<RawDescriptor>,
+
     #[argh(option, from_str_fn(parse_wayland_sock), arg_name = "PATH[,name=NAME]")]
     /// path to one or more Wayland sockets. The unnamed socket is used for
     /// displaying virtual screens while the named ones are used for IPC
@@ -347,6 +348,8 @@ pub fn run_wl_device(opts: Options) -> anyhow::Result<()> {
     let Options {
         wayland_sock,
         socket,
+        socket_path,
+        fd,
         resource_bridge,
     } = opts;
 
@@ -373,9 +376,9 @@ pub fn run_wl_device(opts: Options) -> anyhow::Result<()> {
 
     let ex = Executor::new().context("failed to create executor")?;
 
-    let listener = VhostUserListener::new_socket(&socket, None)?;
+    let conn = BackendConnection::from_opts(socket.as_deref(), socket_path.as_deref(), fd)?;
 
     let backend = WlBackend::new(&ex, wayland_paths, resource_bridge);
     // run_until() returns an Result<Result<..>> which the ? operator lets us flatten.
-    ex.run_until(listener.run_backend(backend, &ex))?
+    ex.run_until(conn.run_backend(backend, &ex))?
 }

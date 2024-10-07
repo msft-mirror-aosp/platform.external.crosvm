@@ -56,9 +56,27 @@ pub struct MemRegion {
     pub size: u64,
 }
 
+/// Signal to the hypervisor on kernels that support the KVM_CAP_USER_CONFIGURE_NONCOHERENT_DMA (or
+/// equivalent) that during user memory region (memslot) configuration, a guest page's memtype
+/// should be considered in SLAT effective memtype determination rather than implicitly respecting
+/// only the host page's memtype.
+///
+/// This explicit control is needed for Virtio devices (e.g. gpu) that configure memslots for host
+/// WB page mappings with guest WC page mappings. See b/316337317, b/360295883 for more detail.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemCacheType {
+    /// Don't provide any explicit instruction to the hypervisor on how it should determine a
+    /// memslot's effective memtype.
+    ///
+    /// On KVM-VMX (Intel), this means that the memslot is flagged with VMX_EPT_IPAT_BIT such that
+    /// only the host memtype is respected.
     CacheCoherent,
+    /// explicitly instruct the hypervisor to respect the guest page's memtype when determining the
+    /// memslot's effective memtype.
+    ///
+    /// On KVM-VMX (Intel), this means the memslot is NOT flagged with VMX_EPT_IPAT_BIT, and the
+    /// effective memtype will generally decay to the weaker amongst the host/guest memtypes and
+    /// the MTRR for the physical address.
     CacheNonCoherent,
 }
 
@@ -332,7 +350,10 @@ pub trait Vcpu: downcast_rs::DowncastSync {
     /// Once called, it will determine whether a MMIO read or MMIO write was the reason for the MMIO
     /// exit, call `handle_fn` with the respective IoParams to perform the MMIO read or write, and
     /// set the return data in the vcpu so that the vcpu can resume running.
-    fn handle_mmio(&self, handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()>;
+    fn handle_mmio(
+        &self,
+        handle_fn: &mut dyn FnMut(IoParams) -> Result<Option<[u8; 8]>>,
+    ) -> Result<()>;
 
     /// Handles an incoming PIO from the guest.
     ///
@@ -575,7 +596,7 @@ impl ProtectionType {
     }
 
     /// Returns whether the VMM needs to load the pVM firmware.
-    pub fn loads_firmware(&self) -> bool {
+    pub fn needs_firmware_loaded(&self) -> bool {
         matches!(
             self,
             Self::UnprotectedWithFirmware | Self::ProtectedWithCustomFirmware
@@ -584,7 +605,7 @@ impl ProtectionType {
 
     /// Returns whether the VM runs a pVM firmware.
     pub fn runs_firmware(&self) -> bool {
-        self.loads_firmware() || matches!(self, Self::Protected)
+        self.needs_firmware_loaded() || matches!(self, Self::Protected)
     }
 }
 

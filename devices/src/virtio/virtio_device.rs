@@ -28,6 +28,15 @@ pub enum VirtioTransportType {
     Mmio,
 }
 
+/// Type of Virtio device memory mapping to use.
+pub enum SharedMemoryPrepareType {
+    /// On first attempted mapping, the entire SharedMemoryRegion is configured with declared
+    /// MemCacheType.
+    SingleMappingOnFirst(MemCacheType),
+    /// No mapping preparation is performed. each mapping is handled individually
+    DynamicPerMapping,
+}
+
 #[derive(Clone)]
 pub struct SharedMemoryRegion {
     /// The id of the shared memory region. A device may have multiple regions, but each
@@ -196,6 +205,14 @@ pub trait VirtioDevice: Send {
     /// devices can remain backwards compatible with older drivers.
     fn set_shared_memory_region_base(&mut self, _addr: GuestAddress) {}
 
+    /// Queries the implementation whether a single prepared hypervisor memory mapping with explicit
+    /// caching type should be setup lazily on first mapping request, or whether to dynamically
+    /// setup a hypervisor mapping with every request's caching type.
+    fn get_shared_memory_prepare_type(&mut self) -> SharedMemoryPrepareType {
+        // default to lazy-prepare of a single memslot with explicit caching type
+        SharedMemoryPrepareType::SingleMappingOnFirst(MemCacheType::CacheCoherent)
+    }
+
     /// Pause all processing.
     ///
     /// Gives up the queues so that a higher layer can potentially snapshot them. The
@@ -278,6 +295,7 @@ macro_rules! suspendable_virtio_tests {
                 num_queues: usize,
                 queue_size: u16,
                 mem: &GuestMemory,
+                interrupt: Interrupt,
             ) -> BTreeMap<usize, Queue> {
                 let mut queues = BTreeMap::new();
                 for i in 0..num_queues {
@@ -285,7 +303,7 @@ macro_rules! suspendable_virtio_tests {
                     let mut queue = QueueConfig::new(queue_size, 0);
                     queue.set_ready(true);
                     let queue = queue
-                        .activate(mem, Event::new().unwrap())
+                        .activate(mem, base::Event::new().unwrap(), interrupt.clone())
                         .expect("QueueConfig::activate");
                     queues.insert(i, queue);
                 }
@@ -314,6 +332,7 @@ macro_rules! suspendable_virtio_tests {
                         .cloned()
                         .expect("missing queue size"),
                     &mem,
+                    interrupt.clone(),
                 );
                 device
                     .activate(mem.clone(), interrupt.clone(), queues)
@@ -341,6 +360,7 @@ macro_rules! suspendable_virtio_tests {
                         .cloned()
                         .expect("missing queue size"),
                     &mem,
+                    interrupt.clone(),
                 );
                 device
                     .activate(mem.clone(), interrupt.clone(), queues)
@@ -357,7 +377,7 @@ macro_rules! suspendable_virtio_tests {
                 device
                     .virtio_wake(Some((mem.clone(), interrupt.clone(), sleep_result)))
                     .expect("failed to wake");
-                let (_, device) = &mut $dev();
+                let (_ctx2, mut device) = $dev();
                 device
                     .virtio_restore(snap.clone())
                     .expect("failed to restore");

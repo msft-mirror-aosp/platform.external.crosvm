@@ -680,7 +680,7 @@ pub struct UsbDetachCommand {
 }
 
 #[derive(FromArgs)]
-/// Detach usb device
+/// List currently attached USB devices
 #[argh(subcommand, name = "list")]
 pub struct UsbListCommand {
     #[argh(positional, arg_name = "VM_SOCKET")]
@@ -1896,6 +1896,16 @@ pub struct RunCommand {
     ///       calculated from this value and other given parameters.
     ///       The value of `size` must be larger than (4096 *
     ///        blocks_per_group.) (default: 16777216)
+    ///     uid=UID - uid of the mkfs process in the user
+    ///       namespace created by minijail. (default: 0)
+    ///     gid=GID - gid of the mkfs process in the user
+    ///       namespace created by minijail. (default: 0)
+    ///     uidmap=UIDMAP - a uid map in the format
+    ///       "inner outer count[,inner outer count]". This format
+    ///       is same as one for minijail.
+    ///       (default: "0 <current euid> 1")
+    ///     gidmap=GIDMAP - a gid map in the same format as uidmap
+    ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
     #[cfg(feature = "process-invariants")]
@@ -2199,7 +2209,7 @@ pub struct RunCommand {
     ///        feature(default: true). This should be set to false
     ///        in case the when the host not allowing write to
     ///        /proc/<pid>/attr/fscreate, or guest directory does
-    ///        care about the security context.
+    ///        not care about the security context.
     ///     Options uid and gid are useful when the crosvm process
     ///     has no CAP_SETGID/CAP_SETUID but an identity mapping of
     ///     the current user/group between the VM and the host is
@@ -3002,12 +3012,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
         cfg.pstore = cmd.pstore;
 
-        cfg.enable_fw_cfg = if let Some(fw) = cmd.enable_fw_cfg {
-            fw
-        } else {
-            false
-        };
-
+        cfg.enable_fw_cfg = cmd.enable_fw_cfg.unwrap_or_default();
         cfg.fw_cfg_parameters = cmd.fw_cfg;
 
         #[cfg(any(target_os = "android", target_os = "linux"))]

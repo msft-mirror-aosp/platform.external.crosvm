@@ -223,7 +223,6 @@ fn create_virtio_devices(
     #[cfg(feature = "balloon")] balloon_device_tube: Option<Tube>,
     #[cfg(feature = "balloon")] balloon_inflate_tube: Option<Tube>,
     #[cfg(feature = "balloon")] init_balloon_size: u64,
-    #[cfg(feature = "balloon")] dynamic_mapping_device_tube: Option<Tube>,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     pmem_ext2_mem_clients: &mut Vec<VmMemoryClient>,
@@ -630,9 +629,7 @@ fn create_virtio_devices(
     }
 
     #[cfg(feature = "balloon")]
-    if let (Some(balloon_device_tube), Some(dynamic_mapping_device_tube)) =
-        (balloon_device_tube, dynamic_mapping_device_tube)
-    {
+    if let Some(balloon_device_tube) = balloon_device_tube {
         let balloon_features = (cfg.balloon_page_reporting as u64)
             << BalloonFeatures::PageReporting as u64
             | (cfg.balloon_ws_reporting as u64) << BalloonFeatures::WSReporting as u64;
@@ -642,7 +639,6 @@ fn create_virtio_devices(
             balloon_device_tube,
             balloon_inflate_tube,
             init_balloon_size,
-            dynamic_mapping_device_tube,
             balloon_features,
             #[cfg(feature = "registered_events")]
             Some(
@@ -796,7 +792,6 @@ fn create_devices(
     control_tubes: &mut Vec<TaggedControlTube>,
     #[cfg(feature = "balloon")] balloon_device_tube: Option<Tube>,
     #[cfg(feature = "balloon")] init_balloon_size: u64,
-    #[cfg(feature = "balloon")] dynamic_mapping_device_tube: Option<Tube>,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     pmem_ext2_mem_clients: &mut Vec<VmMemoryClient>,
@@ -942,8 +937,6 @@ fn create_devices(
         balloon_inflate_tube,
         #[cfg(feature = "balloon")]
         init_balloon_size,
-        #[cfg(feature = "balloon")]
-        dynamic_mapping_device_tube,
         disk_device_tubes,
         pmem_device_tubes,
         pmem_ext2_mem_clients,
@@ -1848,21 +1841,6 @@ where
         (None, None)
     };
 
-    // The balloon device also needs a tube to communicate back to the main process to
-    // handle remapping memory dynamically.
-    #[cfg(feature = "balloon")]
-    let dynamic_mapping_device_tube = if cfg.balloon {
-        let (dynamic_mapping_host_tube, dynamic_mapping_device_tube) =
-            Tube::pair().context("failed to create tube")?;
-        vm_memory_control_tubes.push(VmMemoryTube {
-            tube: dynamic_mapping_host_tube,
-            expose_with_viommu: false,
-        });
-        Some(dynamic_mapping_device_tube)
-    } else {
-        None
-    };
-
     // Create one control socket per disk.
     let mut disk_device_tubes = Vec::new();
     let mut disk_host_tubes = Vec::new();
@@ -2016,8 +1994,6 @@ where
         balloon_device_tube,
         #[cfg(feature = "balloon")]
         init_balloon_size,
-        #[cfg(feature = "balloon")]
-        dynamic_mapping_device_tube,
         &mut disk_device_tubes,
         &mut pmem_device_tubes,
         &mut pmem_ext2_mem_client,

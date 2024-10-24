@@ -12,6 +12,7 @@
     "audio_aaudio",
     "balloon",
     "config-file",
+    "fs_runtime_ugid_map",
     // TODO: The "protos" crate has been modified such that it doesn't work with cargo. If we fix that,
     // we can remove a some patch files and enable "composite-disk" and "registered_events" here.
     // "composite-disk",
@@ -92,7 +93,6 @@
       "//vendor:__subpackages__"
     ],
     "libbase_rust": [
-      "//packages/modules/Virtualization/android/virtmgr",
       // For QCOM's crosvm fork.
       "//vendor:__subpackages__"
     ],

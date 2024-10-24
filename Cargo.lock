@@ -856,6 +856,7 @@ dependencies = [
  "vhost",
  "vm_control",
  "vm_memory",
+ "vmm_vhost",
  "win_audio",
  "win_util",
  "winapi",
@@ -1086,6 +1087,7 @@ dependencies = [
  "thiserror",
  "uuid",
  "vm_memory",
+ "winapi",
  "zerocopy",
 ]
 
@@ -2257,6 +2259,7 @@ dependencies = [
  "proto_build_tools",
  "protobuf",
  "remain",
+ "system_api",
  "thiserror",
 ]
 

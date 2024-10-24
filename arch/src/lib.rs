@@ -93,6 +93,7 @@ use vm_control::PmResource;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
+use vm_memory::MemoryRegionInformation;
 use vm_memory::MemoryRegionOptions;
 
 cfg_if::cfg_if! {
@@ -359,8 +360,6 @@ pub struct VmComponents {
     pub force_s2idle: bool,
     pub fw_cfg_enable: bool,
     pub fw_cfg_parameters: Vec<FwCfgParameters>,
-    #[cfg(feature = "gdb")]
-    pub gdb: Option<(u32, Tube)>, // port and control tube.
     pub host_cpu_topology: bool,
     pub hugepages: bool,
     pub hv_cfg: hypervisor::Config,
@@ -400,8 +399,6 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub bat_control: Option<BatControl>,
     pub delay_rt: bool,
     pub devices_thread: Option<std::thread::JoinHandle<()>>,
-    #[cfg(feature = "gdb")]
-    pub gdb: Option<(u32, Tube)>,
     pub hotplug_bus: BTreeMap<u8, Arc<Mutex<dyn HotPlugBus>>>,
     pub io_bus: Arc<Bus>,
     pub irq_chip: Box<dyn IrqChipArch>,
@@ -499,6 +496,7 @@ pub trait LinuxArch {
         guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         device_tree_overlays: Vec<DtbOverlay>,
         fdt_position: Option<FdtPosition>,
+        no_pmu: bool,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmArch,
@@ -1308,6 +1306,8 @@ where
 /// * `image` - The file containing the image to be loaded.
 /// * `min_guest_addr` - The minimum address of the start of the image.
 /// * `max_guest_addr` - The address to load the last byte of the image.
+/// * `region_filter` - The optional filter function for determining if the given guest memory
+///   region is suitable for loading the image into it.
 /// * `align` - The minimum alignment of the start address of the image in bytes (must be a power of
 ///   two).
 ///
@@ -1317,6 +1317,7 @@ pub fn load_image_high<F>(
     image: &mut F,
     min_guest_addr: GuestAddress,
     max_guest_addr: GuestAddress,
+    region_filter: Option<fn(&MemoryRegionInformation) -> bool>,
     align: u64,
 ) -> Result<(GuestAddress, usize), LoadImageError>
 where
@@ -1339,7 +1340,10 @@ where
 
     // Sort the list of guest memory regions by address so we can iterate over them in reverse order
     // (high to low).
-    let mut regions: Vec<_> = guest_mem.regions().collect();
+    let mut regions: Vec<_> = guest_mem
+        .regions()
+        .filter(region_filter.unwrap_or(|_| true))
+        .collect();
     regions.sort_unstable_by(|a, b| a.guest_addr.cmp(&b.guest_addr));
 
     // Find the highest valid address inside a guest memory region that satisfies the requested
@@ -1487,6 +1491,7 @@ mod tests {
             &mut test_image,
             GuestAddress(0x8000),
             GuestAddress(0xFFFF_FFFF), // max_guest_addr beyond highest guest memory region
+            None,
             TEST_ALIGN,
         )
         .unwrap();

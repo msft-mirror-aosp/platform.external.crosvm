@@ -227,7 +227,10 @@ pub struct VhostUserFrontendOption {
 #[derive(Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct VhostUserFsOption {
-    pub socket: PathBuf,
+    #[serde(alias = "socket")]
+    pub socket_path: Option<PathBuf>,
+    /// File descriptor of connected socket
+    pub socket_fd: Option<u32>,
     pub tag: Option<String>,
 
     /// Maximum number of entries per queue (default: 32768)
@@ -262,9 +265,10 @@ pub fn parse_vhost_user_fs_option(param: &str) -> Result<VhostUserFsOption, Stri
         );
 
         Ok(VhostUserFsOption {
-            socket,
+            socket_path: Some(socket),
             tag: Some(tag),
             max_queue_size: None,
+            socket_fd: None,
         })
     } else {
         from_key_values::<VhostUserFsOption>(param)
@@ -823,6 +827,7 @@ pub struct Config {
     #[cfg(windows)]
     pub net_vhost_user_tube: Option<Tube>,
     pub no_i8042: bool,
+    pub no_pmu: bool,
     pub no_rtc: bool,
     pub no_smt: bool,
     pub params: Vec<String>,
@@ -1050,6 +1055,7 @@ impl Default for Config {
             #[cfg(windows)]
             net_vhost_user_tube: None,
             no_i8042: false,
+            no_pmu: false,
             no_rtc: false,
             no_smt: false,
             params: Vec::new(),
@@ -2071,9 +2077,11 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, Some("my_tag".to_string()));
         assert_eq!(fs.max_queue_size, None);
+        assert_eq!(fs.socket_fd, None);
     }
 
     #[test]
@@ -2089,7 +2097,31 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
+        assert_eq!(fs.tag, Some("my_tag".to_string()));
+        assert_eq!(fs.max_queue_size, None);
+    }
+
+    #[test]
+    fn parse_vhost_user_fs_explict_socket() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &[
+                    "--vhost-user-fs",
+                    "socket=my_socket,tag=my_tag",
+                    "/dev/null",
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.vhost_user_fs.len(), 1);
+        let fs = &cfg.vhost_user_fs[0];
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, Some("my_tag".to_string()));
         assert_eq!(fs.max_queue_size, None);
     }
@@ -2111,7 +2143,8 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, Some("my_tag".to_string()));
         assert_eq!(fs.max_queue_size, Some(256));
     }
@@ -2129,9 +2162,33 @@ mod tests {
 
         assert_eq!(cfg.vhost_user_fs.len(), 1);
         let fs = &cfg.vhost_user_fs[0];
-        assert_eq!(fs.socket.to_str(), Some("my_socket"));
+        let socket = fs.socket_path.as_ref().unwrap();
+        assert_eq!(socket.to_str(), Some("my_socket"));
         assert_eq!(fs.tag, None);
         assert_eq!(fs.max_queue_size, None);
+    }
+
+    #[test]
+    fn parse_vhost_user_fs_socket_fd() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &[
+                    "--vhost-user-fs",
+                    "tag=my_tag,max-queue-size=256,socket-fd=1234",
+                    "/dev/null",
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.vhost_user_fs.len(), 1);
+        let fs = &cfg.vhost_user_fs[0];
+        assert!(fs.socket_path.is_none());
+        assert_eq!(fs.tag, Some("my_tag".to_string()));
+        assert_eq!(fs.max_queue_size, Some(256));
+        assert_eq!(fs.socket_fd.unwrap(), 1234_u32);
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -9,6 +9,8 @@ use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ffi::CString;
+#[cfg(feature = "fs_runtime_ugid_map")]
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::mem;
@@ -16,6 +18,10 @@ use std::mem::size_of;
 use std::mem::MaybeUninit;
 use std::os::raw::c_int;
 use std::os::raw::c_long;
+#[cfg(feature = "fs_runtime_ugid_map")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(feature = "fs_runtime_ugid_map")]
+use std::path::Path;
 use std::ptr;
 use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
@@ -24,7 +30,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::MutexGuard;
-#[cfg(feature = "arc_quota")]
+#[cfg(feature = "fs_permission_translation")]
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -79,8 +85,6 @@ use crate::virtio::fs::arc_ioctl::FsPathXattrDataBuffer;
 #[cfg(feature = "arc_quota")]
 use crate::virtio::fs::arc_ioctl::FsPermissionDataBuffer;
 #[cfg(feature = "arc_quota")]
-use crate::virtio::fs::arc_ioctl::PermissionData;
-#[cfg(feature = "arc_quota")]
 use crate::virtio::fs::arc_ioctl::XattrData;
 use crate::virtio::fs::caps::Capability;
 use crate::virtio::fs::caps::Caps;
@@ -88,12 +92,13 @@ use crate::virtio::fs::caps::Set as CapSet;
 use crate::virtio::fs::caps::Value as CapValue;
 use crate::virtio::fs::config::CachePolicy;
 use crate::virtio::fs::config::Config;
+#[cfg(feature = "fs_permission_translation")]
+use crate::virtio::fs::config::PermissionData;
 use crate::virtio::fs::expiring_map::ExpiringMap;
 use crate::virtio::fs::multikey::MultikeyBTreeMap;
 use crate::virtio::fs::read_dir::ReadDir;
 
 const EMPTY_CSTR: &[u8] = b"\0";
-const ROOT_CSTR: &[u8] = b"/\0";
 const PROC_CSTR: &[u8] = b"/proc\0";
 const UNLABELED_CSTR: &[u8] = b"unlabeled\0";
 
@@ -663,6 +668,13 @@ impl ExpiringCasefoldLookupCaches {
     }
 }
 
+#[cfg(feature = "fs_permission_translation")]
+impl PermissionData {
+    pub(crate) fn need_set_permission(&self, path: &str) -> bool {
+        path.starts_with(&self.perm_path)
+    }
+}
+
 /// A file system that simply "passes through" all requests it receives to the underlying file
 /// system. To keep the implementation simple it servers the contents of its root directory. Users
 /// that wish to serve only a specific directory should set up the environment so that that
@@ -715,7 +727,7 @@ pub struct PassthroughFs {
     expiring_casefold_lookup_caches: Option<Mutex<ExpiringCasefoldLookupCaches>>,
 
     // paths and coresponding permission setting set by `crosvm_client_fs_permission_set` API
-    #[cfg(feature = "arc_quota")]
+    #[cfg(feature = "fs_permission_translation")]
     permission_paths: RwLock<Vec<PermissionData>>,
 
     // paths and coresponding xattr setting set by `crosvm_client_fs_xattr_set` API
@@ -723,6 +735,16 @@ pub struct PassthroughFs {
     xattr_paths: RwLock<Vec<XattrData>>,
 
     cfg: Config,
+
+    // Set the root directory when pivot root isn't enabled for jailed process.
+    //
+    // virtio-fs typically uses mount namespaces and pivot_root for file system isolation,
+    // making the jailed process's root directory "/".
+    //
+    // However, Android's security model prevents crosvm from having the necessary SYS_ADMIN
+    // capability for mount namespaces and pivot_root. This lack of isolation means that
+    // root_dir defaults to the path provided via "--shared-dir".
+    root_dir: String,
 }
 
 impl std::fmt::Debug for PassthroughFs {
@@ -780,7 +802,8 @@ impl PassthroughFs {
             None
         };
 
-        let passthroughfs = PassthroughFs {
+        #[allow(unused_mut)]
+        let mut passthroughfs = PassthroughFs {
             process_lock: Mutex::new(()),
             tag: tag.to_string(),
             inodes: Mutex::new(MultikeyBTreeMap::new()),
@@ -800,12 +823,16 @@ impl PassthroughFs {
             #[cfg(feature = "arc_quota")]
             dbus_fd,
             expiring_casefold_lookup_caches,
-            #[cfg(feature = "arc_quota")]
+            #[cfg(feature = "fs_permission_translation")]
             permission_paths: RwLock::new(Vec::new()),
             #[cfg(feature = "arc_quota")]
             xattr_paths: RwLock::new(Vec::new()),
             cfg,
+            root_dir: "/".to_string(),
         };
+
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        passthroughfs.set_permission_path();
 
         cros_tracing::trace_simple_print!(
             VirtioFs,
@@ -813,6 +840,32 @@ impl PassthroughFs {
             passthroughfs
         );
         Ok(passthroughfs)
+    }
+
+    #[cfg(feature = "fs_runtime_ugid_map")]
+    fn set_permission_path(&mut self) {
+        if !self.cfg.ugid_map.is_empty() {
+            let mut write_lock = self
+                .permission_paths
+                .write()
+                .expect("Failed to acquire write lock on permission_paths");
+            *write_lock = self.cfg.ugid_map.clone();
+        }
+    }
+
+    #[cfg(feature = "fs_runtime_ugid_map")]
+    pub fn set_root_dir(&mut self, shared_dir: String) -> io::Result<()> {
+        let canonicalized_root = match std::fs::canonicalize(shared_dir) {
+            Ok(path) => path,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Failed to canonicalize root_dir: {}", e),
+                ));
+            }
+        };
+        self.root_dir = canonicalized_root.to_string_lossy().to_string();
+        Ok(())
     }
 
     pub fn cfg(&self) -> &Config {
@@ -926,13 +979,15 @@ impl PassthroughFs {
     fn add_entry(
         &self,
         f: File,
-        #[cfg(feature = "arc_quota")] mut st: libc::stat64,
-        #[cfg(not(feature = "arc_quota"))] st: libc::stat64,
+        #[cfg_attr(not(feature = "fs_permission_translation"), allow(unused_mut))]
+        mut st: libc::stat64,
         open_flags: libc::c_int,
         path: String,
     ) -> Entry {
         #[cfg(feature = "arc_quota")]
         self.set_permission(&mut st, &path);
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        self.set_ugid_permission(&mut st, &path);
         let mut inodes = self.inodes.lock();
 
         let altkey = InodeAltKey {
@@ -1008,10 +1063,8 @@ impl PassthroughFs {
     }
 
     fn do_lookup(&self, parent: &InodeData, name: &CStr) -> io::Result<Entry> {
-        #[cfg(feature = "arc_quota")]
+        #[cfg_attr(not(feature = "fs_permission_translation"), allow(unused_mut))]
         let mut st = statat(parent, name)?;
-        #[cfg(not(feature = "arc_quota"))]
-        let st = statat(parent, name)?;
 
         let altkey = InodeAltKey {
             ino: st.st_ino,
@@ -1029,6 +1082,8 @@ impl PassthroughFs {
             // Return the same inode with the reference counter increased.
             #[cfg(feature = "arc_quota")]
             self.set_permission(&mut st, &path);
+            #[cfg(feature = "fs_runtime_ugid_map")]
+            self.set_ugid_permission(&mut st, &path);
             return Ok(Entry {
                 inode: self.increase_inode_refcount(data),
                 generation: 0,
@@ -1189,12 +1244,13 @@ impl PassthroughFs {
     }
 
     fn do_getattr(&self, inode: &InodeData) -> io::Result<(libc::stat64, Duration)> {
-        #[cfg(feature = "arc_quota")]
+        #[allow(unused_mut)]
         let mut st = stat(inode)?;
+
         #[cfg(feature = "arc_quota")]
         self.set_permission(&mut st, &inode.path);
-        #[cfg(not(feature = "arc_quota"))]
-        let st = stat(inode)?;
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        self.set_ugid_permission(&mut st, &inode.path);
         Ok((st, self.cfg.timeout))
     }
 
@@ -1677,6 +1733,103 @@ impl PassthroughFs {
     }
 }
 
+#[cfg(feature = "fs_runtime_ugid_map")]
+impl PassthroughFs {
+    fn find_and_set_ugid_permission(
+        &self,
+        st: &mut libc::stat64,
+        path: &str,
+        is_root_path: bool,
+    ) -> bool {
+        for perm_data in self
+            .permission_paths
+            .read()
+            .expect("acquire permission_paths read lock")
+            .iter()
+        {
+            if (is_root_path && perm_data.perm_path == "/")
+                || (!is_root_path
+                    && perm_data.perm_path != "/"
+                    && perm_data.need_set_permission(path))
+            {
+                self.set_permission_from_data(st, perm_data);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn set_permission_from_data(&self, st: &mut libc::stat64, perm_data: &PermissionData) {
+        st.st_uid = perm_data.guest_uid;
+        st.st_gid = perm_data.guest_gid;
+        st.st_mode = (st.st_mode & libc::S_IFMT) | (0o777 & !perm_data.umask);
+    }
+
+    /// Set permission according to path
+    fn set_ugid_permission(&self, st: &mut libc::stat64, path: &str) {
+        let is_root_path = path.is_empty();
+
+        if self.find_and_set_ugid_permission(st, path, is_root_path) {
+            return;
+        }
+
+        if let Some(perm_data) = self
+            .permission_paths
+            .read()
+            .expect("acquire permission_paths read lock")
+            .iter()
+            .find(|pd| pd.perm_path == "/")
+        {
+            self.set_permission_from_data(st, perm_data);
+        }
+    }
+
+    /// Set host uid/gid to configured value according to path
+    fn change_ugid_creds(&self, ctx: &Context, parent_data: &InodeData, name: &CStr) -> (u32, u32) {
+        let path = format!(
+            "{}/{}",
+            parent_data.path.clone(),
+            name.to_str().unwrap_or("<non UTF-8 str>")
+        );
+
+        let is_root_path = path.is_empty();
+
+        if self.find_ugid_creds_for_path(&path, is_root_path).is_some() {
+            return self.find_ugid_creds_for_path(&path, is_root_path).unwrap();
+        }
+
+        if let Some(perm_data) = self
+            .permission_paths
+            .read()
+            .expect("acquire permission_paths read lock")
+            .iter()
+            .find(|pd| pd.perm_path == "/")
+        {
+            return (perm_data.host_uid, perm_data.host_gid);
+        }
+
+        (ctx.uid, ctx.gid)
+    }
+
+    fn find_ugid_creds_for_path(&self, path: &str, is_root_path: bool) -> Option<(u32, u32)> {
+        for perm_data in self
+            .permission_paths
+            .read()
+            .expect("acquire permission_paths read lock")
+            .iter()
+        {
+            if (is_root_path && perm_data.perm_path == "/")
+                || (!is_root_path
+                    && perm_data.perm_path != "/"
+                    && perm_data.need_set_permission(path))
+            {
+                return Some((perm_data.host_uid, perm_data.host_gid));
+            }
+        }
+        None
+    }
+}
+
 #[cfg(feature = "arc_quota")]
 impl PassthroughFs {
     /// Convert u8 slice to string
@@ -1976,9 +2129,10 @@ impl FileSystem for PassthroughFs {
     type DirIter = ReadDir<Box<[u8]>>;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        // SAFETY: this is a constant value that is a nul-terminated string without interior
-        // nul bytes.
-        let root = unsafe { CStr::from_bytes_with_nul_unchecked(ROOT_CSTR) };
+        let mut root_str_with_null: Vec<u8> = self.root_dir.clone().into_bytes();
+        root_str_with_null.push(0u8);
+        // SAFETY: this is a nul-terminated string without interior nul bytes.
+        let root = unsafe { CStr::from_bytes_with_nul_unchecked(&root_str_with_null) };
 
         let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // SAFETY: this doesn't modify any memory and we check the return value.
@@ -2160,9 +2314,12 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
+        #[allow(unused_variables)]
         #[cfg(feature = "arc_quota")]
         let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(not(feature = "arc_quota"))]
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
+        #[cfg(not(feature = "fs_permission_translation"))]
         let (uid, gid) = (ctx.uid, ctx.gid);
 
         let (_uid, _gid) = set_creds(uid, gid)?;
@@ -2277,10 +2434,14 @@ impl FileSystem for PassthroughFs {
         // SAFETY: This string is nul-terminated and does not contain any interior nul bytes
         let current_dir = unsafe { CStr::from_bytes_with_nul_unchecked(b".\0") };
 
+        #[allow(unused_variables)]
         #[cfg(feature = "arc_quota")]
         let (uid, gid) = self.change_creds(&ctx, &data, current_dir);
-        #[cfg(not(feature = "arc_quota"))]
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        let (uid, gid) = self.change_ugid_creds(&ctx, &data, current_dir);
+        #[cfg(not(feature = "fs_permission_translation"))]
         let (uid, gid) = (ctx.uid, ctx.gid);
+
         let (_uid, _gid) = set_creds(uid, gid)?;
 
         let fd = {
@@ -2336,10 +2497,14 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
+        #[allow(unused_variables)]
         #[cfg(feature = "arc_quota")]
         let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(not(feature = "arc_quota"))]
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
+        #[cfg(not(feature = "fs_permission_translation"))]
         let (uid, gid) = (ctx.uid, ctx.gid);
+
         let (_uid, _gid) = set_creds(uid, gid)?;
 
         let flags = self.update_open_flags(flags as i32);
@@ -2384,10 +2549,9 @@ impl FileSystem for PassthroughFs {
                 entry.inode,
                 flags as u32 & !((libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY) as u32),
             )
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 // Don't leak the entry.
                 self.forget(ctx, entry.inode, 1);
-                e
             })?
         };
         Ok((entry, handle, opts))
@@ -2705,10 +2869,14 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
+        #[allow(unused_variables)]
         #[cfg(feature = "arc_quota")]
         let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(not(feature = "arc_quota"))]
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
+        #[cfg(not(feature = "fs_permission_translation"))]
         let (uid, gid) = (ctx.uid, ctx.gid);
+
         let (_uid, _gid) = set_creds(uid, gid)?;
         {
             let _scoped_umask = ScopedUmask::new(umask);
@@ -2781,10 +2949,14 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
+        #[allow(unused_variables)]
         #[cfg(feature = "arc_quota")]
         let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(not(feature = "arc_quota"))]
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
+        #[cfg(not(feature = "fs_permission_translation"))]
         let (uid, gid) = (ctx.uid, ctx.gid);
+
         let (_uid, _gid) = set_creds(uid, gid)?;
         {
             let casefold_cache = self.lock_casefold_lookup_caches();
@@ -2821,6 +2993,17 @@ impl FileSystem for PassthroughFs {
         })?;
 
         buf.resize(res as usize, 0);
+
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        {
+            let link_target = Path::new(OsStr::from_bytes(&buf[..res as usize]));
+            if !link_target.starts_with(&self.root_dir) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Symbolic link points outside of root_dir",
+                ));
+            }
+        }
         Ok(buf)
     }
 
@@ -3407,10 +3590,14 @@ impl FileSystem for PassthroughFs {
         // Perform lookup but not create negative dentry
         let data = self.find_inode(parent)?;
 
+        #[allow(unused_variables)]
         #[cfg(feature = "arc_quota")]
         let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(not(feature = "arc_quota"))]
+        #[cfg(feature = "fs_runtime_ugid_map")]
+        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
+        #[cfg(not(feature = "fs_permission_translation"))]
         let (uid, gid) = (ctx.uid, ctx.gid);
+
         let (_uid, _gid) = set_creds(uid, gid)?;
 
         // This lookup serves two purposes:

@@ -18,6 +18,10 @@ pub mod gpu;
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use base::linux::MemoryMappingBuilderUnix;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use base::sys::call_with_extended_max_files;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use base::MemoryMappingArena;
 #[cfg(windows)]
 use base::MemoryMappingBuilderWindows;
 use hypervisor::BalloonEvent;
@@ -548,11 +552,25 @@ pub struct IoEventUpdateRequest {
     pub register: bool,
 }
 
+/// Request to mmap a file to a shared memory.
+/// This request is supposed to follow a `VmMemoryRequest::MmapAndRegisterMemory` request that
+/// contains `SharedMemory` that `file` is mmaped to.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[derive(Serialize, Deserialize)]
+pub struct VmMemoryFileMapping {
+    #[serde(with = "with_as_descriptor")]
+    pub file: File,
+    pub length: usize,
+    pub mem_offset: usize,
+    pub file_offset: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum VmMemoryRequest {
     /// Prepare a shared memory region to make later operations more efficient. This
     /// may be a no-op depending on underlying platform support.
     PrepareSharedMemoryRegion { alloc: Alloc, cache: MemCacheType },
+    /// Register a memory to be mapped to the guest.
     RegisterMemory {
         /// Source of the memory to register (mapped file descriptor, shared memory region, etc.)
         source: VmMemorySource,
@@ -562,6 +580,18 @@ pub enum VmMemoryRequest {
         prot: Protection,
         /// Cache attribute for guest memory setting
         cache: MemCacheType,
+    },
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    /// Call mmap to `shm` and register the memory region as a read-only guest memory.
+    /// This request is followed by an array of `VmMemoryFileMapping` with length
+    /// `num_file_mappings`
+    MmapAndRegisterMemory {
+        /// Source of the memory to register (mapped file descriptor, shared memory region, etc.)
+        shm: SharedMemory,
+        /// Where to map the memory in the guest.
+        dest: VmMemoryDestination,
+        /// Length of the array of `VmMemoryFileMapping` that follows.
+        num_file_mappings: usize,
     },
     /// Call hypervisor to free the given memory range.
     DynamicallyFreeMemoryRange {
@@ -678,16 +708,20 @@ fn try_map_to_prepared_region(
     }
 
     let gfn = gfn + (dest_offset >> 12);
-    let memory_region_id = VmMemoryRegionId(gfn);
+    let region_id = VmMemoryRegionId(gfn);
     region_state.registered_memory.insert(
-        memory_region_id,
+        region_id,
         RegisteredMemory::FixedMapping {
             slot: *slot,
             offset: *dest_offset as usize,
             size,
         },
     );
-    Some(VmMemoryResponse::RegisterMemory(memory_region_id))
+
+    Some(VmMemoryResponse::RegisterMemory {
+        region_id,
+        slot: *slot,
+    })
 }
 
 impl VmMemoryRequest {
@@ -702,6 +736,7 @@ impl VmMemoryRequest {
     /// that received this `VmMemoryResponse`.
     pub fn execute(
         self,
+        #[cfg(any(target_os = "android", target_os = "linux"))] tube: &Tube,
         vm: &mut impl Vm,
         sys_allocator: &mut SystemAllocator,
         gralloc: &mut RutabagaGralloc,
@@ -793,7 +828,104 @@ impl VmMemoryRequest {
                 region_state
                     .registered_memory
                     .insert(region_id, RegisteredMemory::DynamicMapping { slot });
-                VmMemoryResponse::RegisterMemory(region_id)
+                VmMemoryResponse::RegisterMemory { region_id, slot }
+            }
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            MmapAndRegisterMemory {
+                shm,
+                dest,
+                num_file_mappings,
+            } => {
+                // Define a callback to be executed with extended limit of file counts.
+                // It recieves `num_file_mappings` FDs and call `add_fd_mapping` for each.
+                let callback = || {
+                    let mem = match MemoryMappingBuilder::new(shm.size() as usize)
+                        .from_shared_memory(&shm)
+                        .build()
+                    {
+                        Ok(mem) => mem,
+                        Err(e) => {
+                            error!("Failed to build MemoryMapping from shared memory: {:#}", e);
+                            return Err(VmMemoryResponse::Err(SysError::new(EINVAL)));
+                        }
+                    };
+                    let mut mmap_arena = MemoryMappingArena::from(mem);
+
+                    // If `num_file_mappings` exceeds `SCM_MAX_FD`, `file_mappings` are sent in
+                    // chunks of length `SCM_MAX_FD`.
+                    let mut file_mappings = Vec::with_capacity(num_file_mappings);
+                    let mut read = 0;
+                    while read < num_file_mappings {
+                        let len = std::cmp::min(num_file_mappings - read, base::unix::SCM_MAX_FD);
+                        let mps: Vec<VmMemoryFileMapping> = match tube.recv_with_max_fds(len) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                error!(
+                                    "Failed to get {num_file_mappings} FDs to be mapped: {:#}",
+                                    e
+                                );
+                                return Err(VmMemoryResponse::Err(SysError::new(EINVAL)));
+                            }
+                        };
+                        file_mappings.extend(mps.into_iter());
+                        read += len;
+                    }
+
+                    for VmMemoryFileMapping {
+                        mem_offset,
+                        length,
+                        file,
+                        file_offset,
+                    } in file_mappings
+                    {
+                        if let Err(e) = mmap_arena.add_fd_mapping(
+                            mem_offset,
+                            length,
+                            &file,
+                            file_offset,
+                            Protection::read(),
+                        ) {
+                            error!("Failed to add fd mapping: {:#}", e);
+                            return Err(VmMemoryResponse::Err(SysError::new(EINVAL)));
+                        }
+                    }
+                    Ok(mmap_arena)
+                };
+                let mmap_arena = match call_with_extended_max_files(callback) {
+                    Ok(Ok(m)) => m,
+                    Ok(Err(e)) => {
+                        return e;
+                    }
+                    Err(e) => {
+                        error!("Failed to set max count of file descriptors: {e}");
+                        return VmMemoryResponse::Err(e);
+                    }
+                };
+
+                let size = shm.size();
+                let guest_addr = match dest.allocate(sys_allocator, size) {
+                    Ok(addr) => addr,
+                    Err(e) => return VmMemoryResponse::Err(e),
+                };
+
+                let slot = match vm.add_memory_region(
+                    guest_addr,
+                    Box::new(mmap_arena),
+                    true,
+                    false,
+                    MemCacheType::CacheCoherent,
+                ) {
+                    Ok(slot) => slot,
+                    Err(e) => return VmMemoryResponse::Err(e),
+                };
+
+                let region_id = VmMemoryRegionId(guest_addr.0 >> 12);
+
+                region_state
+                    .registered_memory
+                    .insert(region_id, RegisteredMemory::DynamicMapping { slot });
+
+                VmMemoryResponse::RegisterMemory { region_id, slot }
             }
             UnregisterMemory(id) => match region_state.registered_memory.remove(&id) {
                 Some(RegisteredMemory::DynamicMapping { slot }) => match vm
@@ -923,7 +1055,10 @@ pub struct VmMemoryRegionId(u64);
 #[derive(Serialize, Deserialize, Debug)]
 pub enum VmMemoryResponse {
     /// The request to register memory into guest address space was successful.
-    RegisterMemory(VmMemoryRegionId),
+    RegisterMemory {
+        region_id: VmMemoryRegionId,
+        slot: u32,
+    },
     Ok,
     Err(SysError),
 }
@@ -1642,7 +1777,6 @@ impl VmRequest {
     pub fn execute(
         &self,
         vm: &impl Vm,
-        run_mode: &mut Option<VmRunMode>,
         disk_host_tubes: &[Tube],
         pm: &mut Option<Arc<Mutex<dyn PmResource + Send>>>,
         gpu_control_tube: Option<&Tube>,
@@ -1659,8 +1793,7 @@ impl VmRequest {
     ) -> VmResponse {
         match self {
             VmRequest::Exit => {
-                *run_mode = Some(VmRunMode::Exiting);
-                VmResponse::Ok
+                panic!("VmRequest::Exit should be handled by the platform run loop");
             }
             VmRequest::Powerbtn => {
                 if let Some(pm) = pm {
@@ -1684,8 +1817,8 @@ impl VmRequest {
                 if let Some(pm) = pm.as_ref() {
                     match clear_evt.try_clone() {
                         Ok(clear_evt) => {
+                            // RTC event will asynchronously trigger wakeup.
                             pm.lock().rtc_evt(clear_evt);
-                            *run_mode = Some(VmRunMode::Running);
                             VmResponse::Ok
                         }
                         Err(err) => {
@@ -1699,7 +1832,20 @@ impl VmRequest {
                 }
             }
             VmRequest::SuspendVcpus => {
-                *run_mode = Some(VmRunMode::Suspending);
+                if !force_s2idle {
+                    kick_vcpus(VcpuControl::RunState(VmRunMode::Suspending));
+                    let current_mode = match get_vcpu_state(kick_vcpus, vcpu_size) {
+                        Ok(state) => state,
+                        Err(e) => {
+                            error!("failed to get vcpu state: {e}");
+                            return VmResponse::Err(SysError::new(EIO));
+                        }
+                    };
+                    if current_mode != VmRunMode::Suspending {
+                        error!("vCPUs failed to all suspend.");
+                        return VmResponse::Err(SysError::new(EIO));
+                    }
+                }
                 VmResponse::Ok
             }
             VmRequest::ResumeVcpus => {
@@ -1722,7 +1868,6 @@ impl VmRequest {
                     error!("Trying to wake Vcpus while Devices are asleep. Did you mean to use `crosvm resume --full`?");
                     return VmResponse::Err(SysError::new(EINVAL));
                 }
-                *run_mode = Some(VmRunMode::Running);
 
                 if force_s2idle {
                     // During resume also emulate powerbtn event which will allow to wakeup fully
@@ -1734,6 +1879,8 @@ impl VmRequest {
                         return VmResponse::Err(SysError::new(ENOTSUP));
                     }
                 }
+
+                kick_vcpus(VcpuControl::RunState(VmRunMode::Running));
                 VmResponse::Ok
             }
             VmRequest::Swap(SwapCommand::Enable) => {

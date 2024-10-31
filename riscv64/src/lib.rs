@@ -198,6 +198,7 @@ impl arch::LinuxArch for Riscv64 {
         _guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         device_tree_overlays: Vec<DtbOverlay>,
         fdt_position: Option<FdtPosition>,
+        _no_pmu: bool,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmRiscv64,
@@ -391,7 +392,9 @@ impl arch::LinuxArch for Riscv64 {
             fdt_offset,
             aia_num_ids,
             aia_num_sources,
-            cmdline.as_str(),
+            cmdline
+                .as_str_with_max_len(RISCV64_CMDLINE_MAX_SIZE - 1)
+                .map_err(Error::Cmdline)?,
             initrd,
             timebase_freq,
             device_tree_overlays,
@@ -422,8 +425,6 @@ impl arch::LinuxArch for Riscv64 {
             delay_rt: components.delay_rt,
             suspend_tube: (Arc::new(Mutex::new(suspend_tube_send)), suspend_tube_recv),
             bat_control: None,
-            #[cfg(feature = "gdb")]
-            gdb: components.gdb,
             pm: None,
             devices_thread: None,
             vm_request_tubes: Vec::new(),
@@ -548,7 +549,7 @@ fn get_high_mmio_base_size(mem_size: u64, guest_phys_addr_bits: u8) -> (u64, u64
 }
 
 fn get_base_linux_cmdline() -> kernel_cmdline::Cmdline {
-    let mut cmdline = kernel_cmdline::Cmdline::new(RISCV64_CMDLINE_MAX_SIZE);
+    let mut cmdline = kernel_cmdline::Cmdline::new();
     cmdline.insert_str("panic=-1").unwrap();
     cmdline
 }

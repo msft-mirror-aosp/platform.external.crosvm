@@ -43,6 +43,8 @@ use devices::PciRootCommand;
 use devices::Serial;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::VirtCpufreq;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use devices::VirtCpufreqV2;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
 #[cfg(feature = "gdb")]
@@ -207,6 +209,7 @@ const AARCH64_IRQ_BASE: u32 = 4;
 const AARCH64_VIRTFREQ_BASE: u64 = 0x1040000;
 const AARCH64_VIRTFREQ_SIZE: u64 = 0x8;
 const AARCH64_VIRTFREQ_MAXSIZE: u64 = 0x10000;
+const AARCH64_VIRTFREQ_V2_SIZE: u64 = 0x1000;
 
 // PMU PPI interrupt, same as qemu
 const AARCH64_PMU_IRQ: u32 = 7;
@@ -363,6 +366,18 @@ fn get_vcpu_mpidr_aff<Vcpu: VcpuAArch64>(vcpus: &[Vcpu], index: usize) -> Option
     Some(vcpus.get(index)?.get_mpidr().ok()? & MPIDR_AFF_MASK)
 }
 
+fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?Sized)) -> u64 {
+    // Static swiotlb is allocated from the end of RAM as a separate memory region, so, if
+    // enabled, make the RAM memory region smaller to leave room for it.
+    let mut main_memory_size = components.memory_size;
+    if let Some(size) = components.swiotlb {
+        if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
+            main_memory_size -= size;
+        }
+    }
+    main_memory_size
+}
+
 impl arch::LinuxArch for AArch64 {
     type Error = Error;
 
@@ -372,14 +387,7 @@ impl arch::LinuxArch for AArch64 {
         components: &VmComponents,
         hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
-        // Static swiotlb is allocated from the end of RAM as a separate memory region, so, if
-        // enabled, make the RAM memory region smaller to leave room for it.
-        let mut main_memory_size = components.memory_size;
-        if let Some(size) = components.swiotlb {
-            if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
-                main_memory_size -= size;
-            }
-        }
+        let main_memory_size = main_memory_size(components, hypervisor);
 
         let mut memory_regions = vec![(
             GuestAddress(AARCH64_PHYS_MEM_START),
@@ -434,6 +442,7 @@ impl arch::LinuxArch for AArch64 {
         _guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
         device_tree_overlays: Vec<DtbOverlay>,
         fdt_position: Option<FdtPosition>,
+        no_pmu: bool,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmAArch64,
@@ -441,6 +450,8 @@ impl arch::LinuxArch for AArch64 {
     {
         let has_bios = matches!(components.vm_image, VmImage::Bios(_));
         let mem = vm.get_memory().clone();
+
+        let main_memory_size = main_memory_size(&components, vm.get_hypervisor());
 
         let fdt_position = fdt_position.unwrap_or(if has_bios {
             FdtPosition::Start
@@ -481,7 +492,7 @@ impl arch::LinuxArch for AArch64 {
                         let initrd_addr =
                             (kernel_end + (AARCH64_INITRD_ALIGN - 1)) & !(AARCH64_INITRD_ALIGN - 1);
                         let initrd_max_size =
-                            components.memory_size - (initrd_addr - AARCH64_PHYS_MEM_START);
+                            main_memory_size - (initrd_addr - AARCH64_PHYS_MEM_START);
                         let initrd_addr = GuestAddress(initrd_addr);
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
@@ -497,7 +508,7 @@ impl arch::LinuxArch for AArch64 {
             }
         };
 
-        let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + components.memory_size);
+        let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + main_memory_size);
 
         let fdt_address = match fdt_position {
             FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START),
@@ -517,6 +528,7 @@ impl arch::LinuxArch for AArch64 {
         let mut use_pmu = vm
             .get_hypervisor()
             .check_capability(HypervisorCap::ArmPmuV3);
+        use_pmu &= !no_pmu;
         let vcpu_count = components.vcpu_count;
         let mut has_pvtime = true;
         let mut vcpus = Vec::with_capacity(vcpu_count);
@@ -705,31 +717,47 @@ impl arch::LinuxArch for AArch64 {
                     None => panic!("vcpu_affinity needs to be set for VirtCpufreq"),
                 };
 
-                let virt_cpufreq = Arc::new(Mutex::new(VirtCpufreq::new(
-                    vcpu_affinity[0].try_into().unwrap(),
-                    *components.normalized_cpu_capacities.get(&vcpu).unwrap(),
-                    *components
-                        .cpu_frequencies
-                        .get(&vcpu)
-                        .unwrap()
-                        .iter()
-                        .max()
-                        .unwrap(),
-                )));
-
-                if vcpu as u64 * AARCH64_VIRTFREQ_SIZE + AARCH64_VIRTFREQ_SIZE
-                    > AARCH64_VIRTFREQ_MAXSIZE
-                {
-                    panic!("Exceeded maximum number of virt cpufreq devices");
+                let mut virtfreq_size = AARCH64_VIRTFREQ_SIZE;
+                if components.virt_cpufreq_v2 {
+                    virtfreq_size = AARCH64_VIRTFREQ_V2_SIZE;
+                    let virt_cpufreq = Arc::new(Mutex::new(VirtCpufreqV2::new(
+                        vcpu_affinity[0].try_into().unwrap(),
+                        components.cpu_frequencies.clone(),
+                        components.vcpu_domain_paths.get(&vcpu).cloned(),
+                        *components.vcpu_domains.get(&vcpu).unwrap_or(&(vcpu as u32)),
+                        *components.normalized_cpu_capacities.get(&vcpu).unwrap(),
+                    )));
+                    mmio_bus
+                        .insert(
+                            virt_cpufreq,
+                            AARCH64_VIRTFREQ_BASE + (vcpu as u64 * virtfreq_size),
+                            virtfreq_size,
+                        )
+                        .map_err(Error::RegisterVirtCpufreq)?;
+                } else {
+                    let virt_cpufreq = Arc::new(Mutex::new(VirtCpufreq::new(
+                        vcpu_affinity[0].try_into().unwrap(),
+                        *components.normalized_cpu_capacities.get(&vcpu).unwrap(),
+                        *components
+                            .cpu_frequencies
+                            .get(&vcpu)
+                            .unwrap()
+                            .iter()
+                            .max()
+                            .unwrap(),
+                    )));
+                    mmio_bus
+                        .insert(
+                            virt_cpufreq,
+                            AARCH64_VIRTFREQ_BASE + (vcpu as u64 * virtfreq_size),
+                            virtfreq_size,
+                        )
+                        .map_err(Error::RegisterVirtCpufreq)?;
                 }
 
-                mmio_bus
-                    .insert(
-                        virt_cpufreq,
-                        AARCH64_VIRTFREQ_BASE + (vcpu as u64 * AARCH64_VIRTFREQ_SIZE),
-                        AARCH64_VIRTFREQ_SIZE,
-                    )
-                    .map_err(Error::RegisterVirtCpufreq)?;
+                if vcpu as u64 * AARCH64_VIRTFREQ_SIZE + virtfreq_size > AARCH64_VIRTFREQ_MAXSIZE {
+                    panic!("Exceeded maximum number of virt cpufreq devices");
+                }
             }
         }
 
@@ -815,7 +843,9 @@ impl arch::LinuxArch for AArch64 {
             components.cpu_capacity,
             components.cpu_frequencies,
             fdt_address,
-            cmdline.as_str(),
+            cmdline
+                .as_str_with_max_len(AARCH64_CMDLINE_MAX_SIZE - 1)
+                .map_err(Error::Cmdline)?,
             (payload.entry(), payload.size() as usize),
             initrd,
             components.android_fstab,
@@ -835,6 +865,7 @@ impl arch::LinuxArch for AArch64 {
             components.dynamic_power_coefficient,
             device_tree_overlays,
             &serial_devices,
+            components.virt_cpufreq_v2,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -862,8 +893,6 @@ impl arch::LinuxArch for AArch64 {
             rt_cpus: components.rt_cpus,
             delay_rt: components.delay_rt,
             bat_control,
-            #[cfg(feature = "gdb")]
-            gdb: components.gdb,
             pm: None,
             resume_notify_devices: Vec::new(),
             root_config: pci_root,
@@ -1160,7 +1189,7 @@ impl<T: VcpuAArch64> arch::GdbOps<T> for AArch64 {
 impl AArch64 {
     /// This returns a base part of the kernel command for this architecture
     fn get_base_linux_cmdline() -> kernel_cmdline::Cmdline {
-        let mut cmdline = kernel_cmdline::Cmdline::new(AARCH64_CMDLINE_MAX_SIZE);
+        let mut cmdline = kernel_cmdline::Cmdline::new();
         cmdline.insert_str("panic=-1").unwrap();
         cmdline
     }

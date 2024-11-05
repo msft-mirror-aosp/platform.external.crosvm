@@ -141,6 +141,9 @@ pub struct CpuOptions {
     /// Select which CPU to boot from.
     #[serde(default)]
     pub boot_cpu: Option<usize>,
+    /// Vector of CPU ids to be grouped into the same freq domain.
+    #[serde(default)]
+    pub freq_domains: Vec<CpuSet>,
 }
 
 /// Device tree overlay configuration.
@@ -753,6 +756,7 @@ pub struct Config {
     pub core_scheduling: bool,
     pub cpu_capacity: BTreeMap<usize, u32>, // CPU index -> capacity
     pub cpu_clusters: Vec<CpuSet>,
+    pub cpu_freq_domains: Vec<CpuSet>,
     #[cfg(all(
         any(target_arch = "arm", target_arch = "aarch64"),
         any(target_os = "android", target_os = "linux")
@@ -822,11 +826,13 @@ pub struct Config {
     pub mmio_address_ranges: Vec<AddressRange>,
     #[cfg(target_arch = "aarch64")]
     pub mte: bool,
+    pub name: Option<String>,
     #[cfg(feature = "net")]
     pub net: Vec<NetParameters>,
     #[cfg(windows)]
     pub net_vhost_user_tube: Option<Tube>,
     pub no_i8042: bool,
+    pub no_pmu: bool,
     pub no_rtc: bool,
     pub no_smt: bool,
     pub params: Vec<String>,
@@ -918,6 +924,7 @@ pub struct Config {
         any(target_os = "android", target_os = "linux")
     ))]
     pub virt_cpufreq: bool,
+    pub virt_cpufreq_v2: bool,
     pub virtio_input: Vec<InputDeviceOption>,
     #[cfg(feature = "audio")]
     #[serde(skip)]
@@ -979,6 +986,7 @@ impl Default for Config {
                 any(target_os = "android", target_os = "linux")
             ))]
             cpu_frequencies_khz: BTreeMap::new(),
+            cpu_freq_domains: Vec::new(),
             delay_rt: false,
             device_tree_overlay: Vec::new(),
             disks: Vec::new(),
@@ -1049,11 +1057,13 @@ impl Default for Config {
             mmio_address_ranges: Vec::new(),
             #[cfg(target_arch = "aarch64")]
             mte: false,
+            name: None,
             #[cfg(feature = "net")]
             net: Vec::new(),
             #[cfg(windows)]
             net_vhost_user_tube: None,
             no_i8042: false,
+            no_pmu: false,
             no_rtc: false,
             no_smt: false,
             params: Vec::new(),
@@ -1139,6 +1149,7 @@ impl Default for Config {
                 any(target_os = "android", target_os = "linux")
             ))]
             virt_cpufreq: false,
+            virt_cpufreq_v2: false,
             virtio_input: Vec::new(),
             #[cfg(feature = "audio")]
             virtio_snds: Vec::new(),

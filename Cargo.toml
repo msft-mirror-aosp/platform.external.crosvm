@@ -139,6 +139,10 @@ balloon = ["devices/balloon", "vm_control/balloon"]
 ## concatenate large file system images into a single disk image.
 composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
 
+## Enables virtiofs uid-gid mapping from the host side through command line when user-namespace
+## isn't available for non-root users. This format is supported only for vhost-user-fs.
+fs_runtime_ugid_map = ["devices/fs_runtime_ugid_map"]
+
 ## Enables support for JSON configuration files that can be specified using `--cfg`. See
 ## [Configuration Files](https://crosvm.dev/book/running_crosvm/options.html#configuration-files)
 ## for more information.
@@ -279,6 +283,15 @@ whpx = ["devices/whpx", "hypervisor/whpx"]
 ## Enables a libslirp based network device. Currently only supported on Windows.
 slirp = ["devices/slirp", "net_util/slirp"]
 
+## Enables slirp debugging.
+slirp-debug = ["net_util/slirp-debug"]
+
+## Enables slirp capture.
+slirp-ring-capture = [
+    "net_util/slirp-ring-capture",
+    "devices/slirp-ring-capture",
+]
+
 #! ### Non-additive feature flags
 #!
 #! These feature flags change the behavior of crosvm instead of adding functionality.
@@ -341,6 +354,9 @@ vtpm = ["devices/vtpm"]
 ## Enables reporting of crosvm crashes
 crash-report = ["broker_ipc/crash-report", "crash_report"]
 
+process-invariants = []
+sandbox = []
+
 #! ### Platform Feature Sets
 #!
 #! These feature flags enable all features that are supported for a given platform.
@@ -356,6 +372,7 @@ all-default = [
     "crash-report",
     "default",
     "ffmpeg",
+    "fs_runtime_ugid_map",
     "gdb",
     "geniezone",
     "gfxstream",
@@ -427,6 +444,7 @@ all-mingw64 = [
     "haxm",
     "net",
     "slirp",
+    "slirp-debug",
     "stats",
     "vulkan_display",
     "pvclock",
@@ -437,21 +455,22 @@ all-msvc64 = [ "all-mingw64" ]
 
 ## All features that are compiled and tested for android builds
 all-android = [
-        "android-sparse",
-        "audio",
-        "audio_aaudio",
-        "balloon",
-        "config-file",
-        "gdb",
-        "gdbstub",
-        "gdbstub_arch",
-        "geniezone",
-        "gunyah",
-        "libaaudio_stub",
-        "net",
-        "qcow",
-        "usb",
-        "composite-disk",
+    "android-sparse",
+    "audio",
+    "audio_aaudio",
+    "balloon",
+    "composite-disk",
+    "config-file",
+    "fs_runtime_ugid_map",
+    "gdb",
+    "gdbstub",
+    "gdbstub_arch",
+    "geniezone",
+    "gunyah",
+    "libaaudio_stub",
+    "net",
+    "qcow",
+    "usb",
 ]
 
 [dependencies]

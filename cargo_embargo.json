@@ -70,6 +70,7 @@
   "module_name_overrides": {
     "libbase": "libbase_rust",
     "libbase64": "libbase64_rust",
+    "libbit_field": "libbit_field_crosvm",
     "libfuse": "libfuse_rust",
     "liblog": "liblog_rust",
     "libminijail": "libminijail_rust",

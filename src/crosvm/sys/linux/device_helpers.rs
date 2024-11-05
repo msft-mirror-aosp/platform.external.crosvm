@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::convert::TryFrom;
 use std::fs;
 use std::fs::File;
@@ -52,6 +53,7 @@ use devices::virtio::vhost::user::VhostUserDeviceBuilder;
 use devices::virtio::vhost::user::VhostUserVsockDevice;
 use devices::virtio::vsock::VsockConfig;
 use devices::virtio::Console;
+use devices::virtio::MemSlotConfig;
 #[cfg(feature = "net")]
 use devices::virtio::NetError;
 #[cfg(feature = "net")]
@@ -95,9 +97,63 @@ use crate::crosvm::config::VhostUserFrontendOption;
 use crate::crosvm::config::VhostUserFsOption;
 use crate::crosvm::sys::config::PmemExt2Option;
 
+/// All the tube types collected and passed to `run_control`.
+///
+/// This mainly exists to simplify the device setup plumbing. We collect the tubes of all the
+/// devices into one list using this enum and then separate them out in `run_control` to be handled
+/// individually.
+#[remain::sorted]
+pub enum AnyControlTube {
+    DeviceControlTube(DeviceControlTube),
+    /// Receives `IrqHandlerRequest`.
+    IrqTube(Tube),
+    TaggedControlTube(TaggedControlTube),
+    VmMemoryTube(VmMemoryTube),
+}
+
+impl From<DeviceControlTube> for AnyControlTube {
+    fn from(value: DeviceControlTube) -> Self {
+        AnyControlTube::DeviceControlTube(value)
+    }
+}
+
+impl From<TaggedControlTube> for AnyControlTube {
+    fn from(value: TaggedControlTube) -> Self {
+        AnyControlTube::TaggedControlTube(value)
+    }
+}
+
+impl From<VmMemoryTube> for AnyControlTube {
+    fn from(value: VmMemoryTube) -> Self {
+        AnyControlTube::VmMemoryTube(value)
+    }
+}
+
+/// Tubes that initiate requests to devices.
+#[remain::sorted]
+pub enum DeviceControlTube {
+    // See `BalloonTube`.
+    #[cfg(feature = "balloon")]
+    Balloon(Tube),
+    // Sends `DiskControlCommand`.
+    Disk(Tube),
+    // Sends `GpuControlCommand`.
+    #[cfg(feature = "gpu")]
+    Gpu(Tube),
+    // Sends `PvClockCommand`.
+    #[cfg(feature = "pvclock")]
+    PvClock(Tube),
+}
+
+/// Tubes that service requests from devices.
+///
+/// Only includes those that happen to be handled together in the main `WaitContext` loop.
 pub enum TaggedControlTube {
+    /// Receives `FsMappingRequest`.
     Fs(Tube),
+    /// Receives `VmRequest`.
     Vm(Tube),
+    /// Receives `VmMemoryMappingRequest`.
     VmMsync(Tube),
 }
 
@@ -122,6 +178,7 @@ impl ReadNotifier for TaggedControlTube {
     }
 }
 
+/// Tubes that service `VmMemoryRequest` requests from devices.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct VmMemoryTube {
     pub tube: Tube,
@@ -329,12 +386,20 @@ impl<'a> VirtioDeviceBuilder for &'a ScsiConfig<'a> {
     }
 }
 
-fn vhost_user_connection(path: &Path, connect_timeout_ms: Option<u64>) -> Result<UnixStream> {
+fn vhost_user_connection(
+    path: &Path,
+    connect_timeout_ms: Option<u64>,
+) -> Result<vmm_vhost::Connection<vmm_vhost::FrontendReq>> {
     let deadline = connect_timeout_ms.map(|t| Instant::now() + Duration::from_millis(t));
     let mut first = true;
     loop {
         match UnixStream::connect(path) {
-            Ok(x) => return Ok(x),
+            Ok(sock) => {
+                let connection = sock
+                    .try_into()
+                    .context("failed to construct Connection from UnixStream")?;
+                return Ok(connection);
+            }
             Err(e) => {
                 // ConnectionRefused => Might be a stale file the backend hasn't deleted yet.
                 // NotFound => Might be the backend hasn't bound the socket yet.
@@ -376,16 +441,19 @@ fn is_socket(path: &PathBuf) -> bool {
     }
 }
 
-fn vhost_user_connection_from_socket_fd(fd: u32) -> Result<UnixStream> {
+fn vhost_user_connection_from_socket_fd(
+    fd: u32,
+) -> Result<vmm_vhost::Connection<vmm_vhost::FrontendReq>> {
     let path = PathBuf::from(format!("/proc/self/fd/{}", fd));
     if !is_socket(&path) {
         anyhow::bail!("path {} is not socket", path.display());
     }
 
-    let safe_fd = safe_descriptor_from_fd(fd as i32)?;
+    let safe_fd = safe_descriptor_from_cmdline_fd(&(fd as i32))?;
 
-    let stream: UnixStream = UnixStream::from(safe_fd);
-    Ok(stream)
+    safe_fd
+        .try_into()
+        .context("failed to create vhost-user connection from fd")
 }
 
 pub fn create_vhost_user_frontend(
@@ -743,7 +811,6 @@ pub fn create_balloon_device(
     tube: Tube,
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
-    dynamic_mapping_device_tube: Tube,
     enabled_features: u64,
     #[cfg(feature = "registered_events")] registered_evt_q: Option<SendTube>,
     ws_num_bins: u8,
@@ -751,7 +818,6 @@ pub fn create_balloon_device(
     let dev = virtio::Balloon::new(
         virtio::base_features(protection_type),
         tube,
-        VmMemoryClient::new(dynamic_mapping_device_tube),
         inflate_tube,
         init_balloon_size,
         enabled_features,
@@ -1086,8 +1152,9 @@ pub fn create_fs_device(
     fs_cfg: virtio::fs::Config,
     device_tube: Tube,
 ) -> DeviceResult {
-    let max_open_files =
-        base::linux::max_open_files().context("failed to get max number of open files")?;
+    let max_open_files = base::linux::max_open_files()
+        .context("failed to get max number of open files")?
+        .rlim_max;
     let j = if let Some(jail_config) = jail_config {
         let mut config = SandboxConfig::new(jail_config, "fs_device");
         config.limit_caps = false;
@@ -1127,8 +1194,9 @@ pub fn create_9p_device(
     tag: &str,
     mut p9_cfg: p9::Config,
 ) -> DeviceResult {
-    let max_open_files =
-        base::linux::max_open_files().context("failed to get max number of open files")?;
+    let max_open_files = base::linux::max_open_files()
+        .context("failed to get max number of open files")?
+        .rlim_max;
     let (jail, root) = if let Some(jail_config) = jail_config {
         let mut config = SandboxConfig::new(jail_config, "9p_device");
         config.limit_caps = false;
@@ -1239,7 +1307,10 @@ pub fn create_pmem_device(
                 Alloc::PmemDevice(index),
                 format!("pmem_disk_image_{}", index),
                 AllocOptions::new()
-                .top_down(true)
+                // Allocate from the bottom up rather than top down to avoid exceeding PHYSMEM_END
+                // with kaslr.
+                // TODO: b/375506171: Find a proper fix.
+                .top_down(false)
                 .prefetchable(true)
                 // Linux kernel requires pmem namespaces to be 128 MiB aligned.
                 // cf. https://github.com/pmem/ndctl/issues/76
@@ -1248,22 +1319,24 @@ pub fn create_pmem_device(
             .context("failed to allocate memory for pmem device")?,
     );
 
-    let mapping_arena_slot = vm
-        .add_memory_region(
-            mapping_address,
-            Box::new(arena),
-            /* read_only = */ pmem.ro,
-            /* log_dirty_pages = */ false,
-            MemCacheType::CacheCoherent,
-        )
-        .context("failed to add pmem device memory")?;
+    let mem_slot = MemSlotConfig::MemSlot {
+        idx: vm
+            .add_memory_region(
+                mapping_address,
+                Box::new(arena),
+                /* read_only = */ pmem.ro,
+                /* log_dirty_pages = */ false,
+                MemCacheType::CacheCoherent,
+            )
+            .context("failed to add pmem device memory")?,
+    };
 
     let dev = virtio::Pmem::new(
         virtio::base_features(protection_type),
         PmemConfig {
             disk_image: Some(fd),
             mapping_address,
-            mapping_arena_slot,
+            mem_slot,
             mapping_size: arena_size,
             pmem_device_tube,
             swap_interval: pmem.swap_interval,
@@ -1281,20 +1354,24 @@ pub fn create_pmem_device(
 pub fn create_pmem_ext2_device(
     protection_type: ProtectionType,
     jail_config: &Option<JailConfig>,
-    vm: &mut impl Vm,
     resources: &mut SystemAllocator,
     opts: &PmemExt2Option,
     index: usize,
+    vm_memory_client: VmMemoryClient,
     pmem_device_tube: Tube,
+    worker_process_pids: &mut BTreeSet<Pid>,
 ) -> DeviceResult {
-    let cfg = ext2::Config {
+    let mapping_size = opts.size as u64;
+    let builder = ext2::Builder {
         inodes_per_group: opts.inodes_per_group,
         blocks_per_group: opts.blocks_per_group,
-        size: opts.size,
+        size: mapping_size as u32,
+        ..Default::default()
     };
-    let arena = ext2::create_ext2_region(&cfg, Some(opts.path.as_path()))?;
-    let mapping_size = arena.size() as u64;
 
+    let max_open_files = base::linux::max_open_files()
+        .context("failed to get max number of open files")?
+        .rlim_max;
     let mapping_address = GuestAddress(
         resources
             .allocate_mmio(
@@ -1311,22 +1388,30 @@ pub fn create_pmem_ext2_device(
             .context("failed to allocate memory for pmem device")?,
     );
 
-    let mapping_arena_slot = vm
-        .add_memory_region(
-            mapping_address,
-            Box::new(arena),
-            /* read_only= */ true,
-            /* log_dirty_pages= */ false,
-            MemCacheType::CacheCoherent,
-        )
-        .context("failed to add pmem device memory")?;
+    let (mkfs_tube, mkfs_device_tube) = Tube::pair().context("failed to create tube")?;
+
+    let ext2_proc_pid = crate::crosvm::sys::linux::ext2::launch(
+        mapping_address,
+        vm_memory_client,
+        mkfs_tube,
+        &opts.path,
+        &opts.ugid,
+        (&opts.uid_map, &opts.gid_map),
+        builder,
+        jail_config,
+    )
+    .context("failed to spawn mkfs process")?;
+
+    worker_process_pids.insert(ext2_proc_pid);
 
     let dev = virtio::Pmem::new(
         virtio::base_features(protection_type),
         PmemConfig {
             disk_image: None,
             mapping_address,
-            mapping_arena_slot,
+            mem_slot: MemSlotConfig::LazyInit {
+                tube: mkfs_device_tube,
+            },
             mapping_size,
             pmem_device_tube,
             swap_interval: None,
@@ -1335,9 +1420,16 @@ pub fn create_pmem_ext2_device(
     )
     .context("failed to create pmem device")?;
 
+    let j = if let Some(jail_config) = jail_config {
+        let mut config = SandboxConfig::new(jail_config, "pmem_device");
+        config.limit_caps = false;
+        create_sandbox_minijail(&opts.path, max_open_files, &config)?
+    } else {
+        create_base_minijail(&opts.path, max_open_files)?
+    };
     Ok(VirtioDeviceStub {
         dev: Box::new(dev) as Box<dyn VirtioDevice>,
-        jail: simple_jail(jail_config, "pmem_device")?,
+        jail: Some(j),
     })
 }
 
@@ -1469,9 +1561,7 @@ pub fn create_vfio_device(
     jail_config: &Option<JailConfig>,
     vm: &impl Vm,
     resources: &mut SystemAllocator,
-    irq_control_tubes: &mut Vec<Tube>,
-    vm_memory_control_tubes: &mut Vec<VmMemoryTube>,
-    control_tubes: &mut Vec<TaggedControlTube>,
+    add_control_tube: &mut impl FnMut(AnyControlTube),
     vfio_path: &Path,
     hotplug: bool,
     hotplug_bus: Option<u8>,
@@ -1487,13 +1577,16 @@ pub fn create_vfio_device(
 
     let (vfio_host_tube_mem, vfio_device_tube_mem) =
         Tube::pair().context("failed to create tube")?;
-    vm_memory_control_tubes.push(VmMemoryTube {
-        tube: vfio_host_tube_mem,
-        expose_with_viommu: false,
-    });
+    add_control_tube(
+        VmMemoryTube {
+            tube: vfio_host_tube_mem,
+            expose_with_viommu: false,
+        }
+        .into(),
+    );
 
     let (vfio_host_tube_vm, vfio_device_tube_vm) = Tube::pair().context("failed to create tube")?;
-    control_tubes.push(TaggedControlTube::Vm(vfio_host_tube_vm));
+    add_control_tube(TaggedControlTube::Vm(vfio_host_tube_vm).into());
 
     let vfio_device =
         VfioDevice::new_passthrough(&vfio_path, vm, vfio_container.clone(), iommu_dev, dt_symbol)
@@ -1503,11 +1596,11 @@ pub fn create_vfio_device(
         VfioDeviceType::Pci => {
             let (vfio_host_tube_msi, vfio_device_tube_msi) =
                 Tube::pair().context("failed to create tube")?;
-            irq_control_tubes.push(vfio_host_tube_msi);
+            add_control_tube(AnyControlTube::IrqTube(vfio_host_tube_msi));
 
             let (vfio_host_tube_msix, vfio_device_tube_msix) =
                 Tube::pair().context("failed to create tube")?;
-            irq_control_tubes.push(vfio_host_tube_msix);
+            add_control_tube(AnyControlTube::IrqTube(vfio_host_tube_msix));
 
             let mut vfio_pci_device = VfioPciDevice::new(
                 vfio_path,

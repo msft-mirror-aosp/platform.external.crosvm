@@ -1179,6 +1179,22 @@ pub struct RunCommand {
     ///       vCPU 1 as intel Atom type, also set vCPU 2 and vCPU 3
     ///       as intel Core type.
     ///     boot-cpu=NUM - Select vCPU to boot from. (default: 0) (aarch64 only)
+    ///     freq_domains=[[FREQ_DOMAIN],...] - CPU freq_domains (default: None) (aarch64 only)
+    ///       Usage is identical to clusters, each FREQ_DOMAIN is a set containing a
+    ///       list of CPUs that should belong to the same freq_domain. Individual
+    ///       CPU ids or ranges can be specified, comma-separated.
+    ///       Examples:
+    ///       freq_domains=[[0],[1],[2],[3]] - creates 4 freq_domains, one
+    ///         for each specified core.
+    ///       freq_domains=[[0-3]] - creates a freq_domain for cores 0 to 3
+    ///         included.
+    ///       freq_domains=[[0,2],[1,3],[4-7,12]] - creates one freq_domain
+    ///         for cores 0 and 2, another one for cores 1 and 3,
+    ///         and one last for cores 4, 5, 6, 7 and 12.
+    ///     sve=[enabled=bool] - SVE Config. (aarch64 only)
+    ///         Examples:
+    ///         sve=[enabled=true] - Enables SVE on device. Will fail is SVE unsupported.
+    ///         default value = false.
     pub cpus: Option<CpuOptions>,
 
     #[cfg(feature = "crash-report")]
@@ -1634,6 +1650,14 @@ pub struct RunCommand {
     /// to 800x1280) and a name for the input device
     pub multi_touch: Vec<TouchDeviceOption>,
 
+    #[argh(option)]
+    #[merge(strategy = overwrite_option)]
+    /// optional name for the VM. This is used as the name of the crosvm
+    /// process which is helpful to distinguish multiple crosvm processes.
+    /// A name longer than 15 bytes is truncated on Linux-like OSes. This
+    /// is no-op on Windows and MacOS at the moment.
+    pub name: Option<String>,
+
     #[cfg(all(unix, feature = "net"))]
     #[argh(
         option,
@@ -1710,6 +1734,13 @@ pub struct RunCommand {
     #[merge(strategy = overwrite_option)]
     /// don't use legacy KBD devices emulation
     pub no_i8042: Option<bool>,
+
+    #[cfg(target_arch = "aarch64")]
+    #[argh(switch)]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_option)]
+    /// disable Performance Monitor Unit (PMU)
+    pub no_pmu: Option<bool>,
 
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
@@ -1896,6 +1927,16 @@ pub struct RunCommand {
     ///       calculated from this value and other given parameters.
     ///       The value of `size` must be larger than (4096 *
     ///        blocks_per_group.) (default: 16777216)
+    ///     uid=UID - uid of the mkfs process in the user
+    ///       namespace created by minijail. (default: 0)
+    ///     gid=GID - gid of the mkfs process in the user
+    ///       namespace created by minijail. (default: 0)
+    ///     uidmap=UIDMAP - a uid map in the format
+    ///       "inner outer count[,inner outer count]". This format
+    ///       is same as one for minijail.
+    ///       (default: "0 <current euid> 1")
+    ///     gidmap=GIDMAP - a gid map in the same format as uidmap
+    ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
     #[cfg(feature = "process-invariants")]
@@ -2199,7 +2240,7 @@ pub struct RunCommand {
     ///        feature(default: true). This should be set to false
     ///        in case the when the host not allowing write to
     ///        /proc/<pid>/attr/fscreate, or guest directory does
-    ///        care about the security context.
+    ///        not care about the security context.
     ///     Options uid and gid are useful when the crosvm process
     ///     has no CAP_SETGID/CAP_SETUID but an identity mapping of
     ///     the current user/group between the VM and the host is
@@ -2562,6 +2603,17 @@ pub struct RunCommand {
     /// enable a virtual cpu freq device
     pub virt_cpufreq: Option<bool>,
 
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        any(target_os = "android", target_os = "linux")
+    ))]
+    #[argh(switch)]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// enable version of the virtual cpu freq device compatible
+    /// with the driver in upstream linux
+    pub virt_cpufreq_upstream: Option<bool>,
+
     #[cfg(feature = "audio")]
     #[argh(
         option,
@@ -2706,6 +2758,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             let cpus = cmd.cpus.unwrap_or_default();
             cfg.vcpu_count = cpus.num_cores;
             cfg.boot_cpu = cpus.boot_cpu.unwrap_or_default();
+            cfg.cpu_freq_domains = cpus.freq_domains;
 
             // Only allow deprecated `--cpu-cluster` option only if `--cpu clusters=[...]` is not
             // used.
@@ -2740,6 +2793,10 @@ impl TryFrom<RunCommand> for super::config::Config {
                     }
                 }
             }
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            {
+                cfg.sve = cpus.sve;
+            }
         }
 
         cfg.vcpu_affinity = cmd.cpu_affinity;
@@ -2758,6 +2815,10 @@ impl TryFrom<RunCommand> for super::config::Config {
         ))]
         {
             cfg.virt_cpufreq = cmd.virt_cpufreq.unwrap_or_default();
+            cfg.virt_cpufreq_v2 = cmd.virt_cpufreq_upstream.unwrap_or_default();
+            if cfg.virt_cpufreq && cfg.virt_cpufreq_v2 {
+                return Err("Only one version of virt-cpufreq can be used!".to_string());
+            }
             if let Some(frequencies) = cmd.cpu_frequencies_khz {
                 cfg.cpu_frequencies_khz = frequencies;
             }
@@ -2789,6 +2850,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                 );
             }
             cfg.mte = cmd.mte.unwrap_or_default();
+            cfg.no_pmu = cmd.no_pmu.unwrap_or_default();
             cfg.swiotlb = cmd.swiotlb;
         }
 
@@ -3002,12 +3064,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
         cfg.pstore = cmd.pstore;
 
-        cfg.enable_fw_cfg = if let Some(fw) = cmd.enable_fw_cfg {
-            fw
-        } else {
-            false
-        };
-
+        cfg.enable_fw_cfg = cmd.enable_fw_cfg.unwrap_or_default();
         cfg.fw_cfg_parameters = cmd.fw_cfg;
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -3638,6 +3695,8 @@ impl TryFrom<RunCommand> for super::config::Config {
         if cmd.disable_sandbox.unwrap_or_default() {
             cfg.jail_config = None;
         }
+
+        cfg.name = cmd.name;
 
         // Now do validation of constructed config
         super::config::validate_config(&mut cfg)?;

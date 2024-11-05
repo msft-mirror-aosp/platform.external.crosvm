@@ -296,6 +296,85 @@ const DESC_ACCESS_EXEC: u8 = 1 << 3;
 const DESC_ACCESS_RW: u8 = 1 << 1;
 const DESC_ACCESS_ACCESSED: u8 = 1 << 0;
 
+#[derive(Debug, Clone, Copy)]
+struct LongModePageTableEntry {
+    execute_disable: bool,
+    protection_key: u8,
+    address: u64,
+    global: bool,
+    page_attribute_table: bool,
+    dirty: bool,
+    accessed: bool,
+    cache_disable: bool,
+    write_through: bool,
+    user_supervisor: bool,
+    read_write: bool,
+    present: bool,
+}
+
+impl LongModePageTableEntry {
+    fn from_address(address: u64) -> Self {
+        assert!(address < 1 << 52, "the address must fit in 52 bits");
+        assert!(address & 0xFFF == 0, "the address must be aligned to 4k");
+        Self {
+            execute_disable: false,
+            protection_key: 0,
+            address,
+            global: false,
+            page_attribute_table: false,
+            dirty: false,
+            accessed: false,
+            cache_disable: false,
+            write_through: false,
+            user_supervisor: false,
+            read_write: false,
+            present: false,
+        }
+    }
+}
+
+impl From<LongModePageTableEntry> for u64 {
+    fn from(page_table_entry: LongModePageTableEntry) -> Self {
+        let mut res = 0;
+        if page_table_entry.present {
+            res |= 1;
+        }
+        if page_table_entry.read_write {
+            res |= 1 << 1;
+        }
+        if page_table_entry.user_supervisor {
+            res |= 1 << 2;
+        }
+        if page_table_entry.write_through {
+            res |= 1 << 3;
+        }
+        if page_table_entry.cache_disable {
+            res |= 1 << 4;
+        }
+        if page_table_entry.accessed {
+            res |= 1 << 5;
+        }
+        if page_table_entry.dirty {
+            res |= 1 << 6;
+        }
+        if page_table_entry.page_attribute_table {
+            res |= 1 << 7;
+        }
+        if page_table_entry.global {
+            res |= 1 << 8;
+        }
+        assert!(page_table_entry.address < 1 << 52);
+        assert!(page_table_entry.address & 0xFFF == 0);
+        res |= page_table_entry.address;
+        assert!(page_table_entry.protection_key < 1 << 4);
+        res |= u64::from(page_table_entry.protection_key) << 59;
+        if page_table_entry.execute_disable {
+            res |= 1 << 63;
+        }
+        res
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ModeConfig {
     idt: Vec<u8>,
@@ -303,6 +382,8 @@ struct ModeConfig {
     gdt: Vec<Segment>,
     gdt_base_addr: u64,
     code_segment_index: u16,
+    task_segment_index: Option<u16>,
+    page_table: Option<Box<[u8; 0x1000]>>,
     long_mode: bool,
 }
 
@@ -573,11 +654,6 @@ impl ModeConfig {
     pub fn configure_long_mode_memory(&self, vm: &mut dyn Vm) {
         let guest_mem = vm.get_memory();
 
-        assert!(
-            guest_mem.range_overlap(GuestAddress(0x1500), GuestAddress(0xc000)),
-            "Long-mode setup requires 0x1500-0xc000 to be mapped in the guest."
-        );
-
         self.configure_gdt_memory(guest_mem);
         self.configure_idt_memory(guest_mem);
 
@@ -585,6 +661,12 @@ impl ModeConfig {
         let pml4_addr = GuestAddress(0x9000);
         let pdpte_addr = GuestAddress(0xa000);
         let pde_addr = GuestAddress(0xb000);
+        let pte_addr = GuestAddress(0xc000);
+
+        assert!(
+            guest_mem.range_overlap(GuestAddress(0x9000), GuestAddress(0xd000)),
+            "the memory range for page tables should be mapped."
+        );
 
         // Pointing to PDPTE with present and RW flags
         guest_mem
@@ -597,8 +679,15 @@ impl ModeConfig {
             .expect("failed to write PDPTE entry");
 
         for i in 0..512 {
-            // Each 2MiB page present and RW
-            let pd_entry_bytes = ((i << 21) | 0x83u64).to_le_bytes();
+            // All pages are present and RW.
+            let flags: u64 = if i == 0 {
+                3
+            } else {
+                // The first 2MiB are 4K pages, the rest are 2M pages.
+                0x83
+            };
+            let addr = if i == 0 { pte_addr.offset() } else { i << 21 };
+            let pd_entry_bytes = (addr | flags).to_le_bytes();
             guest_mem
                 .write_at_addr(
                     &pd_entry_bytes,
@@ -606,6 +695,16 @@ impl ModeConfig {
                 )
                 .expect("Failed to write PDE entry");
         }
+
+        guest_mem
+            .write_at_addr(
+                self.page_table
+                    .as_ref()
+                    .expect("page table must present for long mode")
+                    .as_slice(),
+                pte_addr,
+            )
+            .expect("Failed to write PTE entry");
     }
 
     pub fn enter_long_mode(&self, vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm) {
@@ -616,6 +715,10 @@ impl ModeConfig {
         sregs.gdt = self.get_gdtr_value();
         sregs.idt = self.get_idtr_value();
         sregs.cs = self.get_segment_register_value(self.code_segment_index);
+
+        if let Some(task_segment_index) = self.task_segment_index {
+            sregs.tr = self.get_segment_register_value(task_segment_index);
+        }
 
         // Long mode
         let pml4_addr = GuestAddress(0x9000);
@@ -643,6 +746,15 @@ impl ModeConfig {
         sregs.gdt = self.get_gdtr_value();
         sregs.idt = self.get_idtr_value();
 
+        assert!(
+            self.task_segment_index.is_none(),
+            "task segment not supported for protected mode yet."
+        );
+
+        assert!(
+            self.page_table.is_none(),
+            "setting page tables for protected mode is not supported yet"
+        );
         // 32-bit protected mode, paging disabled
         sregs.cr0 |= 0x1; // PE
         sregs.cr0 &= !0x80000000; // ~PG
@@ -651,6 +763,18 @@ impl ModeConfig {
     }
 
     fn default_long_mode() -> Self {
+        let page_table = (0u64..512)
+            .flat_map(|page_frame_number| {
+                let page_table_entry = LongModePageTableEntry {
+                    present: true,
+                    read_write: true,
+                    ..LongModePageTableEntry::from_address(page_frame_number << 12)
+                };
+                u64::from(page_table_entry).as_bytes().to_owned()
+            })
+            .collect::<Box<[u8]>>()
+            .try_into()
+            .expect("the length of the slice must match");
         Self {
             idt_base_addr: DEFAULT_IDT_OFFSET,
             idt: vec![0; Self::IDT64_SIZE],
@@ -661,6 +785,8 @@ impl ModeConfig {
                 Self::default_code_segment_long_mode(),
             ],
             code_segment_index: 2,
+            task_segment_index: None,
+            page_table: Some(page_table),
             long_mode: true,
         }
     }
@@ -676,6 +802,8 @@ impl ModeConfig {
                 Self::default_code_segment_protected_mode(),
             ],
             code_segment_index: 2,
+            task_segment_index: None,
+            page_table: None,
             long_mode: false,
         }
     }
@@ -756,27 +884,20 @@ fn test_io_exit_handler() {
     let exit_matcher =
         move |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
             VcpuExit::Io => {
-                vcpu.handle_io(&mut |IoParams {
-                                         address,
-                                         size,
-                                         operation,
-                                     }| {
+                vcpu.handle_io(&mut |IoParams { address, operation }| {
                     match operation {
-                        IoOperation::Read => {
-                            let mut data = [0u8; 8];
+                        IoOperation::Read(data) => {
                             assert_eq!(address, 0x20);
-                            assert_eq!(size, 1);
+                            assert_eq!(data.len(), 1);
                             // The original number written below will be doubled and
                             // passed back.
                             data[0] = cached_byte.load(Ordering::SeqCst) * 2;
-                            Some(data)
                         }
-                        IoOperation::Write { data } => {
+                        IoOperation::Write(data) => {
                             assert_eq!(address, 0x10);
-                            assert_eq!(size, 1);
+                            assert_eq!(data.len(), 1);
                             assert_eq!(data[0], 0x34);
                             cached_byte.fetch_add(data[0], Ordering::SeqCst);
-                            None
                         }
                     }
                 })
@@ -784,6 +905,90 @@ fn test_io_exit_handler() {
                 false // Continue VM runloop
             }
             VcpuExit::Hlt => {
+                true // Break VM runloop
+            }
+            r => panic!("unexpected exit reason: {:?}", r),
+        };
+    run_tests!(setup, regs_matcher, &exit_matcher);
+}
+
+global_asm_data!(
+    test_io_rep_string_code,
+    ".code16",
+    "cld",
+    "mov dx, 0x80",  // read data from I/O port 80h
+    "mov di, 0x100", // write data to memory address 0x100
+    "mov cx, 5",     // repeat 5 times
+    "rep insb",
+    "mov si, 0x100", // read data from memory address 0x100
+    "mov dx, 0x80",  // write data to I/O port 80h
+    "mov cx, 5",     // repeat 5 times
+    "rep outsb",
+    "mov cx, 0x5678",
+    "hlt",
+);
+
+#[cfg(not(feature = "haxm"))]
+#[test]
+fn test_io_rep_string() {
+    // Test the REP OUTS*/REP INS* string I/O instructions, which should call the IO handler
+    // multiple times to handle the requested repeat count.
+    let load_addr = GuestAddress(0x1000);
+    let setup = TestSetup {
+        assembly: test_io_rep_string_code::data().to_vec(),
+        load_addr,
+        initial_regs: Regs {
+            rip: load_addr.offset(),
+            rax: 0x1234,
+            rflags: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let regs_matcher = |_, regs: &Regs, _: &_| {
+        // The string I/O instructions should not modify AX.
+        assert_eq!(regs.rax, 0x1234);
+        assert_eq!(regs.rcx, 0x5678);
+    };
+
+    let read_data = AtomicU8::new(0);
+    let write_data = AtomicU8::new(0);
+    let exit_matcher =
+        move |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, vm: &mut dyn Vm| match exit {
+            VcpuExit::Io => {
+                vcpu.handle_io(&mut |IoParams { address, operation }| {
+                    match operation {
+                        IoOperation::Read(data) => {
+                            assert_eq!(address, 0x80);
+                            assert_eq!(data.len(), 1);
+                            // Return 0, 1, 2, 3, 4 for subsequent reads.
+                            data[0] = read_data.fetch_add(1, Ordering::SeqCst);
+                        }
+                        IoOperation::Write(data) => {
+                            assert_eq!(address, 0x80);
+                            assert_eq!(data.len(), 1);
+                            // Expect 0, 1, 2, 3, 4 to be written.
+                            let expected_write = write_data.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(data[0], expected_write);
+                        }
+                    }
+                })
+                .expect("failed to set the data");
+                false // Continue VM runloop
+            }
+            VcpuExit::Hlt => {
+                // Verify 5 reads and writes occurred.
+                assert_eq!(read_data.load(Ordering::SeqCst), 5);
+                assert_eq!(write_data.load(Ordering::SeqCst), 5);
+
+                // Verify the data that should have been written to memory by REP INSB.
+                let mem = vm.get_memory();
+                let mut data = [0u8; 5];
+                mem.read_exact_at_addr(&mut data, GuestAddress(0x100))
+                    .unwrap();
+                assert_eq!(data, [0, 1, 2, 3, 4]);
+
                 true // Break VM runloop
             }
             r => panic!("unexpected exit reason: {:?}", r),
@@ -827,14 +1032,10 @@ fn test_mmio_exit_cross_page() {
 
     let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Mmio => {
-            vcpu.handle_mmio(&mut |IoParams {
-                                       address,
-                                       size,
-                                       operation,
-                                   }| {
+            vcpu.handle_mmio(&mut |IoParams { address, operation }| {
                 match operation {
-                    IoOperation::Read => {
-                        match (address, size) {
+                    IoOperation::Read(data) => {
+                        match (address, data.len()) {
                             // First MMIO read asks to load the first 8 bytes
                             // of a new execution page, when an instruction
                             // crosses page boundary.
@@ -843,21 +1044,25 @@ fn test_mmio_exit_cross_page() {
                             (0x1000, 8) => {
                                 // Ensure this instruction is the first read
                                 // in the sequence.
-                                Ok(Some([0x88, 0x03, 0x67, 0x8a, 0x01, 0xf4, 0, 0]))
+                                data.copy_from_slice(&[0x88, 0x03, 0x67, 0x8a, 0x01, 0xf4, 0, 0]);
+                                Ok(())
                             }
                             // Second MMIO read is a regular read from an
                             // unmapped memory (pointed to by initial EAX).
-                            (0x3010, 1) => Ok(Some([0x66, 0, 0, 0, 0, 0, 0, 0])),
+                            (0x3010, 1) => {
+                                data.copy_from_slice(&[0x66]);
+                                Ok(())
+                            }
                             _ => {
-                                panic!("invalid address({:#x})/size({})", address, size)
+                                panic!("invalid address({:#x})/size({})", address, data.len())
                             }
                         }
                     }
-                    IoOperation::Write { data } => {
+                    IoOperation::Write(data) => {
                         assert_eq!(address, 0x3000);
                         assert_eq!(data[0], 0x33);
-                        assert_eq!(size, 1);
-                        Ok(None)
+                        assert_eq!(data.len(), 1);
+                        Ok(())
                     }
                 }
             })
@@ -940,19 +1145,15 @@ fn test_mmio_exit_readonly_memory() {
 
     let exit_matcher = |_, exit: &VcpuExit, vcpu: &mut dyn VcpuX86_64, _: &mut dyn Vm| match exit {
         VcpuExit::Mmio => {
-            vcpu.handle_mmio(&mut |IoParams {
-                                       address,
-                                       size,
-                                       operation,
-                                   }| match operation {
-                IoOperation::Read => {
+            vcpu.handle_mmio(&mut |IoParams { address, operation }| match operation {
+                IoOperation::Read(_) => {
                     panic!("unexpected mmio read call");
                 }
-                IoOperation::Write { data } => {
-                    assert_eq!(size, 1);
+                IoOperation::Write(data) => {
+                    assert_eq!(data.len(), 1);
                     assert_eq!(address, 0x5000);
                     assert_eq!(data[0], 0x67);
-                    Ok(None)
+                    Ok(())
                 }
             })
             .expect("failed to set the data");
@@ -1253,6 +1454,7 @@ global_asm_data!(
     "hlt",
 );
 
+#[cfg(not(unix))]
 #[test]
 fn test_getsec_instruction() {
     let setup = TestSetup {
@@ -1477,6 +1679,7 @@ global_asm_data!(
 
 // TODO(b/342183625): invvpid instruction is not valid in real mode. Reconsider how we should write
 // this test.
+#[cfg(not(unix))]
 #[test]
 fn test_invvpid_instruction() {
     let setup = TestSetup {
@@ -2417,7 +2620,6 @@ fn test_interrupt_ready_when_normally_not_interruptible() {
                         }
                         instrumentation_traces.borrow_mut().push(instrumentation);
                         // We are always handling out IO port, so no data to return.
-                        None
                     })
                     .expect("should handle IO successfully");
                     if should_inject_interrupt {
@@ -2475,7 +2677,6 @@ fn test_interrupt_ready_when_interrupt_enable_flag_not_set() {
                     vcpu.handle_io(&mut |io_params| {
                         addr = io_params.address;
                         // We are always handling out IO port, so no data to return.
-                        None
                     })
                     .expect("should handle IO successfully");
                     let regs = vcpu
@@ -2721,7 +2922,7 @@ fn test_request_interrupt_window() {
                     VcpuExit::Intr => false,
                     VcpuExit::Io => {
                         // We are always handling out IO port, so no data to return.
-                        vcpu.handle_io(&mut |_| None)
+                        vcpu.handle_io(&mut |_| {})
                             .expect("should handle IO successfully");
 
                         assert!(!vcpu.ready_for_interrupt());
@@ -2877,7 +3078,7 @@ fn test_mmx_state_is_preserved_by_hypervisor() {
             false
         }
         VcpuExit::Io => {
-            vcpu.handle_io(&mut |_| None)
+            vcpu.handle_io(&mut |_| {})
                 .expect("should handle IO successfully");
 
             // kaiyili@ pointed out we should check the XSAVE state exposed by the hypervisor via
@@ -3017,7 +3218,7 @@ fn test_avx_state_is_preserved_by_hypervisor() {
             false
         }
         VcpuExit::Io => {
-            vcpu.handle_io(&mut |_| None)
+            vcpu.handle_io(&mut |_| {})
                 .expect("should handle IO successfully");
 
             // kaiyili@ pointed out we should check the XSAVE state exposed by the hypervisor via
@@ -3439,7 +3640,7 @@ fn test_slat_on_region_removal_is_mmio() {
                 //
                 // We strictly don't care what this data is, since the VM exits before running any
                 // further instructions.
-                vcpu.handle_io(&mut |_| None)
+                vcpu.handle_io(&mut |_| {})
                     .expect("should handle IO successfully");
 
                 // Remove the test memory region to cause a SLAT fault (in the passing case).
@@ -3451,21 +3652,18 @@ fn test_slat_on_region_removal_is_mmio() {
                 false
             }
             VcpuExit::Mmio => {
-                vcpu.handle_mmio(&mut |IoParams {
-                                           address,
-                                           size,
-                                           operation,
-                                       }| {
+                vcpu.handle_mmio(&mut |IoParams { address, operation }| {
                     assert_eq!(address, 0x20000, "MMIO for wrong address");
-                    assert_eq!(size, 1);
-                    assert!(
-                        matches!(operation, IoOperation::Read),
-                        "got unexpected IO operation {:?}",
-                        operation
-                    );
-                    // We won't vmenter again, so there's no need to actually satisfy the MMIO by
-                    // returning data; however, some hypervisors (WHPX) require it.
-                    Ok(Some([0u8; 8]))
+                    match operation {
+                        IoOperation::Read(data) => {
+                            assert_eq!(data.len(), 1);
+                            data[0] = 0;
+                            Ok(())
+                        }
+                        IoOperation::Write(_) => {
+                            panic!("got unexpected IO operation {:?}", operation);
+                        }
+                    }
                 })
                 .unwrap();
                 true
@@ -3670,7 +3868,7 @@ fn test_interrupt_injection_when_not_ready() {
                 VcpuExit::FailEntry { .. } | VcpuExit::Shutdown(..) | VcpuExit::Hlt => true,
                 VcpuExit::Io => {
                     // We are always handling out IO port, so no data to return.
-                    vcpu.handle_io(&mut |_| None)
+                    vcpu.handle_io(&mut |_| {})
                         .expect("should handle IO successfully");
                     assert!(!vcpu.ready_for_interrupt());
                     // We don't care whether we inject the interrupt successfully or not.
@@ -3738,7 +3936,6 @@ fn test_ready_for_interrupt_for_intercepted_instructions() {
                     vcpu.handle_io(&mut |params| {
                         io_port = params.address;
                         // We are always handling out IO port, so no data to return.
-                        None
                     })
                     .expect("should handle port IO successfully");
                     match io_port {

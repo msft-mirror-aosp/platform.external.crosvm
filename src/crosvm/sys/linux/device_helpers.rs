@@ -804,6 +804,31 @@ pub fn create_vinput_device(
     })
 }
 
+pub fn create_custom_device<T: IntoUnixStream>(
+    protection_type: ProtectionType,
+    jail_config: &Option<JailConfig>,
+    custom_device_socket: T,
+    idx: u32,
+    input_config_path: PathBuf,
+) -> DeviceResult {
+    let socket = custom_device_socket
+        .into_unix_stream()
+        .context("failed configuring custom virtio input device")?;
+
+    let dev = virtio::input::new_custom(
+        idx,
+        socket,
+        input_config_path,
+        virtio::base_features(protection_type),
+    )
+    .context("failed to set up input device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
 #[cfg(feature = "balloon")]
 pub fn create_balloon_device(
     protection_type: ProtectionType,
@@ -1097,6 +1122,30 @@ pub fn register_video_device(
     Ok(())
 }
 
+#[cfg(feature = "media")]
+pub fn create_simple_media_device(protection_type: ProtectionType) -> DeviceResult {
+    use devices::virtio::media::create_virtio_media_simple_capture_device;
+
+    let features = virtio::base_features(protection_type);
+    let dev = create_virtio_media_simple_capture_device(features);
+
+    Ok(VirtioDeviceStub { dev, jail: None })
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(feature = "media")]
+pub fn create_v4l2_device<P: AsRef<Path>>(
+    protection_type: ProtectionType,
+    path: P,
+) -> DeviceResult {
+    use devices::virtio::media::create_virtio_media_v4l2_proxy_device;
+
+    let features = virtio::base_features(protection_type);
+    let dev = create_virtio_media_v4l2_proxy_device(features, path)?;
+
+    Ok(VirtioDeviceStub { dev, jail: None })
+}
+
 impl VirtioDeviceBuilder for &VsockConfig {
     const NAME: &'static str = "vhost_vsock";
 
@@ -1307,7 +1356,10 @@ pub fn create_pmem_device(
                 Alloc::PmemDevice(index),
                 format!("pmem_disk_image_{}", index),
                 AllocOptions::new()
-                .top_down(true)
+                // Allocate from the bottom up rather than top down to avoid exceeding PHYSMEM_END
+                // with kaslr.
+                // TODO: b/375506171: Find a proper fix.
+                .top_down(false)
                 .prefetchable(true)
                 // Linux kernel requires pmem namespaces to be 128 MiB aligned.
                 // cf. https://github.com/pmem/ndctl/issues/76

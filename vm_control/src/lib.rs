@@ -141,6 +141,8 @@ pub enum VcpuControl {
     // the channel after completion/failure.
     Snapshot(SnapshotWriter, mpsc::Sender<anyhow::Result<()>>),
     Restore(VcpuRestoreRequest),
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    Throttle(u32),
 }
 
 /// Request to restore a Vcpu from a given snapshot, and report the results
@@ -647,7 +649,7 @@ enum RegisteredMemory {
 }
 
 pub struct VmMappedMemoryRegion {
-    gfn: u64,
+    guest_address: GuestAddress,
     slot: MemSlot,
 }
 
@@ -672,7 +674,10 @@ fn try_map_to_prepared_region(
         return None;
     };
 
-    let VmMappedMemoryRegion { gfn, slot } = region_state.mapped_regions.get(allocation)?;
+    let VmMappedMemoryRegion {
+        guest_address,
+        slot,
+    } = region_state.mapped_regions.get(allocation)?;
 
     let (descriptor, file_offset, size) = match source {
         VmMemorySource::Descriptor {
@@ -707,8 +712,8 @@ fn try_map_to_prepared_region(
         return Some(VmMemoryResponse::Err(err));
     }
 
-    let gfn = gfn + (dest_offset >> 12);
-    let region_id = VmMemoryRegionId(gfn);
+    let guest_address = GuestAddress(guest_address.0 + dest_offset);
+    let region_id = VmMemoryRegionId(guest_address);
     region_state.registered_memory.insert(
         region_id,
         RegisteredMemory::FixedMapping {
@@ -802,7 +807,7 @@ impl VmMemoryRequest {
                     Err(e) => return VmMemoryResponse::Err(e),
                 };
 
-                let region_id = VmMemoryRegionId(guest_addr.0 >> 12);
+                let region_id = VmMemoryRegionId(guest_addr);
                 if let (Some(descriptor), Some(iommu_client)) = (descriptor, iommu_client) {
                     let request =
                         VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDmabufMap {
@@ -919,7 +924,7 @@ impl VmMemoryRequest {
                     Err(e) => return VmMemoryResponse::Err(e),
                 };
 
-                let region_id = VmMemoryRegionId(guest_addr.0 >> 12);
+                let region_id = VmMemoryRegionId(guest_addr);
 
                 region_state
                     .registered_memory
@@ -1049,8 +1054,8 @@ impl VmMemoryRequest {
 
 #[derive(Serialize, Deserialize, Debug, PartialOrd, PartialEq, Eq, Ord, Clone, Copy)]
 /// Identifer for registered memory regions. Globally unique.
-// The current implementation uses gfn as the unique identifier.
-pub struct VmMemoryRegionId(u64);
+// The current implementation uses guest physical address as the unique identifier.
+pub struct VmMemoryRegionId(GuestAddress);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum VmMemoryResponse {
@@ -1207,6 +1212,7 @@ pub enum BatControlResult {
     NoSuchStatus,
     NoSuchBatType,
     StringParseIntErr,
+    StringParseBoolErr,
 }
 
 impl Display for BatControlResult {
@@ -1221,6 +1227,7 @@ impl Display for BatControlResult {
             NoSuchStatus => write!(f, "Invalid Battery status setting. Only support: unknown/charging/discharging/notcharging/full"),
             NoSuchBatType => write!(f, "Invalid Battery type setting. Only support: goldfish"),
             StringParseIntErr => write!(f, "Battery property target ParseInt error"),
+            StringParseBoolErr => write!(f, "Battery property target ParseBool error"),
         }
     }
 }
@@ -1250,6 +1257,8 @@ pub enum BatProperty {
     Present,
     Capacity,
     ACOnline,
+    SetFakeBatConfig,
+    CancelFakeBatConfig,
 }
 
 impl FromStr for BatProperty {
@@ -1262,7 +1271,23 @@ impl FromStr for BatProperty {
             "present" => Ok(BatProperty::Present),
             "capacity" => Ok(BatProperty::Capacity),
             "aconline" => Ok(BatProperty::ACOnline),
+            "set_fake_bat_config" => Ok(BatProperty::SetFakeBatConfig),
+            "cancel_fake_bat_config" => Ok(BatProperty::CancelFakeBatConfig),
             _ => Err(BatControlResult::NoSuchProperty),
+        }
+    }
+}
+
+impl Display for BatProperty {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            BatProperty::Status => write!(f, "status"),
+            BatProperty::Health => write!(f, "health"),
+            BatProperty::Present => write!(f, "present"),
+            BatProperty::Capacity => write!(f, "capacity"),
+            BatProperty::ACOnline => write!(f, "aconline"),
+            BatProperty::SetFakeBatConfig => write!(f, "set_fake_bat_config"),
+            BatProperty::CancelFakeBatConfig => write!(f, "cancel_fake_bat_config"),
         }
     }
 }
@@ -1350,6 +1375,21 @@ impl From<BatHealth> for u32 {
     }
 }
 
+/// Configuration of fake battery status information.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub enum BatConfig {
+    // Propagates host's battery status
+    #[default]
+    Real,
+    // Fake on battery status. Simulates a disconnected AC adapter.
+    // This forces ac_online to false and sets the battery status
+    // to DISCHARGING
+    Fake {
+        // Sets the maximum battery capacity reported to the guest
+        max_capacity: u32,
+    },
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum BatControlCommand {
     SetStatus(BatStatus),
@@ -1357,6 +1397,8 @@ pub enum BatControlCommand {
     SetPresent(u32),
     SetCapacity(u32),
     SetACOnline(u32),
+    SetFakeBatConfig(u32),
+    CancelFakeConfig,
 }
 
 impl BatControlCommand {
@@ -1380,6 +1422,12 @@ impl BatControlCommand {
                     .parse::<u32>()
                     .map_err(|_| BatControlResult::StringParseIntErr)?,
             )),
+            BatProperty::SetFakeBatConfig => Ok(BatControlCommand::SetFakeBatConfig(
+                target
+                    .parse::<u32>()
+                    .map_err(|_| BatControlResult::StringParseIntErr)?,
+            )),
+            BatProperty::CancelFakeBatConfig => Ok(BatControlCommand::CancelFakeConfig),
         }
     }
 }
@@ -1505,6 +1553,8 @@ pub enum VmRequest {
     ResumeVm,
     /// Returns Vcpus PID/TID
     VcpuPidTid,
+    /// Throttles the requested vCPU for microseconds
+    Throttle(usize, u32),
 }
 
 /// NOTE: when making any changes to this enum please also update
@@ -1783,6 +1833,7 @@ impl VmRequest {
         usb_control_tube: Option<&Tube>,
         bat_control: &mut Option<BatControl>,
         kick_vcpus: impl Fn(VcpuControl),
+        #[cfg(any(target_os = "android", target_os = "linux"))] kick_vcpu: impl Fn(usize, VcpuControl),
         force_s2idle: bool,
         #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
         device_control_tube: &Tube,
@@ -2209,6 +2260,7 @@ impl VmRequest {
             } => VmResponse::Ok,
             VmRequest::Unregister { socket_addr: _ } => VmResponse::Ok,
             VmRequest::VcpuPidTid => unreachable!(),
+            VmRequest::Throttle(_, _) => unreachable!(),
         }
     }
 }
@@ -2417,9 +2469,8 @@ pub enum VmResponse {
     Err(SysError),
     /// Indicates the request encountered some error during execution.
     ErrString(String),
-    /// The request to register memory into guest address space was successfully done at guest page
-    /// frame number `gfn` and memory slot number `slot`.
-    RegisterMemory { gfn: u64, slot: u32 },
+    /// The memory was registered into guest address space in memory slot number `slot`.
+    RegisterMemory { slot: u32 },
     /// Results of balloon control commands.
     #[cfg(feature = "balloon")]
     BalloonStats {
@@ -2460,11 +2511,7 @@ impl Display for VmResponse {
             Ok => write!(f, "ok"),
             Err(e) => write!(f, "error: {}", e),
             ErrString(e) => write!(f, "error: {}", e),
-            RegisterMemory { gfn, slot } => write!(
-                f,
-                "memory registered to guest page frame number {:#x} and memory slot {}",
-                gfn, slot
-            ),
+            RegisterMemory { slot } => write!(f, "memory registered in slot {}", slot),
             #[cfg(feature = "balloon")]
             VmResponse::BalloonStats {
                 stats,

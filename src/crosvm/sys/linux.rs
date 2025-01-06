@@ -370,10 +370,11 @@ fn create_virtio_devices(
         }
     }
 
-    for (_, param) in cfg.serial_parameters.iter().filter(|(_k, v)| {
-        v.hardware == SerialHardware::VirtioConsole
-            || v.hardware == SerialHardware::LegacyVirtioConsole
-    }) {
+    for (_, param) in cfg
+        .serial_parameters
+        .iter()
+        .filter(|(_k, v)| v.hardware == SerialHardware::VirtioConsole)
+    {
         let dev = param.create_virtio_device_and_jail(cfg.protection_type, &cfg.jail_config)?;
         devs.push(dev);
     }
@@ -506,6 +507,7 @@ fn create_virtio_devices(
     let mut single_touch_idx = 0;
     let mut trackpad_idx = 0;
     let mut multi_touch_trackpad_idx = 0;
+    let mut custom_idx = 0;
     for input in &cfg.virtio_input {
         let input_dev = match input {
             InputDeviceOption::Evdev { path } => {
@@ -643,6 +645,17 @@ fn create_virtio_devices(
                 multi_touch_trackpad_idx += 1;
                 dev
             }
+            InputDeviceOption::Custom { path, config_path } => {
+                let dev = create_custom_device(
+                    cfg.protection_type,
+                    &cfg.jail_config,
+                    path.as_path(),
+                    custom_idx,
+                    config_path.clone(),
+                )?;
+                custom_idx += 1;
+                dev
+            }
         };
         devs.push(input_dev);
     }
@@ -721,6 +734,19 @@ fn create_virtio_devices(
                 snd_params,
             )?);
         }
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[cfg(feature = "media")]
+    {
+        for v4l2_device in &cfg.v4l2_proxy {
+            devs.push(create_v4l2_device(cfg.protection_type, v4l2_device)?);
+        }
+    }
+
+    #[cfg(feature = "media")]
+    if cfg.simple_media_device {
+        devs.push(create_simple_media_device(cfg.protection_type)?);
     }
 
     #[cfg(feature = "video-decoder")]
@@ -1312,96 +1338,107 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         if !cfg.cpu_frequencies_khz.is_empty() {
             cpu_frequencies = cfg.cpu_frequencies_khz.clone();
         } else {
-            let host_cpu_frequencies = Arch::get_host_cpu_frequencies_khz()?;
-
-            for cpu_id in 0..cfg.vcpu_count.unwrap_or(1) {
-                let vcpu_affinity = match cfg.vcpu_affinity.clone() {
-                    Some(VcpuAffinity::Global(v)) => v,
-                    Some(VcpuAffinity::PerVcpu(mut m)) => m.remove(&cpu_id).unwrap_or_default(),
-                    None => {
-                        panic!("There must be some vcpu_affinity setting with VirtCpufreq enabled!")
-                    }
-                };
-
-                // Check that the physical CPUs that the vCPU is affined to all share the same
-                // frequency domain.
-                if let Some(freq_domain) = host_cpu_frequencies.get(&vcpu_affinity[0]) {
-                    for cpu in vcpu_affinity.iter() {
-                        if let Some(frequencies) = host_cpu_frequencies.get(cpu) {
-                            if frequencies != freq_domain {
-                                panic!("Affined CPUs do not share a frequency domain!");
+            match Arch::get_host_cpu_frequencies_khz() {
+                Ok(host_cpu_frequencies) => {
+                    for cpu_id in 0..cfg.vcpu_count.unwrap_or(1) {
+                        let vcpu_affinity = match cfg.vcpu_affinity.clone() {
+                            Some(VcpuAffinity::Global(v)) => v,
+                            Some(VcpuAffinity::PerVcpu(mut m)) => {
+                                m.remove(&cpu_id).unwrap_or_default()
                             }
+                            None => {
+                                panic!("There must be some vcpu_affinity setting with VirtCpufreq enabled!")
+                            }
+                        };
+
+                        // Check that the physical CPUs that the vCPU is affined to all share the
+                        // same frequency domain.
+                        if let Some(freq_domain) = host_cpu_frequencies.get(&vcpu_affinity[0]) {
+                            for cpu in vcpu_affinity.iter() {
+                                if let Some(frequencies) = host_cpu_frequencies.get(cpu) {
+                                    if frequencies != freq_domain {
+                                        panic!("Affined CPUs do not share a frequency domain!");
+                                    }
+                                }
+                            }
+                            cpu_frequencies.insert(cpu_id, freq_domain.clone());
+                        } else {
+                            panic!("No frequency domain for cpu:{}", cpu_id);
                         }
                     }
-                    cpu_frequencies.insert(cpu_id, freq_domain.clone());
-                } else {
-                    panic!("No frequency domain for cpu:{}", cpu_id);
+                }
+                Err(e) => {
+                    warn!("Unable to get host cpu frequencies {:#}", e);
                 }
             }
         }
-        let mut max_freqs = Vec::new();
 
-        for (_cpu, frequencies) in cpu_frequencies.iter() {
-            max_freqs.push(*frequencies.iter().max().ok_or(Error::new(libc::EINVAL))?)
-        }
+        if !cpu_frequencies.is_empty() {
+            let mut max_freqs = Vec::new();
 
-        let host_max_freqs = Arch::get_host_cpu_max_freq_khz()?;
-        let largest_host_max_freq = host_max_freqs
-            .values()
-            .max()
-            .ok_or(Error::new(libc::EINVAL))?;
-
-        for (cpu_id, max_freq) in max_freqs.iter().enumerate() {
-            let normalized_cpu_capacity = (u64::from(*cpu_capacity.get(&cpu_id).unwrap())
-                * u64::from(*max_freq))
-            .checked_div(u64::from(*largest_host_max_freq))
-            .ok_or(Error::new(libc::EINVAL))?;
-            normalized_cpu_capacities.insert(
-                cpu_id,
-                u32::try_from(normalized_cpu_capacity).map_err(|_| Error::new(libc::EINVAL))?,
-            );
-        }
-
-        if !cfg.cpu_freq_domains.is_empty() {
-            let cgroup_path = cfg
-                .vcpu_cgroup_path
-                .clone()
-                .context("cpu_freq_domains requires vcpu_cgroup_path")?;
-
-            if !cgroup_path.join("cgroup.controllers").exists() {
-                panic!("CGroupsV2 must be enabled for cpu freq domain support!");
+            for (_cpu, frequencies) in cpu_frequencies.iter() {
+                max_freqs.push(*frequencies.iter().max().ok_or(Error::new(libc::EINVAL))?)
             }
 
-            // Assign parent crosvm process to top level cgroup
-            let cgroup_procs_path = cgroup_path.join("cgroup.procs");
-            std::fs::write(
-                cgroup_procs_path.clone(),
-                process::id().to_string().as_bytes(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to create vcpu-cgroup-path {}",
-                    cgroup_procs_path.display(),
+            let host_max_freqs = Arch::get_host_cpu_max_freq_khz()?;
+            let largest_host_max_freq = host_max_freqs
+                .values()
+                .max()
+                .ok_or(Error::new(libc::EINVAL))?;
+
+            for (cpu_id, max_freq) in max_freqs.iter().enumerate() {
+                let normalized_cpu_capacity = (u64::from(*cpu_capacity.get(&cpu_id).unwrap())
+                    * u64::from(*max_freq))
+                .checked_div(u64::from(*largest_host_max_freq))
+                .ok_or(Error::new(libc::EINVAL))?;
+                normalized_cpu_capacities.insert(
+                    cpu_id,
+                    u32::try_from(normalized_cpu_capacity).map_err(|_| Error::new(libc::EINVAL))?,
+                );
+            }
+
+            if !cfg.cpu_freq_domains.is_empty() {
+                let cgroup_path = cfg
+                    .vcpu_cgroup_path
+                    .clone()
+                    .context("cpu_freq_domains requires vcpu_cgroup_path")?;
+
+                if !cgroup_path.join("cgroup.controllers").exists() {
+                    panic!("CGroupsV2 must be enabled for cpu freq domain support!");
+                }
+
+                // Assign parent crosvm process to top level cgroup
+                let cgroup_procs_path = cgroup_path.join("cgroup.procs");
+                std::fs::write(
+                    cgroup_procs_path.clone(),
+                    process::id().to_string().as_bytes(),
                 )
-            })?;
-
-            for (freq_domain_idx, cpus) in cfg.cpu_freq_domains.iter().enumerate() {
-                let vcpu_domain_path = cgroup_path.join(format!("vcpu-domain{}", freq_domain_idx));
-                // Create subtree for domain
-                create_dir_all(&vcpu_domain_path)?;
-
-                // Set vcpu_domain cgroup type as 'threaded' to get thread level granularity
-                // controls
-                let cgroup_type_path = cgroup_path.join(vcpu_domain_path.join("cgroup.type"));
-                std::fs::write(cgroup_type_path.clone(), b"threaded").with_context(|| {
+                .with_context(|| {
                     format!(
                         "failed to create vcpu-cgroup-path {}",
-                        cgroup_type_path.display(),
+                        cgroup_procs_path.display(),
                     )
                 })?;
-                for core_idx in cpus.iter() {
-                    vcpu_domain_paths.insert(*core_idx, vcpu_domain_path.clone());
-                    vcpu_domains.insert(*core_idx, freq_domain_idx as u32);
+
+                for (freq_domain_idx, cpus) in cfg.cpu_freq_domains.iter().enumerate() {
+                    let vcpu_domain_path =
+                        cgroup_path.join(format!("vcpu-domain{}", freq_domain_idx));
+                    // Create subtree for domain
+                    create_dir_all(&vcpu_domain_path)?;
+
+                    // Set vcpu_domain cgroup type as 'threaded' to get thread level granularity
+                    // controls
+                    let cgroup_type_path = cgroup_path.join(vcpu_domain_path.join("cgroup.type"));
+                    std::fs::write(cgroup_type_path.clone(), b"threaded").with_context(|| {
+                        format!(
+                            "failed to create vcpu-cgroup-path {}",
+                            cgroup_type_path.display(),
+                        )
+                    })?;
+                    for core_idx in cpus.iter() {
+                        vcpu_domain_paths.insert(*core_idx, vcpu_domain_path.clone());
+                        vcpu_domains.insert(*core_idx, freq_domain_idx as u32);
+                    }
                 }
             }
         }
@@ -1473,14 +1510,13 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         #[cfg(target_arch = "x86_64")]
         force_s2idle: cfg.force_s2idle,
         pvm_fw: pvm_fw_image,
-        #[cfg(target_arch = "x86_64")]
-        pcie_ecam: cfg.pcie_ecam,
-        #[cfg(target_arch = "x86_64")]
-        pci_low_start: cfg.pci_low_start,
+        pci_config: cfg.pci_config,
         dynamic_power_coefficient: cfg.dynamic_power_coefficient.clone(),
         boot_cpu: cfg.boot_cpu,
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         virt_cpufreq_v2: cfg.virt_cpufreq_v2,
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        sve_config: cfg.sve.unwrap_or_default(),
     })
 }
 
@@ -1538,9 +1574,10 @@ fn punch_holes_in_guest_mem_layout_for_mappings(
 fn create_guest_memory(
     cfg: &Config,
     components: &VmComponents,
+    arch_memory_layout: &<Arch as LinuxArch>::ArchMemoryLayout,
     hypervisor: &impl Hypervisor,
 ) -> Result<GuestMemory> {
-    let guest_mem_layout = Arch::guest_memory_layout(components, hypervisor)
+    let guest_mem_layout = Arch::guest_memory_layout(components, arch_memory_layout, hypervisor)
         .context("failed to create guest memory layout")?;
 
     let guest_mem_layout =
@@ -1582,7 +1619,9 @@ fn run_gz(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> 
     let gzvm = Geniezone::new_with_path(device_path)
         .with_context(|| format!("failed to open GenieZone device {}", device_path.display()))?;
 
-    let guest_mem = create_guest_memory(&cfg, &components, &gzvm)?;
+    let arch_memory_layout =
+        Arch::arch_memory_layout(&components).context("failed to create arch memory layout")?;
+    let guest_mem = create_guest_memory(&cfg, &components, &arch_memory_layout, &gzvm)?;
 
     #[cfg(feature = "swap")]
     let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
@@ -1617,6 +1656,7 @@ fn run_gz(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> 
     run_vm::<GeniezoneVcpu, GeniezoneVm>(
         cfg,
         components,
+        &arch_memory_layout,
         vm,
         &mut irq_chip,
         ioapic_host_tube,
@@ -1637,7 +1677,9 @@ fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) ->
     let kvm = Kvm::new_with_path(device_path)
         .with_context(|| format!("failed to open KVM device {}", device_path.display()))?;
 
-    let guest_mem = create_guest_memory(&cfg, &components, &kvm)?;
+    let arch_memory_layout =
+        Arch::arch_memory_layout(&components).context("failed to create arch memory layout")?;
+    let guest_mem = create_guest_memory(&cfg, &components, &arch_memory_layout, &kvm)?;
 
     #[cfg(feature = "swap")]
     let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
@@ -1658,6 +1700,9 @@ fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) ->
     }
 
     // Check that the VM was actually created in protected mode as expected.
+    // This check is only needed on aarch64. On x86_64, protected VM creation will fail
+    // if protected mode is not supported.
+    #[cfg(not(target_arch = "x86_64"))]
     if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
         bail!("Failed to create protected VM");
     }
@@ -1715,6 +1760,7 @@ fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) ->
     run_vm::<KvmVcpu, KvmVm>(
         cfg,
         components,
+        &arch_memory_layout,
         vm,
         irq_chip.as_mut(),
         ioapic_host_tube,
@@ -1738,7 +1784,9 @@ fn run_gunyah(
     let gunyah = Gunyah::new_with_path(device_path)
         .with_context(|| format!("failed to open Gunyah device {}", device_path.display()))?;
 
-    let guest_mem = create_guest_memory(&cfg, &components, &gunyah)?;
+    let arch_memory_layout =
+        Arch::arch_memory_layout(&components).context("failed to create arch memory layout")?;
+    let guest_mem = create_guest_memory(&cfg, &components, &arch_memory_layout, &gunyah)?;
 
     #[cfg(feature = "swap")]
     let swap_controller = if let Some(swap_dir) = cfg.swap_dir.as_ref() {
@@ -1762,6 +1810,7 @@ fn run_gunyah(
     run_vm::<GunyahVcpu, GunyahVm>(
         cfg,
         components,
+        &arch_memory_layout,
         vm,
         &mut GunyahIrqChip::new(vm_clone)?,
         None,
@@ -1835,6 +1884,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 fn run_vm<Vcpu, V>(
     cfg: Config,
     #[allow(unused_mut)] mut components: VmComponents,
+    arch_memory_layout: &<Arch as LinuxArch>::ArchMemoryLayout,
     mut vm: V,
     irq_chip: &mut dyn IrqChipArch,
     ioapic_host_tube: Option<Tube>,
@@ -1937,7 +1987,7 @@ where
 
     let pstore_size = components.pstore.as_ref().map(|pstore| pstore.size as u64);
     let mut sys_allocator = SystemAllocator::new(
-        Arch::get_system_allocator_config(&vm),
+        Arch::get_system_allocator_config(&vm, arch_memory_layout),
         pstore_size,
         &cfg.mmio_address_ranges,
     )
@@ -2166,6 +2216,7 @@ where
 
     let mut linux = Arch::build_vm::<V, Vcpu>(
         components,
+        arch_memory_layout,
         &vm_evt_wrtube,
         &mut sys_allocator,
         &cfg.serial_parameters,
@@ -3072,6 +3123,14 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         VmRequest::VcpuPidTid => VmResponse::VcpuPidTidResponse {
             pid_tid_map: state.vcpus_pid_tid.clone(),
         },
+        VmRequest::Throttle(vcpu, cycles) => {
+            vcpu::kick_vcpu(
+                &state.vcpu_handles.get(vcpu),
+                state.linux.irq_chip.as_irq_chip(),
+                VcpuControl::Throttle(cycles),
+            );
+            return Ok(VmRequestResult::new(None, false));
+        }
         _ => {
             if !state.cfg.force_s2idle {
                 #[cfg(feature = "pvclock")]
@@ -3118,6 +3177,13 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 None,
                 &mut state.linux.bat_control,
                 kick_all_vcpus,
+                |index, msg| {
+                    vcpu::kick_vcpu(
+                        &state.vcpu_handles.get(index),
+                        state.linux.irq_chip.as_irq_chip(),
+                        msg,
+                    )
+                },
                 state.cfg.force_s2idle,
                 #[cfg(feature = "swap")]
                 state.swap_controller.as_ref(),

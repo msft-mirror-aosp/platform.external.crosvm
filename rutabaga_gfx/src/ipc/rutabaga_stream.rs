@@ -5,8 +5,9 @@
 use std::collections::VecDeque;
 use std::mem::size_of;
 
-use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
 
 use crate::bytestream::Reader;
 use crate::bytestream::Writer;
@@ -20,7 +21,7 @@ use crate::rutabaga_os::DEFAULT_RAW_DESCRIPTOR;
 use crate::rutabaga_utils::RutabagaError;
 use crate::rutabaga_utils::RutabagaHandle;
 use crate::rutabaga_utils::RutabagaResult;
-use crate::rutabaga_utils::RUTABAGA_FENCE_HANDLE_TYPE_EVENT_FD;
+use crate::rutabaga_utils::RUTABAGA_HANDLE_TYPE_SIGNAL_EVENT_FD;
 
 const MAX_DESCRIPTORS: usize = 1;
 const MAX_COMMAND_SIZE: usize = 4096;
@@ -42,7 +43,7 @@ impl RutabagaStream {
         }
     }
 
-    pub fn write<T: FromBytes + AsBytes>(
+    pub fn write<T: FromBytes + IntoBytes + Immutable>(
         &mut self,
         encode: KumquatGpuProtocolWrite<T>,
     ) -> RutabagaResult<()> {
@@ -124,7 +125,7 @@ impl RutabagaStream {
 
                     let handle = RutabagaHandle {
                         os_handle,
-                        handle_type: RUTABAGA_FENCE_HANDLE_TYPE_EVENT_FD,
+                        handle_type: RUTABAGA_HANDLE_TYPE_SIGNAL_EVENT_FD,
                     };
 
                     KumquatGpuProtocol::TransferToHost3d(resp, handle)
@@ -137,7 +138,7 @@ impl RutabagaStream {
 
                     let handle = RutabagaHandle {
                         os_handle,
-                        handle_type: RUTABAGA_FENCE_HANDLE_TYPE_EVENT_FD,
+                        handle_type: RUTABAGA_HANDLE_TYPE_SIGNAL_EVENT_FD,
                     };
 
                     KumquatGpuProtocol::TransferFromHost3d(resp, handle)

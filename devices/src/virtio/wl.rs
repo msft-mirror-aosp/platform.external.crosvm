@@ -124,9 +124,9 @@ use rutabaga_gfx::RutabagaIntoRawDescriptor;
 use rutabaga_gfx::RUTABAGA_MAP_CACHE_CACHED;
 #[cfg(feature = "minigbm")]
 use rutabaga_gfx::RUTABAGA_MAP_CACHE_MASK;
+use snapshot::AnySnapshot;
 use thiserror::Error as ThisError;
 use vm_control::VmMemorySource;
-use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
 use zerocopy::AsBytes;
@@ -2096,8 +2096,8 @@ impl VirtioDevice for Wl {
         })
     }
 
-    fn set_shared_memory_region_base(&mut self, shmem_base: GuestAddress) {
-        self.address_offset = Some(shmem_base.0);
+    fn set_shared_memory_region(&mut self, shmem_region: AddressRange) {
+        self.address_offset = Some(shmem_region.start);
     }
 
     fn set_shared_memory_mapper(&mut self, mapper: Box<dyn SharedMemoryMapper>) {
@@ -2132,16 +2132,12 @@ impl VirtioDevice for Wl {
     // implementation as part of b/266514618
     // virtio-wl is not used, but is created. As such, virtio_snapshot/restore will be called when
     // cuttlefish attempts to take a snapshot.
-    fn virtio_snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::Value::Null)
+    fn virtio_snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
+        AnySnapshot::to_any(())
     }
 
-    fn virtio_restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            data == serde_json::Value::Null,
-            "unexpected snapshot data: should be null, got {}",
-            data,
-        );
+    fn virtio_restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
+        let () = AnySnapshot::from_any(data)?;
         Ok(())
     }
 }

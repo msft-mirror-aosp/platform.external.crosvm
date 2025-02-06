@@ -186,7 +186,7 @@ crosvm run \
 Add a custom virtio-input device.
 
 - `path` (required): path to event source socket
-- `config_path` (required): path to file configuring device
+- `config-path` (required): path to file configuring device
 
 ```sh
 crosvm run \
@@ -195,45 +195,22 @@ crosvm run \
 ```
 
 This config_path requires a JSON-formatted configuration file. "events" configures the supported
-events. "name" defines the customized device name, "serial" defines customized serial name. The
-properties and axis info are yet to be supported.
+events. "name" defines the customized device name, "serial" defines customized serial name,
+"properties" defines the device properties and "axis_info" defines the axis information.
 
-Here is an example of event config file:
+An example configuration file covering all property types can be found in
+[`/devices/tests/data/input/example_custom_multitouchscreen_config.json`](https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/tests/data/input/example_custom_multitouchscreen_config.json).
+It configures a device equivalent to the default multitouch screen device
+(`crosvm run --input=multi-touch,...`). Another example can be found in
+[`/devices/tests/data/input/example_custom_keyboard_config.json`](https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/tests/data/input/example_custom_keyboard_config.json),
+which configures a device equivalent to the default keyboard (`crosvm run --input=keyboard,...`).
+
+Here is a portion of the example config file:
 
 ```
-{
-  "name": "Virtio Custom",
-  "serial_name": "virtio-custom",
-  "events": [
-    {
-      "event_type": "EV_KEY",
-      "event_type_code": 1,
-      "supported_events": {
-        "KEY_ESC": 1,
-        "KEY_1": 2,
-        "KEY_2": 3,
-        "KEY_A": 30,
-        "KEY_B": 48,
-        "KEY_SPACE": 57
-      }
-    },
-    {
-      "event_type": "EV_REP",
-      "event_type_code": 20,
-      "supported_events": {
-        "REP_DELAY": 0,
-        "REP_PERIOD": 1
-      }
-    },
-    {
-      "event_type": "EV_LED",
-      "event_type_code": 17,
-      "supported_events": {
-        "LED_NUML": 0,
-        "LED_CAPSL": 1,
-        "LED_SCROLLL": 2
-      }
-    }
-  ]
-}
+{{#include ../../../../devices/tests/data/input/example_custom_multitouchscreen_config.json::12}}
+          ...
+{{#include ../../../../devices/tests/data/input/example_custom_multitouchscreen_config.json:23:33}}
+          ...
+{{#include ../../../../devices/tests/data/input/example_custom_multitouchscreen_config.json:68:}}
 ```

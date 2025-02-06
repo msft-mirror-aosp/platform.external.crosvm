@@ -11,6 +11,7 @@ use cros_fdt::Fdt;
 use cros_fdt::FdtNode;
 use libc::ENOENT;
 use libc::ENOTSUP;
+use snapshot::AnySnapshot;
 use vm_memory::GuestAddress;
 use vm_memory::MemoryRegionPurpose;
 
@@ -131,6 +132,7 @@ impl VmAArch64 for GunyahVm {
         let mut base_set = false;
         for region in self.guest_mem.regions() {
             let create_shm_node = match region.options.purpose {
+                MemoryRegionPurpose::Bios => false,
                 MemoryRegionPurpose::GuestMemoryRegion => {
                     // Assume first GuestMemoryRegion contains the payload
                     // This memory region is described by the "base-address" property
@@ -141,6 +143,7 @@ impl VmAArch64 for GunyahVm {
                 }
                 // Described by the "firmware-address" property
                 MemoryRegionPurpose::ProtectedFirmwareRegion => false,
+                MemoryRegionPurpose::ReservedMemory => true,
                 MemoryRegionPurpose::StaticSwiotlbRegion => true,
             };
 
@@ -250,11 +253,11 @@ impl VcpuAArch64 for GunyahVcpu {
         Err(Error::new(ENOTSUP))
     }
 
-    fn hypervisor_specific_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn hypervisor_specific_snapshot(&self) -> anyhow::Result<AnySnapshot> {
         unimplemented!()
     }
 
-    fn hypervisor_specific_restore(&self, _data: serde_json::Value) -> anyhow::Result<()> {
+    fn hypervisor_specific_restore(&self, _data: AnySnapshot) -> anyhow::Result<()> {
         unimplemented!()
     }
 }

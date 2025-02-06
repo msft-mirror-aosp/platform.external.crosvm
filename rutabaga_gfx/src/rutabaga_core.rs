@@ -173,6 +173,15 @@ pub trait RutabagaComponent {
         })
     }
 
+    fn import(
+        &self,
+        _resource_id: u32,
+        _import_handle: RutabagaHandle,
+        _import_data: RutabagaImportData,
+    ) -> RutabagaResult<Option<RutabagaResource>> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// Implementations must attach `vecs` to the resource.
     fn attach_backing(
         &self,
@@ -274,6 +283,15 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// Implementations must restore the context from the given stream.
+    fn restore_context(
+        &self,
+        _snapshot: Vec<u8>,
+        _fence_handler: RutabagaFenceHandler,
+    ) -> RutabagaResult<Box<dyn RutabagaContext>> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// Implementations should resume workers.
     fn resume(&self) -> RutabagaResult<()> {
         Ok(())
@@ -324,6 +342,11 @@ pub trait RutabagaContext {
 
     /// Implementations must return the component type associated with the context.
     fn component_type(&self) -> RutabagaComponentType;
+
+    /// Implementations must serialize the context.
+    fn snapshot(&self) -> RutabagaResult<Vec<u8>> {
+        Err(RutabagaError::Unsupported)
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -436,8 +459,9 @@ pub struct Rutabaga {
 /// The serialized and deserialized parts of `Rutabaga` that are preserved across
 /// snapshot() and restore().
 #[derive(Deserialize, Serialize)]
-pub struct RutabagaSnapshot {
-    pub resources: Map<u32, RutabagaResourceSnapshot>,
+struct RutabagaSnapshot {
+    resources: Map<u32, RutabagaResourceSnapshot>,
+    contexts: Map<u32, Vec<u8>>,
 }
 
 impl Rutabaga {
@@ -453,26 +477,38 @@ impl Rutabaga {
     /// Take a snapshot of Rutabaga's current state. The snapshot is serialized into an opaque byte
     /// stream and written to `w`.
     pub fn snapshot(&self, w: &mut impl Write, directory: &str) -> RutabagaResult<()> {
-        if self.default_component == RutabagaComponentType::Gfxstream {
-            let component = self
-                .components
-                .get(&self.default_component)
-                .ok_or(RutabagaError::InvalidComponent)?;
+        let component = self
+            .components
+            .get(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
 
-            component.snapshot(directory)
-        } else if self.default_component == RutabagaComponentType::Rutabaga2D {
-            let snapshot = RutabagaSnapshot {
-                resources: self
-                    .resources
-                    .iter()
-                    .map(|(i, r)| Ok((*i, RutabagaResourceSnapshot::try_from(r)?)))
-                    .collect::<RutabagaResult<_>>()?,
-            };
+        component.snapshot(directory)?;
 
-            serde_json::to_writer(w, &snapshot).map_err(|e| RutabagaError::IoError(e.into()))
-        } else {
-            Err(RutabagaError::Unsupported)
-        }
+        let snapshot = RutabagaSnapshot {
+            resources: self
+                .resources
+                .iter()
+                .map(|(i, r)| Ok((*i, RutabagaResourceSnapshot::try_from(r)?)))
+                .collect::<RutabagaResult<_>>()?,
+            contexts: self
+                .contexts
+                .iter()
+                .map(|(i, c)| Ok((*i, c.snapshot()?)))
+                .collect::<RutabagaResult<_>>()?,
+        };
+
+        serde_json::to_writer(w, &snapshot).map_err(|e| RutabagaError::IoError(e.into()))
+    }
+
+    fn destroy_objects(&mut self) -> RutabagaResult<()> {
+        let resource_ids: Vec<_> = self.resources.keys().cloned().collect();
+        resource_ids
+            .into_iter()
+            .try_for_each(|resource_id| self.unref_resource(resource_id))?;
+
+        self.contexts.clear();
+
+        Ok(())
     }
 
     /// Restore Rutabaga to a previously snapshot'd state.
@@ -497,27 +533,30 @@ impl Rutabaga {
     /// approach would scale to support 3D modes, which have others problems that require VMM help,
     /// like resource handles.
     pub fn restore(&mut self, r: &mut impl Read, directory: &str) -> RutabagaResult<()> {
-        if self.default_component == RutabagaComponentType::Gfxstream {
-            let component = self
-                .components
-                .get_mut(&self.default_component)
-                .ok_or(RutabagaError::InvalidComponent)?;
+        self.destroy_objects()?;
 
-            component.restore(directory)
-        } else if self.default_component == RutabagaComponentType::Rutabaga2D {
-            let snapshot: RutabagaSnapshot =
-                serde_json::from_reader(r).map_err(|e| RutabagaError::IoError(e.into()))?;
+        let component = self
+            .components
+            .get_mut(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
 
-            self.resources = snapshot
-                .resources
-                .into_iter()
-                .map(|(i, s)| Ok((i, RutabagaResource::try_from(s)?)))
-                .collect::<RutabagaResult<_>>()?;
+        component.restore(directory)?;
 
-            return Ok(());
-        } else {
-            Err(RutabagaError::Unsupported)
-        }
+        let snapshot: RutabagaSnapshot =
+            serde_json::from_reader(r).map_err(|e| RutabagaError::IoError(e.into()))?;
+
+        self.resources = snapshot
+            .resources
+            .into_iter()
+            .map(|(i, s)| Ok((i, RutabagaResource::try_from(s)?)))
+            .collect::<RutabagaResult<_>>()?;
+        self.contexts = snapshot
+            .contexts
+            .into_iter()
+            .map(|(i, c)| Ok((i, component.restore_context(c, self.fence_handler.clone())?)))
+            .collect::<RutabagaResult<_>>()?;
+
+        Ok(())
     }
 
     pub fn resume(&self) -> RutabagaResult<()> {
@@ -653,6 +692,33 @@ impl Rutabaga {
 
         let resource = component.create_3d(resource_id, resource_create_3d)?;
         self.resources.insert(resource_id, resource);
+        Ok(())
+    }
+
+    /// Creates and imports to a resource with the external `import_handle` and the `import_data`
+    /// metadata.
+    pub fn resource_import(
+        &mut self,
+        resource_id: u32,
+        import_handle: RutabagaHandle,
+        import_data: RutabagaImportData,
+    ) -> RutabagaResult<()> {
+        let component = self
+            .components
+            .get_mut(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+
+        match component.import(resource_id, import_handle, import_data) {
+            Ok(Some(resource)) => {
+                self.resources.insert(resource_id, resource);
+            }
+            Ok(None) => {
+                if !self.resources.contains_key(&resource_id) {
+                    return Err(RutabagaError::InvalidResourceId);
+                }
+            }
+            Err(e) => return Err(e),
+        };
         Ok(())
     }
 
@@ -826,7 +892,7 @@ impl Rutabaga {
             let handle_opt = resource.handle.take();
             match handle_opt {
                 Some(handle) => {
-                    if handle.handle_type != RUTABAGA_MEM_HANDLE_TYPE_SHM {
+                    if handle.handle_type != RUTABAGA_HANDLE_TYPE_MEM_SHM {
                         return Err(RutabagaError::SpecViolation(
                             "expected a shared memory handle",
                         ));

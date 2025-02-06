@@ -23,14 +23,18 @@ use data_model::FlexibleArrayWrapper;
 use kvm_sys::*;
 use libc::E2BIG;
 use libc::EAGAIN;
+use libc::EINVAL;
 use libc::EIO;
+use libc::ENOMEM;
 use libc::ENXIO;
 use serde::Deserialize;
 use serde::Serialize;
+use snapshot::AnySnapshot;
 use vm_memory::GuestAddress;
 
 use super::Config;
 use super::Kvm;
+use super::KvmCap;
 use super::KvmVcpu;
 use super::KvmVm;
 use crate::host_phys_addr_bits;
@@ -160,7 +164,7 @@ impl Kvm {
         if protection_type.isolates_memory() {
             Ok(KVM_X86_PKVM_PROTECTED_VM)
         } else {
-            Ok(0)
+            Ok(KVM_X86_DEFAULT_VM)
         }
     }
 
@@ -445,11 +449,69 @@ impl KvmVm {
             Ok(())
         }
     }
+
+    /// Get pKVM hypervisor details, e.g. the firmware size.
+    ///
+    /// Returns `Err` if not running under pKVM.
+    ///
+    /// Uses `KVM_ENABLE_CAP` internally, but it is only a getter, there should be no side effects
+    /// in KVM.
+    fn get_protected_vm_info(&self) -> Result<KvmProtectedVmInfo> {
+        let mut info = KvmProtectedVmInfo {
+            firmware_size: 0,
+            reserved: [0; 7],
+        };
+        // SAFETY:
+        // Safe because we allocated the struct and we know the kernel won't write beyond the end of
+        // the struct or keep a pointer to it.
+        unsafe {
+            self.enable_raw_capability(
+                KvmCap::X86ProtectedVm,
+                KVM_CAP_X86_PROTECTED_VM_FLAGS_INFO,
+                &[&mut info as *mut KvmProtectedVmInfo as u64, 0, 0, 0],
+            )
+        }?;
+        Ok(info)
+    }
+
+    fn set_protected_vm_firmware_gpa(&self, fw_addr: GuestAddress) -> Result<()> {
+        // SAFETY:
+        // Safe because none of the args are pointers.
+        unsafe {
+            self.enable_raw_capability(
+                KvmCap::X86ProtectedVm,
+                KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_FW_GPA,
+                &[fw_addr.0, 0, 0, 0],
+            )
+        }
+    }
+}
+
+#[repr(C)]
+struct KvmProtectedVmInfo {
+    firmware_size: u64,
+    reserved: [u64; 7],
 }
 
 impl VmX86_64 for KvmVm {
     fn get_hypervisor(&self) -> &dyn HypervisorX86_64 {
         &self.kvm
+    }
+
+    fn load_protected_vm_firmware(
+        &mut self,
+        fw_addr: GuestAddress,
+        fw_max_size: u64,
+    ) -> Result<()> {
+        let info = self.get_protected_vm_info()?;
+        if info.firmware_size == 0 {
+            Err(Error::new(EINVAL))
+        } else {
+            if info.firmware_size > fw_max_size {
+                return Err(Error::new(ENOMEM));
+            }
+            self.set_protected_vm_firmware_gpa(fw_addr)
+        }
     }
 
     fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuX86_64>> {
@@ -744,7 +806,7 @@ impl VcpuX86_64 for KvmVcpu {
         }
     }
 
-    fn get_interrupt_state(&self) -> Result<serde_json::Value> {
+    fn get_interrupt_state(&self) -> Result<AnySnapshot> {
         let mut vcpu_evts: kvm_vcpu_events = Default::default();
         let ret = {
             // SAFETY:
@@ -755,7 +817,7 @@ impl VcpuX86_64 for KvmVcpu {
         };
         if ret == 0 {
             Ok(
-                serde_json::to_value(VcpuEvents::from(&vcpu_evts)).map_err(|e| {
+                AnySnapshot::to_any(VcpuEvents::from(&vcpu_evts)).map_err(|e| {
                     error!("failed to serialize vcpu_events: {:?}", e);
                     Error::new(EIO)
                 })?,
@@ -765,9 +827,9 @@ impl VcpuX86_64 for KvmVcpu {
         }
     }
 
-    fn set_interrupt_state(&self, data: serde_json::Value) -> Result<()> {
+    fn set_interrupt_state(&self, data: AnySnapshot) -> Result<()> {
         let vcpu_events =
-            kvm_vcpu_events::from(&serde_json::from_value::<VcpuEvents>(data).map_err(|e| {
+            kvm_vcpu_events::from(&AnySnapshot::from_any::<VcpuEvents>(data).map_err(|e| {
                 error!("failed to deserialize vcpu_events: {:?}", e);
                 Error::new(EIO)
             })?);

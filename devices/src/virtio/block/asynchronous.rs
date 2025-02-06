@@ -50,6 +50,7 @@ use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use futures::FutureExt;
 use remain::sorted;
+use snapshot::AnySnapshot;
 use thiserror::Error as ThisError;
 use virtio_sys::virtio_config::VIRTIO_F_RING_PACKED;
 use vm_control::DiskControlCommand;
@@ -278,7 +279,6 @@ async fn process_one_chain(
     flush_timer: &RefCell<TimerAsync<Timer>>,
     flush_timer_armed: &RefCell<bool>,
 ) {
-    let _trace = cros_tracing::trace_event!(VirtioBlk, "process_one_chain");
     let len = match process_one_request(&mut avail_desc, disk_state, flush_timer, flush_timer_armed)
         .await
     {
@@ -822,7 +822,6 @@ impl BlockAsync {
                 let offset = sector
                     .checked_shl(u32::from(SECTOR_SHIFT))
                     .ok_or(ExecuteError::OutOfRange)?;
-                let _trace = cros_tracing::trace_event!(VirtioBlk, "in", offset, data_len);
                 check_range(offset, data_len as u64, disk_size)?;
                 let disk_image = &disk_state.disk_image;
                 writer
@@ -842,7 +841,6 @@ impl BlockAsync {
                 let offset = sector
                     .checked_shl(u32::from(SECTOR_SHIFT))
                     .ok_or(ExecuteError::OutOfRange)?;
-                let _trace = cros_tracing::trace_event!(VirtioBlk, "out", offset, data_len);
                 check_range(offset, data_len as u64, disk_size)?;
                 let disk_image = &disk_state.disk_image;
                 reader
@@ -865,12 +863,6 @@ impl BlockAsync {
                 }
             }
             VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => {
-                #[allow(clippy::if_same_then_else)]
-                let _trace = if req_type == VIRTIO_BLK_T_DISCARD {
-                    cros_tracing::trace_event!(VirtioBlk, "discard")
-                } else {
-                    cros_tracing::trace_event!(VirtioBlk, "write_zeroes")
-                };
                 if req_type == VIRTIO_BLK_T_DISCARD && !disk_state.sparse {
                     // Discard is a hint; if this is a non-sparse disk, just ignore it.
                     return Ok(());
@@ -926,7 +918,6 @@ impl BlockAsync {
                 }
             }
             VIRTIO_BLK_T_FLUSH => {
-                let _trace = cros_tracing::trace_event!(VirtioBlk, "flush");
                 disk_state
                     .disk_image
                     .fdatasync()
@@ -942,7 +933,6 @@ impl BlockAsync {
                 }
             }
             VIRTIO_BLK_T_GET_ID => {
-                let _trace = cros_tracing::trace_event!(VirtioBlk, "get_id");
                 if let Some(id) = disk_state.id {
                     writer.write_all(&id).map_err(ExecuteError::CopyId)?;
                 } else {
@@ -1174,18 +1164,14 @@ impl VirtioDevice for BlockAsync {
         Ok(())
     }
 
-    fn virtio_snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn virtio_snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
         // `virtio_sleep` ensures there is no pending state, except for the `Queue`s, which are
         // handled at a higher layer.
-        Ok(serde_json::Value::Null)
+        AnySnapshot::to_any(())
     }
 
-    fn virtio_restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            data == serde_json::Value::Null,
-            "unexpected snapshot data: should be null, got {}",
-            data,
-        );
+    fn virtio_restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
+        let () = AnySnapshot::from_any(data)?;
         Ok(())
     }
 
@@ -1810,14 +1796,12 @@ mod tests {
             [0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             "read_config should read the resized capacity"
         );
-        assert_eq!(
-            interrupt
-                    .get_interrupt_evt()
-                    // Wait a bit until the blk signals the interrupt
-                    .wait_timeout(Duration::from_millis(300)),
-            Ok(base::EventWaitResult::Signaled),
-            "interrupt should be signaled"
-        );
+        // Wait until the blk signals the interrupt
+        interrupt
+            .get_interrupt_evt()
+            .wait()
+            .expect("interrupt should be signaled");
+
         assert_eq!(
             interrupt.read_interrupt_status(),
             crate::virtio::INTERRUPT_STATUS_CONFIG_CHANGED as u8,

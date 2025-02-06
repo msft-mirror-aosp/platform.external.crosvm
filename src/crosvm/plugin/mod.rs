@@ -203,7 +203,7 @@ fn mmap_to_sys_err(e: MmapError) -> SysError {
 /// Each such object has an ID associated with it that exists in an ID space shared by every variant
 /// of `PluginObject`. This allows all the objects to be indexed in a single map, and allows for a
 /// common destroy method.
-
+///
 /// In addition to the destory method, each object may have methods specific to its variant type.
 /// These variant methods must be done by matching the variant to the expected type for that method.
 /// For example, getting the dirty log from a `Memory` object starting with an ID:
@@ -614,7 +614,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
         _ => panic!("Executable was not a plugin"),
     };
     let vcpu_count = cfg.vcpu_count.unwrap_or(1) as u32;
-    let mem = GuestMemory::new(&[]).unwrap();
+    let mut mem = GuestMemory::new(&[]).unwrap();
     let mut mem_policy = MemoryPolicy::empty();
     if cfg.hugepages {
         mem_policy |= MemoryPolicy::USE_HUGEPAGES;

@@ -13,12 +13,12 @@
 //! something to the guest on function 0.
 
 use base::RawDescriptor;
-use resources::Alloc;
 use resources::SystemAllocator;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
+use snapshot::AnySnapshot;
 
 use crate::pci::pci_configuration::PciBarConfiguration;
 use crate::pci::pci_configuration::PciClassCode;
@@ -164,15 +164,7 @@ impl PciDevice for StubPciDevice {
 
     fn allocate_address(&mut self, resources: &mut SystemAllocator) -> Result<PciAddress> {
         if self.assigned_address.is_none() {
-            if resources.reserve_pci(
-                Alloc::PciBar {
-                    bus: self.requested_address.bus,
-                    dev: self.requested_address.dev,
-                    func: self.requested_address.func,
-                    bar: 0,
-                },
-                self.debug_label(),
-            ) {
+            if resources.reserve_pci(self.requested_address, self.debug_label()) {
                 self.assigned_address = Some(self.requested_address);
             }
         }
@@ -212,11 +204,11 @@ impl Suspendable for StubPciDevice {
         Ok(())
     }
 
-    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
         self.config_regs.snapshot()
     }
 
-    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+    fn restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
         self.config_regs.restore(data)
     }
 }
@@ -289,7 +281,7 @@ mod test {
         let mut device = StubPciDevice::new(&CONFIG);
 
         assert!(device.allocate_address(&mut allocator).is_ok());
-        assert!(allocator.release_pci(0xa, 0xb, 1));
+        assert!(allocator.release_pci(PciAddress::new(0, 0xa, 0xb, 1).unwrap()));
     }
 
     #[test]

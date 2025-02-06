@@ -86,6 +86,7 @@ members = [
     "resources",
     "rutabaga_gfx",
     "serde_keyvalue",
+    "snapshot",
     "swap",
     "system_api",
     "third_party/vmm_vhost",
@@ -117,6 +118,7 @@ exclude = [
 
 [workspace.dependencies]
 tokio = { version = "1.29.1", features = ["net", "rt-multi-thread", "time", "sync", "macros"] }
+snapshot = { path = "snapshot" }
 
 [features]
 ## Default features of crosvm. This selection is somewhat arbitrary for historical reasons.
@@ -532,6 +534,7 @@ scudo = { version = "0.1", optional = true }
 serde = { version = "1", features = ["rc"] }
 serde_json = "1"
 serde_keyvalue = { path = "serde_keyvalue", features = ["argh_derive"] }
+snapshot = { workspace = true }
 smallvec = "1.6.1"
 static_assertions = "1.1"
 swap = { path = "swap" }
@@ -555,7 +558,7 @@ aarch64 = { path = "aarch64" }
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 minijail = "*" # provided by ebuild
-p9 = "0.2.3"
+p9 = "0.3.1"
 vhost = { path = "vhost" }
 android_audio = { path = "android_audio"}
 

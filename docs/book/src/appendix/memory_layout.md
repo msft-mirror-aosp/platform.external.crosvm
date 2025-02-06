@@ -7,7 +7,7 @@ see the source. All addresses are in hexadecimal.
 
 | Name/source link             | Address       | End (exclusive) | Size      | Notes                                                                                    |
 | ---------------------------- | ------------- | --------------- | --------- | ---------------------------------------------------------------------------------------- |
-| [`START_OF_RAM_32BITS`]      | `0000`        |                 |           | RAM                                                                                      |
+|                              | `0000`        | `A_0000`        | 640 KiB   | RAM (\<1M)                                                                               |
 | [`ZERO_PAGE_OFFSET`]         | `7000`        |                 |           | Linux boot_params structure                                                              |
 | [`BOOT_STACK_POINTER`]       | `8000`        |                 |           | Boot SP value                                                                            |
 | [`boot_pml4_addr`]           | `9000`        | `A000`          | 4 KiB     | Boot page table                                                                          |
@@ -16,11 +16,11 @@ see the source. All addresses are in hexadecimal.
 | [`CMDLINE_OFFSET`]           | `2_0000`      | `2_0800`        | 2 KiB     | Linux kernel command line                                                                |
 | [`SETUP_DATA_START`]         | `2_0800`      | `E_0000`        | 766 KiB   | Linux kernel `setup_data` linked list                                                    |
 | [`ACPI_HI_RSDP_WINDOW_BASE`] | `E_0000`      |                 |           | ACPI tables                                                                              |
+| [`mem_1m_to_4g`]             | `10_0000`     | `D000_0000`     | ~3.24 GiB | RAM (\<4G)                                                                               |
 | [`KERNEL_START_OFFSET`]      | `20_0000`     |                 |           | Linux kernel image load address                                                          |
 | [`initrd_start`]             | after kernel  |                 |           | Initial RAM disk for Linux kernel (optional)                                             |
-| [`END_ADDR_BEFORE_32BITS`]   | after initrd  | `D000_0000`     | ~3.24 GiB | RAM (\<4G)                                                                               |
-| [`PROTECTED_VM_FW_START`]    | `CFC0_0000`   | `D000_0000`     | 4 MiB     | pVM firmware (if running a protected VM)                                                 |
-| [`END_ADDR_BEFORE_32BITS`]   | `D000_0000`   | `F400_0000`     | 576 MiB   | Low (\<4G) MMIO allocation area                                                          |
+| [`PROTECTED_VM_FW_START`]    | `7FC0_0000`   | `8000_0000`     | 4 MiB     | pVM firmware (if running a protected VM)                                                 |
+| [`pci_mmio_before_32bit`]    | `D000_0000`   | `F400_0000`     | 576 MiB   | Low (\<4G) MMIO allocation area                                                          |
 | [`PCIE_CFG_MMIO_START`]      | `F400_0000`   | `F800_0000`     | 64 MiB    | PCIe enhanced config (ECAM)                                                              |
 | [`RESERVED_MEM_SIZE`]        | `F800_0000`   | `1_0000_0000`   | 128 MiB   | LAPIC/IOAPIC/HPET/…                                                                      |
 | [`IDENTITY_MAP_ADDR`]        | `FEFF_C000`   |                 |           | Identity map segment                                                                     |
@@ -28,7 +28,6 @@ see the source. All addresses are in hexadecimal.
 |                              | `1_0000_0000` |                 |           | RAM (>4G)                                                                                |
 |                              | (end of RAM)  |                 |           | High (>4G) MMIO allocation area                                                          |
 
-[`start_of_ram_32bits`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=351?q=START_OF_RAM_32BITS
 [`zero_page_offset`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=368?q=ZERO_PAGE_OFFSET
 [`boot_stack_pointer`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=350?q=BOOT_STACK_POINTER
 [`boot_pml4_addr`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/regs.rs;l=297?q=boot_pml4_addr
@@ -40,7 +39,8 @@ see the source. All addresses are in hexadecimal.
 [`kernel_start_offset`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=372?q=KERNEL_START_OFFSET
 [`initrd_start`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=1692?q=initrd_start
 [`protected_vm_fw_start`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=394?q=PROTECTED_VM_FW_START
-[`end_addr_before_32bits`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=356?q=END_ADDR_BEFORE_32BITS
+[`mem_1m_to_4g`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=737?q=mem_1m_to_4g
+[`pci_mmio_before_32bit`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=456?q=pci_mmio_before_32bit
 [`pcie_cfg_mmio_start`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=363?q=PCIE_CFG_MMIO_START
 [`reserved_mem_size`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=358?q=RESERVED_MEM_SIZE
 [`identity_map_addr`]: https://crsrc.org/o/src/platform/crosvm/x86_64/src/lib.rs;l=500?q=identity_map_addr_start
@@ -65,7 +65,7 @@ These apply for all boot modes.
 | [`AARCH64_PCI_CAM_BASE_DEFAULT`]  | `1_0000`        | `101_0000`      | 16 MiB         | PCI configuration (CAM)                                       |
 | [`AARCH64_VIRTFREQ_BASE`]         | `104_0000`      | `105_0000`      | 64 KiB         | Virtual cpufreq device                                        |
 | [`AARCH64_PVTIME_IPA_START`]      | `1ff_0000`      | `200_0000`      | 64 KiB         | Paravirtualized time                                          |
-| [`AARCH64_PCI_CAM_BASE_DEFAULT`]  | `200_0000`      | `400_0000`      | 32 MiB         | Low MMIO allocation area                                      |
+| [`AARCH64_PCI_MEM_BASE_DEFAULT`]  | `200_0000`      | `400_0000`      | 32 MiB         | Low MMIO allocation area                                      |
 | [`AARCH64_GIC_CPUI_BASE`]         | `3ffd_0000`     | `3fff_0000`     | 128 KiB        | vGIC                                                          |
 | [`AARCH64_GIC_DIST_BASE`]         | `3fff_0000`     | `4000_0000`     | 64 KiB         | vGIC                                                          |
 | [`AARCH64_PROTECTED_VM_FW_START`] | `7fc0_0000`     | `8000_0000`     | 4 MiB          | pVM firmware (if running a protected VM)                      |
@@ -105,9 +105,9 @@ with a 16 MiB alignment.
 [serial_addr]: https://crsrc.org/o/src/platform/crosvm/arch/src/serial.rs;l=78?q=SERIAL_ADDR
 [`aarch64_rtc_addr`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=177?q=AARCH64_RTC_ADDR
 [`aarch64_vmwdt_addr`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=187?q=AARCH64_VMWDT_ADDR
-[`aarch64_pci_cfg_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=192?q=AARCH64_PCI_CAM_BASE_DEFAULT
 [`aarch64_virtfreq_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=207?q=AARCH64_VIRTFREQ_BASE
-[`aarch64_mmio_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=196?q=AARCH64_PCI_CAM_BASE_DEFAULT
+[`aarch64_pci_cam_base_default`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=154?q=AARCH64_PCI_CAM_BASE_DEFAULT
+[`aarch64_pci_mem_base_default`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=154?q=AARCH64_PCI_MEM_BASE_DEFAULT
 [`aarch64_gic_cpui_base`]: https://crsrc.org/o/src/platform/crosvm/devices/src/irqchip/kvm/aarch64.rs;l=106?q=AARCH64_GIC_CPUI_BASE
 [`aarch64_gic_dist_base`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=105?q=AARCH64_GIC_DIST_BASE
 [`aarch64_pvtime_ipa_start`]: https://crsrc.org/o/src/platform/crosvm/aarch64/src/lib.rs;l=100?q=AARCH64_PVTIME_IPA_START

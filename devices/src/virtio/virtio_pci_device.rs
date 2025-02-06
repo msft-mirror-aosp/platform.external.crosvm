@@ -26,11 +26,13 @@ use hypervisor::MemCacheType;
 use libc::ERANGE;
 #[cfg(target_arch = "x86_64")]
 use metrics::MetricEventType;
+use resources::AddressRange;
 use resources::Alloc;
 use resources::AllocOptions;
 use resources::SystemAllocator;
 use serde::Deserialize;
 use serde::Serialize;
+use snapshot::AnySnapshot;
 use sync::Mutex;
 use virtio_sys::virtio_config::VIRTIO_CONFIG_S_ACKNOWLEDGE;
 use virtio_sys::virtio_config::VIRTIO_CONFIG_S_DRIVER;
@@ -43,7 +45,6 @@ use vm_control::api::VmMemoryClient;
 use vm_control::VmMemoryDestination;
 use vm_control::VmMemoryRegionId;
 use vm_control::VmMemorySource;
-use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
@@ -331,17 +332,17 @@ enum SleepState {
 
 #[derive(Serialize, Deserialize)]
 struct VirtioPciDeviceSnapshot {
-    config_regs: serde_json::Value,
+    config_regs: AnySnapshot,
 
-    inner_device: serde_json::Value,
+    inner_device: AnySnapshot,
     device_activated: bool,
 
     interrupt: Option<InterruptSnapshot>,
-    msix_config: serde_json::Value,
+    msix_config: AnySnapshot,
     common_config: VirtioPciCommonConfig,
 
-    queues: Vec<serde_json::Value>,
-    activated_queues: Option<Vec<(usize, serde_json::Value)>>,
+    queues: Vec<AnySnapshot>,
+    activated_queues: Option<Vec<(usize, AnySnapshot)>>,
 }
 
 impl VirtioPciDevice {
@@ -725,28 +726,12 @@ impl PciDevice for VirtioPciDevice {
     ) -> std::result::Result<PciAddress, PciDeviceError> {
         if self.pci_address.is_none() {
             if let Some(address) = self.preferred_address {
-                if !resources.reserve_pci(
-                    Alloc::PciBar {
-                        bus: address.bus,
-                        dev: address.dev,
-                        func: address.func,
-                        bar: 0,
-                    },
-                    self.debug_label(),
-                ) {
+                if !resources.reserve_pci(address, self.debug_label()) {
                     return Err(PciDeviceError::PciAllocationFailed);
                 }
                 self.pci_address = Some(address);
             } else {
-                self.pci_address = match resources.allocate_pci(0, self.debug_label()) {
-                    Some(Alloc::PciBar {
-                        bus,
-                        dev,
-                        func,
-                        bar: _,
-                    }) => Some(PciAddress { bus, dev, func }),
-                    _ => None,
-                }
+                self.pci_address = resources.allocate_pci(0, self.debug_label());
             }
         }
         self.pci_address.ok_or(PciDeviceError::PciAllocationFailed)
@@ -914,8 +899,6 @@ impl PciDevice for VirtioPciDevice {
                 }
                 _ => (),
             }
-        } else {
-            self.device.read_bar(bar_index, offset, data);
         }
     }
 
@@ -969,8 +952,6 @@ impl PciDevice for VirtioPciDevice {
                 }
                 _ => (),
             }
-        } else {
-            self.device.write_bar(bar_index, offset, data);
         }
 
         if !self.device_activated && self.is_driver_ready() {
@@ -1151,9 +1132,11 @@ where
         .get_shared_memory_region()
         .is_some()
     {
+        let shmem_region = AddressRange::from_start_and_size(ranges[0].addr, ranges[0].size)
+            .expect("invalid shmem region");
         virtio_pci_device
             .device
-            .set_shared_memory_region_base(GuestAddress(ranges[0].addr));
+            .set_shared_memory_region(shmem_region);
     }
 
     Ok(ranges)
@@ -1276,12 +1259,12 @@ impl Suspendable for VirtioPciDevice {
         Ok(())
     }
 
-    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
         if self.iommu.is_some() {
             return Err(anyhow!("Cannot snapshot if iommu is present."));
         }
 
-        serde_json::to_value(VirtioPciDeviceSnapshot {
+        AnySnapshot::to_any(VirtioPciDeviceSnapshot {
             config_regs: self.config_regs.snapshot()?,
             inner_device: self.device.virtio_snapshot()?,
             device_activated: self.device_activated,
@@ -1310,7 +1293,7 @@ impl Suspendable for VirtioPciDevice {
         .context("failed to serialize VirtioPciDeviceSnapshot")
     }
 
-    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+    fn restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
         // Restoring from an activated state is more complex and low priority, so just fail for
         // now. We'll need to reset the device before restoring, e.g. must call
         // self.unregister_ioevents().
@@ -1319,7 +1302,7 @@ impl Suspendable for VirtioPciDevice {
             "tried to restore after virtio device activated. not supported yet"
         );
 
-        let deser: VirtioPciDeviceSnapshot = serde_json::from_value(data)?;
+        let deser: VirtioPciDeviceSnapshot = AnySnapshot::from_any(data)?;
 
         self.config_regs.restore(deser.config_regs)?;
         self.device_activated = deser.device_activated;

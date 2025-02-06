@@ -70,6 +70,7 @@ use cros_async::TaskHandle;
 use hypervisor::MemCacheType;
 use serde::Deserialize;
 use serde::Serialize;
+use snapshot::AnySnapshot;
 use sync::Mutex;
 use thiserror::Error as ThisError;
 use vm_control::VmMemorySource;
@@ -197,10 +198,10 @@ pub trait VhostUserDevice {
     fn enter_suspended_state(&mut self) -> anyhow::Result<()>;
 
     /// Snapshot device and return serialized state.
-    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value>;
+    fn snapshot(&mut self) -> anyhow::Result<AnySnapshot>;
 
     /// Restore device state from a snapshot.
-    fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()>;
+    fn restore(&mut self, data: AnySnapshot) -> anyhow::Result<()>;
 }
 
 /// A virtio ring entry.
@@ -236,7 +237,9 @@ impl VhostUserRegularOps {
         files: Vec<File>,
     ) -> VhostResult<(GuestMemory, Vec<MappingInfo>)> {
         if files.len() != contexts.len() {
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam(
+                "number of files & contexts was not equal",
+            ));
         }
 
         let mut regions = Vec::with_capacity(files.len());
@@ -276,14 +279,16 @@ impl VhostUserRegularOps {
     }
 
     pub fn set_vring_kick(_index: u8, file: Option<File>) -> VhostResult<Event> {
-        let file = file.ok_or(VhostError::InvalidParam)?;
+        let file = file.ok_or(VhostError::InvalidParam("missing file for set_vring_kick"))?;
         // Remove O_NONBLOCK from kick_fd. Otherwise, uring_executor will fails when we read
         // values via `next_val()` later.
         // This is only required (and can only be done) on Unix platforms.
         #[cfg(any(target_os = "android", target_os = "linux"))]
         if let Err(e) = clear_fd_flags(file.as_raw_fd(), libc::O_NONBLOCK) {
             error!("failed to remove O_NONBLOCK for kick fd: {}", e);
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam(
+                "could not remove O_NONBLOCK from vring_kick",
+            ));
         }
         Ok(Event::from(SafeDescriptor::from(file)))
     }
@@ -293,7 +298,7 @@ impl VhostUserRegularOps {
         file: Option<File>,
         signal_config_change_fn: Box<dyn Fn() + Send + Sync>,
     ) -> VhostResult<Interrupt> {
-        let file = file.ok_or(VhostError::InvalidParam)?;
+        let file = file.ok_or(VhostError::InvalidParam("missing file for set_vring_call"))?;
         Ok(Interrupt::new_vhost_user(
             Event::from(SafeDescriptor::from(file)),
             signal_config_change_fn,
@@ -324,7 +329,7 @@ enum DeviceStateThread {
 pub struct DeviceRequestHandlerSnapshot {
     acked_features: u64,
     acked_protocol_features: u64,
-    backend: serde_json::Value,
+    backend: AnySnapshot,
 }
 
 impl<T: VhostUserDevice> DeviceRequestHandler<T> {
@@ -405,7 +410,7 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         let unexpected_features = features & !self.backend.features();
         if unexpected_features != 0 {
             error!("unexpected set_features {:#x}", unexpected_features);
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam("unexpected set_features"));
         }
 
         if let Err(e) = self.backend.ack_features(features) {
@@ -467,7 +472,9 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
 
     fn set_vring_num(&mut self, index: u32, num: u32) -> VhostResult<()> {
         if index as usize >= self.vrings.len() || num == 0 || num > Queue::MAX_SIZE.into() {
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam(
+                "set_vring_num: invalid index or num",
+            ));
         }
         self.vrings[index as usize].queue.set_size(num as u16);
 
@@ -484,10 +491,15 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         _log: u64,
     ) -> VhostResult<()> {
         if index as usize >= self.vrings.len() {
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam(
+                "set_vring_addr: index out of range",
+            ));
         }
 
-        let vmm_maps = self.vmm_maps.as_ref().ok_or(VhostError::InvalidParam)?;
+        let vmm_maps = self
+            .vmm_maps
+            .as_ref()
+            .ok_or(VhostError::InvalidParam("set_vring_addr: missing vmm_maps"))?;
         let vring = &mut self.vrings[index as usize];
         vring
             .queue
@@ -501,8 +513,10 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
     }
 
     fn set_vring_base(&mut self, index: u32, base: u32) -> VhostResult<()> {
-        if index as usize >= self.vrings.len() || base >= Queue::MAX_SIZE.into() {
-            return Err(VhostError::InvalidParam);
+        if index as usize >= self.vrings.len() {
+            return Err(VhostError::InvalidParam(
+                "set_vring_base: index out of range",
+            ));
         }
 
         let vring = &mut self.vrings[index as usize];
@@ -516,7 +530,9 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
         let vring = self
             .vrings
             .get_mut(index as usize)
-            .ok_or(VhostError::InvalidParam)?;
+            .ok_or(VhostError::InvalidParam(
+                "get_vring_base: index out of range",
+            ))?;
 
         // Quotation from vhost-user spec:
         // "The back-end must [...] stop ring upon receiving VHOST_USER_GET_VRING_BASE."
@@ -532,7 +548,6 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
             };
 
             trace!("stopped queue {index}");
-
             vring.reset();
 
             if self.all_queues_stopped() {
@@ -552,7 +567,9 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
 
     fn set_vring_kick(&mut self, index: u8, file: Option<File>) -> VhostResult<()> {
         if index as usize >= self.vrings.len() {
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam(
+                "set_vring_kick: index out of range",
+            ));
         }
 
         let vring = &mut self.vrings[index as usize];
@@ -587,7 +604,6 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
             error!("Failed to start queue {}: {}", index, e);
             return Err(VhostError::BackendInternalError);
         }
-
         trace!("started queue {index}");
 
         Ok(())
@@ -595,7 +611,9 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
 
     fn set_vring_call(&mut self, index: u8, file: Option<File>) -> VhostResult<()> {
         if index as usize >= self.vrings.len() {
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam(
+                "set_vring_call: index out of range",
+            ));
         }
 
         let backend_req_conn = self.backend_req_connection.clone();
@@ -622,7 +640,9 @@ impl<T: VhostUserDevice> vmm_vhost::Backend for DeviceRequestHandler<T> {
 
     fn set_vring_enable(&mut self, index: u32, enable: bool) -> VhostResult<()> {
         if index as usize >= self.vrings.len() {
-            return Err(VhostError::InvalidParam);
+            return Err(VhostError::InvalidParam(
+                "set_vring_enable: index out of range",
+            ));
         }
 
         // This request should be handled only when VHOST_USER_F_PROTOCOL_FEATURES
@@ -1079,16 +1099,16 @@ mod tests {
             Ok(())
         }
 
-        fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
-            serde_json::to_value(FakeBackendSnapshot {
+        fn snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
+            AnySnapshot::to_any(FakeBackendSnapshot {
                 data: vec![1, 2, 3],
             })
             .context("failed to serialize snapshot")
         }
 
-        fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
+        fn restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
             let snapshot: FakeBackendSnapshot =
-                serde_json::from_value(data).context("failed to deserialize snapshot")?;
+                AnySnapshot::from_any(data).context("failed to deserialize snapshot")?;
             assert_eq!(snapshot.data, vec![1, 2, 3], "bad snapshot data");
             Ok(())
         }
@@ -1147,9 +1167,7 @@ mod tests {
                 }
 
                 println!("activate");
-                vmm_device
-                    .activate(mem.clone(), interrupt.clone(), queues)
-                    .unwrap();
+                vmm_device.activate(mem, interrupt, queues).unwrap();
             };
 
             activate(&mut vmm_device);

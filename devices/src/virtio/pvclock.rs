@@ -77,6 +77,7 @@ use data_model::Le32;
 use data_model::Le64;
 use serde::Deserialize;
 use serde::Serialize;
+use snapshot::AnySnapshot;
 use vm_control::PvClockCommand;
 use vm_control::PvClockCommandResponse;
 use vm_memory::GuestAddress;
@@ -805,7 +806,8 @@ fn run_main_worker(
                     let desc_chain = match set_pvclock_page_queue.pop() {
                         Some(desc_chain) => desc_chain,
                         None => {
-                            error!("set_pvclock_page queue was empty");
+                            // Spurious doorbells from the driver are permitted
+                            // by the virtio spec (v1.3; section 2.9).
                             continue;
                         }
                     };
@@ -1019,12 +1021,12 @@ impl VirtioDevice for PvClock {
         Ok(())
     }
 
-    fn virtio_snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
-        serde_json::to_value(&self.state).context("failed to serialize PvClockState")
+    fn virtio_snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
+        AnySnapshot::to_any(&self.state).context("failed to serialize PvClockState")
     }
 
-    fn virtio_restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
-        let state: PvClockState = serde_json::from_value(data).context("error deserializing")?;
+    fn virtio_restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
+        let state: PvClockState = AnySnapshot::from_any(data).context("error deserializing")?;
         if state.features != self.features() {
             bail!(
                 "expected virtio_features to match, but they did not. Live: {:?}, snapshot {:?}",

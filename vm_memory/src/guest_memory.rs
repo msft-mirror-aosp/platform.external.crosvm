@@ -32,6 +32,7 @@ use base::VolatileSlice;
 use cros_async::mem;
 use cros_async::BackingMemory;
 use remain::sorted;
+use snapshot::AnySnapshot;
 use thiserror::Error;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
@@ -115,10 +116,20 @@ pub struct MemoryRegionInformation<'a> {
 #[sorted]
 #[derive(Clone, Copy, Debug, Default, PartialOrd, PartialEq, Eq, Ord)]
 pub enum MemoryRegionPurpose {
-    // General purpose guest memory
+    /// BIOS/firmware ROM
+    Bios,
+
+    /// General purpose guest memory
     #[default]
     GuestMemoryRegion,
+
+    /// PVMFW
     ProtectedFirmwareRegion,
+
+    /// An area that should be backed by a GuestMemory region but reported as reserved to the
+    /// guest.
+    ReservedMemory,
+
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     StaticSwiotlbRegion,
 }
@@ -229,6 +240,7 @@ impl MemoryRegion {
 #[derive(Clone, Debug)]
 pub struct GuestMemory {
     regions: Arc<[MemoryRegion]>,
+    locked: bool,
 }
 
 impl AsRawDescriptors for GuestMemory {
@@ -311,6 +323,7 @@ impl GuestMemory {
 
         Ok(GuestMemory {
             regions: Arc::from(regions),
+            locked: false,
         })
     }
 
@@ -351,7 +364,13 @@ impl GuestMemory {
 
         Ok(GuestMemory {
             regions: Arc::from(regions),
+            locked: false,
         })
+    }
+
+    // Whether `MemoryPolicy::LOCK_GUEST_MEMORY` was set.
+    pub fn locked(&self) -> bool {
+        self.locked
     }
 
     /// Returns the end address of memory.
@@ -874,7 +893,7 @@ impl GuestMemory {
         &self,
         w: &mut T,
         compress: bool,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<AnySnapshot> {
         fn go(
             this: &GuestMemory,
             w: &mut impl Write,
@@ -920,10 +939,10 @@ impl GuestMemory {
             go(self, w)?
         };
 
-        Ok(serde_json::to_value(MemorySnapshotMetadata {
+        AnySnapshot::to_any(MemorySnapshotMetadata {
             regions,
             compressed: compress,
-        })?)
+        })
     }
 
     /// Restore the guest memory using the bytes from `r`.
@@ -935,12 +954,8 @@ impl GuestMemory {
     /// Returns an error if `metadata` doesn't match the configuration of the `GuestMemory` or if
     /// `r` doesn't produce exactly as many bytes as needed.
     #[deny(unsafe_op_in_unsafe_fn)]
-    pub unsafe fn restore<T: Read>(
-        &self,
-        metadata: serde_json::Value,
-        r: &mut T,
-    ) -> anyhow::Result<()> {
-        let metadata: MemorySnapshotMetadata = serde_json::from_value(metadata)?;
+    pub unsafe fn restore<T: Read>(&self, metadata: AnySnapshot, r: &mut T) -> anyhow::Result<()> {
+        let metadata: MemorySnapshotMetadata = AnySnapshot::from_any(metadata)?;
 
         let mut r: Box<dyn Read> = if metadata.compressed {
             Box::new(lz4_flex::frame::FrameDecoder::new(r))
@@ -1251,7 +1266,7 @@ mod tests {
         // no vm is running
         let metadata_json = unsafe { gm.snapshot(&mut data, false).unwrap() };
         let metadata: MemorySnapshotMetadata =
-            serde_json::from_value(metadata_json.clone()).unwrap();
+            AnySnapshot::from_any(metadata_json.clone()).unwrap();
 
         #[cfg(unix)]
         assert_eq!(

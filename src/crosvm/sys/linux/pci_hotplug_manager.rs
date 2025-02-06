@@ -909,11 +909,7 @@ impl PciHotPlugManager {
         for (downstream_address, recoverable_resource) in port_stub.devices.drain() {
             // port_stub.port does not have remove_hotplug_device method, as devices are removed
             // when hot_unplug is called.
-            resources.release_pci(
-                downstream_address.bus,
-                downstream_address.dev,
-                downstream_address.func,
-            );
+            resources.release_pci(downstream_address);
             linux.irq_chip.unregister_level_irq_event(
                 recoverable_resource.irq_num,
                 &recoverable_resource.irq_evt,
@@ -932,6 +928,7 @@ mod tests {
     use devices::Suspendable;
     use serde::Deserialize;
     use serde::Serialize;
+    use snapshot::AnySnapshot;
 
     use super::*;
 
@@ -969,12 +966,12 @@ mod tests {
     struct MockDevice;
 
     impl Suspendable for MockDevice {
-        fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
-            serde_json::to_value(self).context("error serializing")
+        fn snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
+            AnySnapshot::to_any(self).context("error serializing")
         }
 
-        fn restore(&mut self, data: serde_json::Value) -> anyhow::Result<()> {
-            *self = serde_json::from_value(data).context("error deserializing")?;
+        fn restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
+            *self = AnySnapshot::from_any(data).context("error deserializing")?;
             Ok(())
         }
 

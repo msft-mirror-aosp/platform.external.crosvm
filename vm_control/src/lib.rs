@@ -27,11 +27,11 @@ use base::MemoryMappingBuilderWindows;
 use hypervisor::BalloonEvent;
 use hypervisor::MemCacheType;
 use hypervisor::MemRegion;
+use snapshot::AnySnapshot;
 
 #[cfg(feature = "balloon")]
 mod balloon_tube;
 pub mod client;
-mod snapshot_format;
 pub mod sys;
 
 #[cfg(target_arch = "x86_64")]
@@ -49,6 +49,7 @@ use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -96,7 +97,8 @@ use rutabaga_gfx::RutabagaMappedRegion;
 use rutabaga_gfx::VulkanInfo;
 use serde::Deserialize;
 use serde::Serialize;
-pub use snapshot_format::*;
+use snapshot::SnapshotReader;
+use snapshot::SnapshotWriter;
 use swap::SwapStatus;
 use sync::Mutex;
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -596,27 +598,13 @@ pub enum VmMemoryRequest {
         num_file_mappings: usize,
     },
     /// Call hypervisor to free the given memory range.
-    DynamicallyFreeMemoryRange {
-        guest_address: GuestAddress,
-        size: u64,
-    },
+    DynamicallyFreeMemoryRanges { ranges: Vec<(GuestAddress, u64)> },
     /// Call hypervisor to reclaim a priorly freed memory range.
-    DynamicallyReclaimMemoryRange {
-        guest_address: GuestAddress,
-        size: u64,
-    },
+    DynamicallyReclaimMemoryRanges { ranges: Vec<(GuestAddress, u64)> },
     /// Balloon allocation/deallocation target reached.
     BalloonTargetReached { size: u64 },
     /// Unregister the given memory slot that was previously registered with `RegisterMemory`.
     UnregisterMemory(VmMemoryRegionId),
-    /// Register an ioeventfd by looking up using Alloc info.
-    IoEventWithAlloc {
-        evt: Event,
-        allocation: Alloc,
-        offset: u64,
-        datamatch: Datamatch,
-        register: bool,
-    },
     /// Register an eventfd with raw guest memory address.
     IoEventRaw(IoEventUpdateRequest),
 }
@@ -969,62 +957,40 @@ impl VmMemoryRequest {
                 }
                 None => VmMemoryResponse::Err(SysError::new(EINVAL)),
             },
-            DynamicallyFreeMemoryRange {
-                guest_address,
-                size,
-            } => match vm.handle_balloon_event(BalloonEvent::Inflate(MemRegion {
-                guest_address,
-                size,
-            })) {
-                Ok(_) => VmMemoryResponse::Ok,
-                Err(e) => VmMemoryResponse::Err(e),
-            },
-            DynamicallyReclaimMemoryRange {
-                guest_address,
-                size,
-            } => match vm.handle_balloon_event(BalloonEvent::Deflate(MemRegion {
-                guest_address,
-                size,
-            })) {
-                Ok(_) => VmMemoryResponse::Ok,
-                Err(e) => VmMemoryResponse::Err(e),
-            },
+            DynamicallyFreeMemoryRanges { ranges } => {
+                let mut r = VmMemoryResponse::Ok;
+                for (guest_address, size) in ranges {
+                    match vm.handle_balloon_event(BalloonEvent::Inflate(MemRegion {
+                        guest_address,
+                        size,
+                    })) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            r = VmMemoryResponse::Err(e);
+                            break;
+                        }
+                    }
+                }
+                r
+            }
+            DynamicallyReclaimMemoryRanges { ranges } => {
+                let mut r = VmMemoryResponse::Ok;
+                for (guest_address, size) in ranges {
+                    match vm.handle_balloon_event(BalloonEvent::Deflate(MemRegion {
+                        guest_address,
+                        size,
+                    })) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            r = VmMemoryResponse::Err(e);
+                            break;
+                        }
+                    }
+                }
+                r
+            }
             BalloonTargetReached { size } => {
                 match vm.handle_balloon_event(BalloonEvent::BalloonTargetReached(size)) {
-                    Ok(_) => VmMemoryResponse::Ok,
-                    Err(e) => VmMemoryResponse::Err(e),
-                }
-            }
-            IoEventWithAlloc {
-                evt,
-                allocation,
-                offset,
-                datamatch,
-                register,
-            } => {
-                let len = match datamatch {
-                    Datamatch::AnyLength => 1,
-                    Datamatch::U8(_) => 1,
-                    Datamatch::U16(_) => 2,
-                    Datamatch::U32(_) => 4,
-                    Datamatch::U64(_) => 8,
-                };
-                let addr = match sys_allocator
-                    .mmio_allocator_any()
-                    .address_from_pci_offset(allocation, offset, len)
-                {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        error!("error getting target address: {:#}", e);
-                        return VmMemoryResponse::Err(SysError::new(EINVAL));
-                    }
-                };
-                let res = if register {
-                    vm.register_ioevent(&evt, IoEventAddress::Mmio(addr), datamatch)
-                } else {
-                    vm.unregister_ioevent(&evt, IoEventAddress::Mmio(addr), datamatch)
-                };
-                match res {
                     Ok(_) => VmMemoryResponse::Ok,
                     Err(e) => VmMemoryResponse::Err(e),
                 }
@@ -1373,21 +1339,6 @@ impl From<BatHealth> for u32 {
     fn from(status: BatHealth) -> Self {
         status as u32
     }
-}
-
-/// Configuration of fake battery status information.
-#[derive(Serialize, Deserialize, Debug, Default)]
-pub enum BatConfig {
-    // Propagates host's battery status
-    #[default]
-    Real,
-    // Fake on battery status. Simulates a disconnected AC adapter.
-    // This forces ac_online to false and sets the battery status
-    // to DISCHARGING
-    Fake {
-        // Sets the maximum battery capacity reported to the guest
-        max_capacity: u32,
-    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1839,7 +1790,7 @@ impl VmRequest {
         device_control_tube: &Tube,
         vcpu_size: usize,
         irq_handler_control: &Tube,
-        snapshot_irqchip: impl Fn() -> anyhow::Result<serde_json::Value>,
+        snapshot_irqchip: impl Fn() -> anyhow::Result<AnySnapshot>,
         suspended_pvclock_state: &mut Option<hypervisor::ClockState>,
     ) -> VmResponse {
         match self {
@@ -2239,6 +2190,7 @@ impl VmRequest {
                     *compress_memory,
                     *encrypt,
                     suspended_pvclock_state,
+                    vm,
                 ) {
                     Ok(()) => {
                         info!("Finished crosvm snapshot successfully");
@@ -2272,11 +2224,14 @@ fn do_snapshot(
     irq_handler_control: &Tube,
     device_control_tube: &Tube,
     vcpu_size: usize,
-    snapshot_irqchip: impl Fn() -> anyhow::Result<serde_json::Value>,
+    snapshot_irqchip: impl Fn() -> anyhow::Result<AnySnapshot>,
     compress_memory: bool,
     encrypt: bool,
     suspended_pvclock_state: &mut Option<hypervisor::ClockState>,
+    vm: &impl Vm,
 ) -> anyhow::Result<()> {
+    let snapshot_start = Instant::now();
+
     let _vcpu_guard = VcpuSuspendGuard::new(&kick_vcpus, vcpu_size)?;
     let _device_guard = DeviceSleepGuard::new(device_control_tube)?;
 
@@ -2326,7 +2281,7 @@ fn do_snapshot(
     let snapshot_writer = SnapshotWriter::new(snapshot_path, encrypt)?;
 
     // Snapshot hypervisor's paravirtualized clock.
-    snapshot_writer.write_fragment("pvclock", &serde_json::to_value(suspended_pvclock_state)?)?;
+    snapshot_writer.write_fragment("pvclock", &AnySnapshot::to_any(suspended_pvclock_state)?)?;
 
     // Snapshot Vcpus
     info!("VCPUs snapshotting...");
@@ -2367,6 +2322,18 @@ fn do_snapshot(
         bail!("unexpected SnapshotDevices response: {resp}");
     }
     info!("Devices snapshotted.");
+
+    let snap_duration_ms = snapshot_start.elapsed().as_millis();
+    info!(
+        "snapshot: completed snapshot in {}ms; VM mem size: {}MB",
+        snap_duration_ms,
+        vm.get_memory().memory_size() / 1024 / 1024,
+    );
+    metrics::log_metric_with_details(
+        metrics::MetricEventType::SnapshotSaveOverallLatency,
+        snap_duration_ms as i64,
+        &metrics_events::RecordDetails {},
+    );
     Ok(())
 }
 
@@ -2381,10 +2348,12 @@ pub fn do_restore(
     irq_handler_control: &Tube,
     device_control_tube: &Tube,
     vcpu_size: usize,
-    mut restore_irqchip: impl FnMut(serde_json::Value) -> anyhow::Result<()>,
+    mut restore_irqchip: impl FnMut(AnySnapshot) -> anyhow::Result<()>,
     require_encrypted: bool,
     suspended_pvclock_state: &mut Option<hypervisor::ClockState>,
+    vm: &impl Vm,
 ) -> anyhow::Result<()> {
+    let restore_start = Instant::now();
     let _guard = VcpuSuspendGuard::new(&kick_vcpus, vcpu_size);
     let _devices_guard = DeviceSleepGuard::new(device_control_tube)?;
 
@@ -2394,7 +2363,7 @@ pub fn do_restore(
     *suspended_pvclock_state = snapshot_reader.read_fragment("pvclock")?;
 
     // Restore IrqChip
-    let irq_snapshot: serde_json::Value = snapshot_reader.read_fragment("irqchip")?;
+    let irq_snapshot: AnySnapshot = snapshot_reader.read_fragment("irqchip")?;
     restore_irqchip(irq_snapshot)?;
 
     // Restore Vcpu(s)
@@ -2454,6 +2423,18 @@ pub fn do_restore(
             resp
         );
     }
+
+    let restore_duration_ms = restore_start.elapsed().as_millis();
+    info!(
+        "snapshot: completed restore in {}ms; mem size: {}",
+        restore_duration_ms,
+        vm.get_memory().memory_size(),
+    );
+    metrics::log_metric_with_details(
+        metrics::MetricEventType::SnapshotRestoreOverallLatency,
+        restore_duration_ms as i64,
+        &metrics_events::RecordDetails {},
+    );
     Ok(())
 }
 

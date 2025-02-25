@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::io::Write;
 
-use zerocopy::AsBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
 use zerocopy::FromBytes;
 
 pub struct RutabagaSnapshot {
@@ -24,7 +25,7 @@ impl RutabagaSnapshot {
     // detail, doesn't need to support host migration (e.g. we don't need to care about endianess
     // or integer sizes), and isn't expected to be stable across releases.
     pub fn serialize_to(&self, w: &mut impl Write) -> std::io::Result<()> {
-        fn write(w: &mut impl Write, v: impl AsBytes) -> std::io::Result<()> {
+        fn write<T: FromBytes + IntoBytes + Immutable>(w: &mut impl Write, v: T) -> std::io::Result<()> {
             w.write_all(v.as_bytes())
         }
 
@@ -40,7 +41,7 @@ impl RutabagaSnapshot {
     }
 
     pub fn deserialize_from(r: &mut impl Read) -> std::io::Result<Self> {
-        fn read<T: AsBytes + FromBytes + Default>(r: &mut impl Read) -> std::io::Result<T> {
+        fn read<T: Immutable + IntoBytes + FromBytes + Default>(r: &mut impl Read) -> std::io::Result<T> {
             let mut v: T = Default::default();
             r.read_exact(v.as_bytes_mut())?;
             Ok(v)

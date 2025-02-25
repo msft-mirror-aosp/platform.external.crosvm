@@ -6,9 +6,9 @@
 
 #![allow(dead_code)]
 
-use zerocopy::AsBytes;
 use zerocopy::FromBytes;
-use zerocopy::FromZeroes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
 
 use crate::rutabaga_utils::RutabagaHandle;
 use crate::rutabaga_utils::VulkanInfo;
@@ -43,14 +43,14 @@ pub const KUMQUAT_GPU_PROTOCOL_RESP_CONTEXT_CREATE: u32 = 0x3005;
 pub const KUMQUAT_GPU_PROTOCOL_RESP_RESOURCE_CREATE: u32 = 0x3006;
 pub const KUMQUAT_GPU_PROTOCOL_RESP_CMD_SUBMIT_3D: u32 = 0x3007;
 
-#[derive(Copy, Clone, Debug, Default, AsBytes, FromZeroes, FromBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_ctrl_hdr {
     pub type_: u32,
     pub payload: u32,
 }
 
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_box {
     pub x: u32,
@@ -62,7 +62,7 @@ pub struct kumquat_gpu_protocol_box {
 }
 
 /* KUMQUAT_GPU_PROTOCOL_TRANSFER_TO_HOST_3D, KUMQUAT_GPU_PROTOCOL_TRANSFER_FROM_HOST_3D */
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_transfer_host_3d {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -77,7 +77,7 @@ pub struct kumquat_gpu_protocol_transfer_host_3d {
 }
 
 /* KUMQUAT_GPU_PROTOCOL_RESOURCE_CREATE_3D */
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_resource_create_3d {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -96,7 +96,7 @@ pub struct kumquat_gpu_protocol_resource_create_3d {
     pub ctx_id: u32,
 }
 
-#[derive(Debug, Copy, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Debug, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_ctx_create {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -119,7 +119,7 @@ impl Clone for kumquat_gpu_protocol_ctx_create {
 }
 
 /* KUMQUAT_GPU_PROTOCOL_CTX_ATTACH_RESOURCE, KUMQUAT_GPU_PROTOCOL_CTX_DETACH_RESOURCE */
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_ctx_resource {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -128,7 +128,7 @@ pub struct kumquat_gpu_protocol_ctx_resource {
 }
 
 /* KUMQUAT_GPU_PROTOCOL_SUBMIT_3D */
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_cmd_submit {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -155,7 +155,7 @@ pub struct kumquat_gpu_protocol_cmd_submit {
 }
 
 /* KUMQUAT_GPU_PROTOCOL_RESP_CAPSET_INFO */
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_resp_capset_info {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -166,7 +166,7 @@ pub struct kumquat_gpu_protocol_resp_capset_info {
 }
 
 /* KUMQUAT_GPU_PROTOCOL_GET_CAPSET */
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_get_capset {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -174,7 +174,7 @@ pub struct kumquat_gpu_protocol_get_capset {
     pub capset_version: u32,
 }
 
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_resource_create_blob {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -186,7 +186,7 @@ pub struct kumquat_gpu_protocol_resource_create_blob {
     pub size: u64,
 }
 
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_resp_resource_create {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -195,7 +195,7 @@ pub struct kumquat_gpu_protocol_resp_resource_create {
     pub vulkan_info: VulkanInfo,
 }
 
-#[derive(Copy, Clone, Debug, Default, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct kumquat_gpu_protocol_resp_cmd_submit_3d {
     pub hdr: kumquat_gpu_protocol_ctrl_hdr,
@@ -230,7 +230,7 @@ pub enum KumquatGpuProtocol {
     RespCmdSubmit3d(u64, RutabagaHandle),
 }
 
-pub enum KumquatGpuProtocolWrite<T: AsBytes + FromBytes> {
+pub enum KumquatGpuProtocolWrite<T: IntoBytes + FromBytes + Immutable> {
     Cmd(T),
     CmdWithHandle(T, RutabagaHandle),
     CmdWithData(T, Vec<u8>),

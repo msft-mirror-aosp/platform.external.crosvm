@@ -1,3 +1,4 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_license//rules:license.bzl", "license")
 load("@rules_license//rules:license_kind.bzl", "license_kind")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
@@ -35,7 +36,7 @@ rust_shared_library(
     deps = [
         "//external/crosvm/rutabaga_gfx",
         "//external/qemu:libmodule-common",
-        "//hardware/google/gfxstream/host:gfxstream_backend",
+        "@gfxstream//host:gfxstream_backend",
         "@libc",
         "@log",
         "@once_cell",
